@@ -17,6 +17,9 @@ use bitcoin::{hash_types::Txid, util::psbt};
 
 use serde::{Deserialize, Serialize};
 
+/// Identifes a keychain by kind + index
+pub type Keychain = (KeychainKind, u32);
+
 /// Types of keychains
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeychainKind {

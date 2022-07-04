@@ -37,6 +37,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::default::Default;
 use std::marker::PhantomData;
@@ -47,7 +48,7 @@ use bitcoin::{OutPoint, Script, Transaction};
 use miniscript::descriptor::DescriptorTrait;
 
 use super::coin_selection::{CoinSelectionAlgorithm, DefaultCoinSelectionAlgorithm};
-use crate::descriptor::ExtendedDescriptor;
+use crate::Keychain;
 use crate::{database::BatchDatabase, Error, Utxo, Wallet};
 use crate::{
     types::{FeeRate, KeychainKind, LocalUtxo, WeightedUtxo},
@@ -120,7 +121,7 @@ impl TxBuilderContext for BumpFee {}
 #[derive(Debug)]
 pub struct TxBuilder<'a, D, Cs, Ctx> {
     pub(crate) wallet: &'a Wallet<D>,
-    pub(crate) params: TxParams<'a>,
+    pub(crate) params: TxParams,
     pub(crate) coin_selection: Cs,
     pub(crate) phantom: PhantomData<Ctx>,
 }
@@ -128,13 +129,12 @@ pub struct TxBuilder<'a, D, Cs, Ctx> {
 /// The parameters for transaction creation sans coin selection algorithm.
 //TODO: TxParams should eventually be exposed publicly.
 #[derive(Default, Debug, Clone)]
-pub(crate) struct TxParams<'a> {
+pub(crate) struct TxParams {
     pub(crate) recipients: Vec<(Script, u64)>,
     pub(crate) drain_wallet: bool,
     pub(crate) drain_to: Option<Script>,
     pub(crate) fee_policy: Option<FeePolicy>,
-    pub(crate) descriptor_policy_paths:
-        BTreeMap<&'a ExtendedDescriptor, BTreeMap<String, Vec<usize>>>,
+    pub(crate) descriptor_policy_paths: HashMap<Keychain, BTreeMap<String, Vec<usize>>>,
     pub(crate) utxos: Vec<WeightedUtxo>,
     pub(crate) unspendable: HashSet<OutPoint>,
     pub(crate) manually_selected_only: bool,
@@ -251,21 +251,18 @@ impl<'a, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext>
     /// let builder = wallet
     ///     .build_tx()
     ///     .add_recipient(to_address.script_pubkey(), 50_000)
-    ///     .policy_path(
-    ///         path,
-    ///         wallet.get_descriptor_for_keychain(KeychainKind::External),
-    ///     );
+    ///     .policy_path(path, (KeychainKind::External, 0));
     ///
     /// # Ok::<(), bdk::Error>(())
     /// ```
     pub fn policy_path(
         &mut self,
         policy_path: BTreeMap<String, Vec<usize>>,
-        descriptor: &'a ExtendedDescriptor,
+        keychain: Keychain,
     ) -> &mut Self {
         self.params
             .descriptor_policy_paths
-            .insert(descriptor, policy_path);
+            .insert(keychain, policy_path);
         self
     }
 

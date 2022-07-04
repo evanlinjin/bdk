@@ -563,11 +563,12 @@ where
             })
             .transpose()?;
 
-        let external_policy_path = params.descriptor_policy_paths.get(&self.descriptor);
-        let internal_policy_path = self
-            .change_descriptor
-            .as_ref()
-            .and_then(|desc| params.descriptor_policy_paths.get(desc));
+        let external_policy_path = params
+            .descriptor_policy_paths
+            .get(&(KeychainKind::External, 0));
+        let internal_policy_path = params
+            .descriptor_policy_paths
+            .get(&(KeychainKind::Internal, 0));
 
         // The policy allows spending external outputs, but it requires a policy path that hasn't been
         // provided
@@ -2663,7 +2664,7 @@ pub(crate) mod test {
         let mut builder = wallet.build_tx();
         builder
             .add_recipient(addr.script_pubkey(), 30_000)
-            .policy_path(path, &wallet.descriptor);
+            .policy_path(path, (KeychainKind::External, 0));
         let (psbt, _) = builder.finish().unwrap();
 
         assert_eq!(psbt.unsigned_tx.input[0].sequence, 0xFFFFFFFF);
@@ -2682,7 +2683,7 @@ pub(crate) mod test {
         let mut builder = wallet.build_tx();
         builder
             .add_recipient(addr.script_pubkey(), 30_000)
-            .policy_path(path, &wallet.descriptor);
+            .policy_path(path, (KeychainKind::External, 0));
         let (psbt, _) = builder.finish().unwrap();
 
         assert_eq!(psbt.unsigned_tx.input[0].sequence, 144);
@@ -4314,7 +4315,7 @@ pub(crate) mod test {
         let mut builder = wallet.build_tx();
         builder
             .add_recipient(addr.script_pubkey(), 25_000)
-            .policy_path(path, &wallet.descriptor);
+            .policy_path(path, (KeychainKind::External, 0));
         let (psbt, _) = builder.finish().unwrap();
 
         assert_eq!(
