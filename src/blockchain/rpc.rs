@@ -26,7 +26,7 @@
 //!     },
 //!     network: bdk::bitcoin::Network::Testnet,
 //!     wallet_name: "wallet_name".to_string(),
-//!     skip_blocks: None,
+//!     sync_params: None,
 //! };
 //! let blockchain = RpcBlockchain::from_config(&config);
 //! ```
@@ -37,10 +37,12 @@ use crate::bitcoin::{Address, Network, OutPoint, Transaction, TxOut, Txid};
 use crate::blockchain::*;
 use crate::database::{BatchDatabase, DatabaseUtils};
 use crate::descriptor::get_checksum;
+use crate::error::MissingCachedScripts;
 use crate::{BlockTime, Error, FeeRate, KeychainKind, LocalUtxo, TransactionDetails};
+use bitcoin::Script;
 use bitcoincore_rpc::json::{
-    GetAddressInfoResultLabel, ImportMultiOptions, ImportMultiRequest,
-    ImportMultiRequestScriptPubkey, ImportMultiRescanSince,
+    GetTransactionResult, ImportMultiOptions, ImportMultiRequest, ImportMultiRequestScriptPubkey,
+    ImportMultiRescanSince, ScanningDetails,
 };
 use bitcoincore_rpc::jsonrpc::serde_json::{json, Value};
 use bitcoincore_rpc::Auth as RpcAuth;
@@ -49,7 +51,8 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::str::FromStr;
+use std::thread;
+use std::time::Duration;
 
 /// The main struct for RPC backend implementing the [crate::blockchain::Blockchain] trait
 #[derive(Debug)]
@@ -60,11 +63,10 @@ pub struct RpcBlockchain {
     is_descriptors: bool,
     /// Blockchain capabilities, cached here at startup
     capabilities: HashSet<Capability>,
-    /// Skip this many blocks of the blockchain at the first rescan, if None the rescan is done from the genesis block
-    skip_blocks: Option<u32>,
-
-    /// This is a fixed Address used as a hack key to store information on the node
-    _storage_address: Address,
+    /// Sync parameters.
+    sync_params: RpcSyncParams,
+    /// Network
+    network: Network,
 }
 
 /// RpcBlockchain configuration options
@@ -78,8 +80,33 @@ pub struct RpcConfig {
     pub network: Network,
     /// The wallet name in the bitcoin node, consider using [crate::wallet::wallet_name_from_descriptor] for this
     pub wallet_name: String,
-    /// Skip this many blocks of the blockchain at the first rescan, if None the rescan is done from the genesis block
-    pub skip_blocks: Option<u32>,
+    /// Sync parameters
+    pub sync_params: Option<RpcSyncParams>,
+}
+
+/// Sync parameters for Bitcoin Core RPC.
+///
+/// In general, BDK tries to sync `scriptPubKey`s cached in [`crate::database::Database`] with
+/// `scriptPubKey`s imported in the Bitcoin Core Wallet. These parameters are used for determining
+/// how the `importdescriptors` RPC calls are to be made.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct RpcSyncParams {
+    /// The minimum gap allowed between cache count and last index (stored in [`crate::database::Database`]).
+    pub stop_gap: usize,
+    /// Time in unix seconds in which initial sync will start scanning from (0 to start from genesis).
+    pub start_time: u64,
+    /// RPC poll rate (in seconds) to get state updates.
+    pub poll_rate_sec: u64,
+}
+
+impl Default for RpcSyncParams {
+    fn default() -> Self {
+        Self {
+            stop_gap: 10,
+            start_time: 0,
+            poll_rate_sec: 3,
+        }
+    }
 }
 
 /// This struct is equivalent to [bitcoincore_rpc::Auth] but it implements [serde::Serialize]
@@ -116,23 +143,82 @@ impl From<Auth> for RpcAuth {
 }
 
 impl RpcBlockchain {
-    fn get_node_synced_height(&self) -> Result<u32, Error> {
-        let info = self.client.get_address_info(&self._storage_address)?;
-        if let Some(GetAddressInfoResultLabel::Simple(label)) = info.labels.first() {
-            Ok(label
-                .parse::<u32>()
-                .unwrap_or_else(|_| self.skip_blocks.unwrap_or(0)))
-        } else {
-            Ok(self.skip_blocks.unwrap_or(0))
-        }
-    }
+    /// Sync `scriptPubKey`s that are cached in [crate::database::Database] into the Bitcoin Core
+    /// wallet.
+    ///
+    /// We also ensure `stop_gap` is respected (so that we are decently cached above last active
+    /// `scriptPubKey` index). If not, we return [Error::MissingCachedScripts].
+    ///
+    /// Bitcoin Core may take a while to sync with newly introduced `scriptPubKey`s, we block until
+    /// sync completes.
+    fn sync_scripts<D>(
+        &self,
+        kind: KeychainKind,
+        db: &mut D,
+        prog: &dyn Progress,
+    ) -> Result<ScriptsState, Error>
+    where
+        D: BatchDatabase,
+    {
+        let db_scripts = db.iter_script_pubkeys(Some(kind))?;
 
-    /// Set the synced height in the core node by using a label of a fixed address so that
-    /// another client with the same descriptor doesn't rescan the blockchain
-    fn set_node_synced_height(&self, height: u32) -> Result<(), Error> {
-        Ok(self
-            .client
-            .set_label(&self._storage_address, &height.to_string())?)
+        // this is a hack to check whether the scripts are coming from a derivable descriptor
+        // we assume for non-derivable descriptors, the initial script count is always 1
+        let is_derivable = db_scripts.len() > 1;
+
+        // ensure we have atleast `stop_gap` scripts in cache
+        if is_derivable && db_scripts.len() < self.sync_params.stop_gap {
+            return Err(Error::MissingCachedScripts(MissingCachedScripts {
+                last_count: db_scripts.len(),
+                missing_count: self.sync_params.stop_gap - db_scripts.len(),
+            }));
+        }
+
+        // obtain initial state of `scriptPubKey`s in Core wallet
+        let mut spk_state = ScriptsState::default();
+        spk_state.update(self.network, &self.client, db_scripts.iter().enumerate())?;
+
+        // now we need to ensure that:
+        // 1. imported is synced with cached
+        // 2. we are atleast `stop_gap` above `last_active` index (if any)
+
+        // import missing scriptPubKeys into Core Wallet
+        // - `start_index`: scriptPubKey derivation index to start import from
+        // - `start_epoch`: unix timestamp of where to start blockchain scan from
+        let start_index = spk_state.last_imported.map(|l| l + 1).unwrap_or(0);
+        let start_epoch = db
+            .get_sync_time()?
+            .map_or(self.sync_params.start_time, |st| st.block_time.timestamp);
+
+        let import_iter = db_scripts.iter().skip(start_index);
+        if self.is_descriptors {
+            import_descriptors(&self.client, start_epoch, import_iter)?;
+        } else {
+            import_multi(&self.client, start_epoch, import_iter)?;
+        }
+
+        // await sync (TODO: Maybe make this async)
+        await_wallet_scan(&self.client, self.sync_params.poll_rate_sec, prog)?;
+
+        // update `ScriptsState` with what is newly imported
+        spk_state.update(
+            self.network,
+            &self.client,
+            db_scripts.iter().enumerate().skip(start_index),
+        )?;
+
+        // check actual gap against `stop_gap`
+        let actual_gap = spk_state.actual_gap();
+        if is_derivable && actual_gap < self.sync_params.stop_gap {
+            // we are under-cached, return error
+            return Err(Error::MissingCachedScripts(MissingCachedScripts {
+                last_count: spk_state.last_imported.unwrap_or(0),
+                missing_count: self.sync_params.stop_gap - actual_gap,
+            }));
+        }
+
+        spk_state.update_db_last_index(db, kind)?;
+        Ok(spk_state)
     }
 }
 
@@ -178,224 +264,32 @@ impl GetBlockHash for RpcBlockchain {
 impl WalletSync for RpcBlockchain {
     fn wallet_setup<D: BatchDatabase>(
         &self,
-        database: &mut D,
+        db: &mut D,
         progress_update: Box<dyn Progress>,
     ) -> Result<(), Error> {
-        let mut scripts_pubkeys = database.iter_script_pubkeys(Some(KeychainKind::External))?;
-        scripts_pubkeys.extend(database.iter_script_pubkeys(Some(KeychainKind::Internal))?);
-        debug!(
-            "importing {} script_pubkeys (some maybe already imported)",
-            scripts_pubkeys.len()
-        );
+        // sync external descriptor `scriptPubKey`s
+        let external_txids = self
+            .sync_scripts(KeychainKind::External, db, &*progress_update)?
+            .txids;
 
-        if self.is_descriptors {
-            // Core still doesn't support complex descriptors like BDK, but when the wallet type is
-            // "descriptors" we should import individual addresses using `importdescriptors` rather
-            // than `importmulti`, using the `raw()` descriptor which allows us to specify an
-            // arbitrary script
-            let requests = Value::Array(
-                scripts_pubkeys
-                    .iter()
-                    .map(|s| {
-                        let desc = format!("raw({})", s.to_hex());
-                        json!({
-                            "timestamp": "now",
-                            "desc": format!("{}#{}", desc, get_checksum(&desc).unwrap()),
-                        })
-                    })
-                    .collect(),
-            );
+        // sync internal descriptor `scriptPubKey`s
+        let internal_txids = self
+            .sync_scripts(KeychainKind::Internal, db, &*progress_update)?
+            .txids;
 
-            let res: Vec<Value> = self.client.call("importdescriptors", &[requests])?;
-            res.into_iter()
-                .map(|v| match v["success"].as_bool() {
-                    Some(true) => Ok(()),
-                    Some(false) => Err(Error::Generic(
-                        v["error"]["message"]
-                            .as_str()
-                            .unwrap_or("Unknown error")
-                            .to_string(),
-                    )),
-                    _ => Err(Error::Generic("Unexpected response from Core".to_string())),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-        } else {
-            let requests: Vec<_> = scripts_pubkeys
-                .iter()
-                .map(|s| ImportMultiRequest {
-                    timestamp: ImportMultiRescanSince::Timestamp(0),
-                    script_pubkey: Some(ImportMultiRequestScriptPubkey::Script(s)),
-                    watchonly: Some(true),
-                    ..Default::default()
-                })
-                .collect();
-            let options = ImportMultiOptions {
-                rescan: Some(false),
-            };
-            self.client.import_multi(&requests, Some(&options))?;
-        }
+        // all `txid`s obtained from Core wallet
+        let core_txids = external_txids
+            .union(&internal_txids)
+            .collect::<HashSet<_>>();
 
-        loop {
-            let current_height = self.get_height()?;
+        // obtain db state
+        let mut db_state = DbState::from_db(db)?;
 
-            // min because block invalidate may cause height to go down
-            let node_synced = self.get_node_synced_height()?.min(current_height);
+        // update db state
+        db_state.update(&self.client, db, core_txids.into_iter())?;
 
-            let sync_up_to = node_synced.saturating_add(10_000).min(current_height);
-
-            debug!("rescan_blockchain from:{} to:{}", node_synced, sync_up_to);
-            self.client
-                .rescan_blockchain(Some(node_synced as usize), Some(sync_up_to as usize))?;
-            progress_update.update((sync_up_to as f32) / (current_height as f32), None)?;
-
-            self.set_node_synced_height(sync_up_to)?;
-
-            if sync_up_to == current_height {
-                break;
-            }
-        }
-
-        self.wallet_sync(database, progress_update)
-    }
-
-    fn wallet_sync<D: BatchDatabase>(
-        &self,
-        db: &mut D,
-        _progress_update: Box<dyn Progress>,
-    ) -> Result<(), Error> {
-        let mut indexes = HashMap::new();
-        for keykind in &[KeychainKind::External, KeychainKind::Internal] {
-            indexes.insert(*keykind, db.get_last_index(*keykind)?.unwrap_or(0));
-        }
-
-        let mut known_txs: HashMap<_, _> = db
-            .iter_txs(true)?
-            .into_iter()
-            .map(|tx| (tx.txid, tx))
-            .collect();
-        let known_utxos: HashSet<_> = db.iter_utxos()?.into_iter().collect();
-
-        //TODO list_since_blocks would be more efficient
-        let current_utxo = self
-            .client
-            .list_unspent(Some(0), None, None, Some(true), None)?;
-        debug!("current_utxo len {}", current_utxo.len());
-
-        //TODO supported up to 1_000 txs, should use since_blocks or do paging
-        let list_txs = self
-            .client
-            .list_transactions(None, Some(1_000), None, Some(true))?;
-        let mut list_txs_ids = HashSet::new();
-
-        for tx_result in list_txs.iter().filter(|t| {
-            // list_txs returns all conflicting txs, we want to
-            // filter out replaced tx => unconfirmed and not in the mempool
-            t.info.confirmations > 0 || self.client.get_mempool_entry(&t.info.txid).is_ok()
-        }) {
-            let txid = tx_result.info.txid;
-            list_txs_ids.insert(txid);
-            if let Some(mut known_tx) = known_txs.get_mut(&txid) {
-                let confirmation_time =
-                    BlockTime::new(tx_result.info.blockheight, tx_result.info.blocktime);
-                if confirmation_time != known_tx.confirmation_time {
-                    // reorg may change tx height
-                    debug!(
-                        "updating tx({}) confirmation time to: {:?}",
-                        txid, confirmation_time
-                    );
-                    known_tx.confirmation_time = confirmation_time;
-                    db.set_tx(known_tx)?;
-                }
-            } else {
-                //TODO check there is already the raw tx in db?
-                let tx_result = self.client.get_transaction(&txid, Some(true))?;
-                let tx: Transaction = deserialize(&tx_result.hex)?;
-                let mut received = 0u64;
-                let mut sent = 0u64;
-                for output in tx.output.iter() {
-                    if let Ok(Some((kind, index))) =
-                        db.get_path_from_script_pubkey(&output.script_pubkey)
-                    {
-                        if index > *indexes.get(&kind).unwrap() {
-                            indexes.insert(kind, index);
-                        }
-                        received += output.value;
-                    }
-                }
-
-                for input in tx.input.iter() {
-                    if let Some(previous_output) = db.get_previous_output(&input.previous_output)? {
-                        if db.is_mine(&previous_output.script_pubkey)? {
-                            sent += previous_output.value;
-                        }
-                    }
-                }
-
-                let td = TransactionDetails {
-                    transaction: Some(tx),
-                    txid: tx_result.info.txid,
-                    confirmation_time: BlockTime::new(
-                        tx_result.info.blockheight,
-                        tx_result.info.blocktime,
-                    ),
-                    received,
-                    sent,
-                    fee: tx_result.fee.map(|f| f.as_sat().unsigned_abs()),
-                };
-                debug!(
-                    "saving tx: {} tx_result.fee:{:?} td.fees:{:?}",
-                    td.txid, tx_result.fee, td.fee
-                );
-                db.set_tx(&td)?;
-            }
-        }
-
-        for known_txid in known_txs.keys() {
-            if !list_txs_ids.contains(known_txid) {
-                debug!("removing tx: {}", known_txid);
-                db.del_tx(known_txid, false)?;
-            }
-        }
-
-        // Filter out trasactions that are for script pubkeys that aren't in this wallet.
-        let current_utxos = current_utxo
-            .into_iter()
-            .filter_map(
-                |u| match db.get_path_from_script_pubkey(&u.script_pub_key) {
-                    Err(e) => Some(Err(e)),
-                    Ok(None) => None,
-                    Ok(Some(path)) => Some(Ok(LocalUtxo {
-                        outpoint: OutPoint::new(u.txid, u.vout),
-                        keychain: path.0,
-                        txout: TxOut {
-                            value: u.amount.as_sat(),
-                            script_pubkey: u.script_pub_key,
-                        },
-                        is_spent: false,
-                    })),
-                },
-            )
-            .collect::<Result<HashSet<_>, Error>>()?;
-
-        let spent: HashSet<_> = known_utxos.difference(&current_utxos).collect();
-        for utxo in spent {
-            debug!("setting as spent utxo: {:?}", utxo);
-            let mut spent_utxo = utxo.clone();
-            spent_utxo.is_spent = true;
-            db.set_utxo(&spent_utxo)?;
-        }
-        let received: HashSet<_> = current_utxos.difference(&known_utxos).collect();
-        for utxo in received {
-            debug!("adding utxo: {:?}", utxo);
-            db.set_utxo(utxo)?;
-        }
-
-        for (keykind, index) in indexes {
-            debug!("{:?} max {}", keykind, index);
-            db.set_last_index(keykind, index)?;
-        }
-
-        Ok(())
+        // apply updates to db
+        db_state.apply(db)
     }
 }
 
@@ -464,17 +358,12 @@ impl ConfigurableBlockchain for RpcBlockchain {
             }
         }
 
-        // this is just a fixed address used only to store a label containing the synced height in the node
-        let mut storage_address =
-            Address::from_str("bc1qst0rewf0wm4kw6qn6kv0e5tc56nkf9yhcxlhqv").unwrap();
-        storage_address.network = network;
-
         Ok(RpcBlockchain {
             client,
             capabilities,
             is_descriptors,
-            _storage_address: storage_address,
-            skip_blocks: config.skip_blocks,
+            sync_params: config.sync_params.clone().unwrap_or_default(),
+            network,
         })
     }
 }
@@ -495,6 +384,399 @@ fn list_wallet_dir(client: &Client) -> Result<Vec<String>, Error> {
     Ok(result.wallets.into_iter().map(|n| n.name).collect())
 }
 
+/// State of scriptPubKeys in Core wallet.
+#[derive(Default, Debug)]
+struct ScriptsState {
+    last_imported: Option<usize>,
+    last_active: Option<usize>,
+    txids: HashSet<Txid>,
+}
+
+impl ScriptsState {
+    /// Iterates through `scripts` and finds the last imported script (if any), the last active
+    /// script (if any), and an aggregation of associated txids. This uses the
+    /// `listreceivedbyaddress` RPC call.
+    fn update<'a, S>(&mut self, network: Network, client: &Client, scripts: S) -> Result<(), Error>
+    where
+        S: Iterator<Item = (usize, &'a Script)>,
+    {
+        for (index, script) in scripts {
+            let addr = Address::from_script(script, network).ok_or_else(|| {
+                Error::Generic(format!(
+                    "script `{}` cannot be represented as an address",
+                    script
+                ))
+            })?;
+
+            let recv_list =
+                client.list_received_by_address(Some(&addr), Some(0), Some(true), Some(true))?;
+
+            if recv_list.is_empty() {
+                continue;
+            }
+
+            let last_imported = self.last_imported.get_or_insert(index);
+            if *last_imported < index {
+                *last_imported = index;
+            }
+
+            if !recv_list[0].txids.is_empty() {
+                let last_active = self.last_active.get_or_insert(index);
+                if *last_active < index {
+                    *last_active = index;
+                }
+
+                recv_list[0].txids.iter().for_each(|txid| {
+                    self.txids.insert(*txid);
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The actual gap is the difference between last imported derivation index and last active
+    /// derivation index.
+    fn actual_gap(&self) -> usize {
+        let last_active = self.last_active.map_or(0_usize, |l| l + 1);
+        let last_imported = self.last_imported.map_or(0_usize, |l| l + 1);
+        last_imported - last_active
+    }
+
+    /// Updates the "last index" stored in `Database`.
+    fn update_db_last_index<D: BatchDatabase>(
+        &self,
+        db: &mut D,
+        keychain: KeychainKind,
+    ) -> Result<(), Error> {
+        let db_index = db.get_last_index(keychain)?;
+        let new_index = self.last_active.map(|l| l as u32);
+        match (db_index, new_index) {
+            (None, Some(value)) => db.set_last_index(keychain, value),
+            (Some(old_value), Some(value)) if value > old_value => {
+                db.set_last_index(keychain, value)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Represents the state of the [`crate::database::Database`].
+struct DbState {
+    txs: HashMap<Txid, TransactionDetails>,
+    utxos: HashSet<LocalUtxo>,
+
+    // "deltas" to apply to database
+    retained_txs: HashSet<Txid>, // txs to retain (everything else should be deleted)
+    updated_txs: HashSet<Txid>,  // txs to update
+    updated_utxos: HashSet<LocalUtxo>, // utxos to update
+}
+
+impl DbState {
+    /// Obtain [DbState] from [crate::database::Database].
+    fn from_db<D: BatchDatabase>(db: &D) -> Result<Self, Error> {
+        let txs = db
+            .iter_txs(true)?
+            .into_iter()
+            .map(|tx| (tx.txid, tx))
+            .collect::<HashMap<_, _>>();
+        let utxos = db.iter_utxos()?.into_iter().collect::<HashSet<_>>();
+
+        let retained_txs = HashSet::with_capacity(txs.len());
+        let updated_txs = HashSet::with_capacity(txs.len());
+        let updated_utxos = HashSet::with_capacity(utxos.len());
+
+        Ok(Self {
+            txs,
+            utxos,
+            retained_txs,
+            updated_txs,
+            updated_utxos,
+        })
+    }
+
+    /// Update [DbState] with Core wallet state
+    fn update<'a, D, I>(&mut self, client: &Client, db: &D, new_txids: I) -> Result<(), Error>
+    where
+        D: BatchDatabase,
+        I: Iterator<Item = &'a Txid>,
+    {
+        // Obtain filtered list of tx results
+        let tx_results = new_txids
+            .filter_map(|txid| {
+                client
+                    .get_transaction(txid, Some(true))
+                    .map(|res| Self::_filter_tx(client, res))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for tx_res in tx_results {
+            let mut updated = false;
+
+            let db_tx = self.txs.entry(tx_res.info.txid).or_insert_with(|| {
+                updated = true;
+                TransactionDetails {
+                    txid: tx_res.info.txid,
+                    ..Default::default()
+                }
+            });
+
+            // update raw tx (if needed)
+            let raw_tx = match &db_tx.transaction {
+                Some(raw_tx) => raw_tx,
+                None => {
+                    updated = true;
+                    db_tx.transaction.insert(deserialize(&tx_res.hex)?)
+                }
+            };
+
+            // update fee (if needed)
+            if let (None, Some(new_fee)) = (db_tx.fee, tx_res.fee) {
+                updated = true;
+                db_tx.fee = Some(new_fee.as_sat().unsigned_abs());
+            }
+
+            // update confirmation time (if needed)
+            let conf_time = BlockTime::new(tx_res.info.blockheight, tx_res.info.blocktime);
+            if db_tx.confirmation_time != conf_time {
+                updated = true;
+                db_tx.confirmation_time = conf_time;
+            }
+
+            // update received (if needed)
+            let received = Self::_received_from_raw_tx(db, raw_tx)?;
+            if db_tx.received != received {
+                updated = true;
+                db_tx.received = received;
+            }
+
+            self.retained_txs.insert(tx_res.info.txid);
+            if updated {
+                self.updated_txs.insert(tx_res.info.txid);
+            }
+        }
+
+        // update sent from tx inputs
+        let sent_updates = self
+            .txs
+            .values()
+            .filter_map(|db_tx| {
+                let txid = self.retained_txs.get(&db_tx.txid)?;
+                self._sent_from_raw_tx(db, db_tx.transaction.as_ref()?)
+                    .map(|sent| {
+                        if db_tx.sent != sent {
+                            Some((*txid, sent))
+                        } else {
+                            None
+                        }
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // record send updates
+        sent_updates.into_iter().for_each(|(txid, sent)| {
+            self.txs.entry(txid).and_modify(|db_tx| db_tx.sent = sent);
+            self.updated_txs.insert(txid);
+        });
+
+        // obtain UTXOs from Core wallet
+        let core_utxos = client
+            .list_unspent(Some(0), None, None, Some(true), None)?
+            .into_iter()
+            .filter_map(|utxo_res| {
+                db.get_path_from_script_pubkey(&utxo_res.script_pub_key)
+                    .transpose()
+                    .map(|v| {
+                        v.map(|(keychain, _)| LocalUtxo {
+                            outpoint: OutPoint::new(utxo_res.txid, utxo_res.vout),
+                            keychain,
+                            txout: TxOut {
+                                value: utxo_res.amount.as_sat(),
+                                script_pubkey: utxo_res.script_pub_key,
+                            },
+                            is_spent: false,
+                        })
+                    })
+            })
+            .collect::<Result<HashSet<_>, Error>>()?;
+
+        // mark "spent utxos" to be updated in database
+        let spent_utxos = self.utxos.difference(&core_utxos).cloned().map(|mut utxo| {
+            utxo.is_spent = true;
+            utxo
+        });
+
+        // mark new utxos to be added in database
+        let new_utxos = core_utxos.difference(&self.utxos).cloned();
+
+        // add to updated utxos
+        self.updated_utxos = spent_utxos.chain(new_utxos).collect();
+
+        Ok(())
+    }
+
+    /// We want to filter out conflicting transactions.
+    /// Only accept transactions that are already confirmed, or existing in mempool.
+    fn _filter_tx(client: &Client, res: GetTransactionResult) -> Option<GetTransactionResult> {
+        if res.info.confirmations > 0 || client.get_mempool_entry(&res.info.txid).is_ok() {
+            Some(res)
+        } else {
+            None
+        }
+    }
+
+    /// Calculates received amount from raw tx.
+    fn _received_from_raw_tx<D: BatchDatabase>(db: &D, raw_tx: &Transaction) -> Result<u64, Error> {
+        raw_tx.output.iter().try_fold(0_u64, |recv, txo| {
+            let v = if db.is_mine(&txo.script_pubkey)? {
+                txo.value
+            } else {
+                0
+            };
+            Ok(recv + v)
+        })
+    }
+
+    /// Calculates sent from raw tx.
+    fn _sent_from_raw_tx<D: BatchDatabase>(
+        &self,
+        db: &D,
+        raw_tx: &Transaction,
+    ) -> Result<u64, Error> {
+        raw_tx.input.iter().try_fold(0_u64, |sent, txin| {
+            let v = match self._previous_output(&txin.previous_output) {
+                Some(prev_txo) => {
+                    if db.is_mine(&prev_txo.script_pubkey)? {
+                        prev_txo.value
+                    } else {
+                        0
+                    }
+                }
+                None => 0_u64,
+            };
+            Ok(sent + v)
+        })
+    }
+
+    fn _previous_output(&self, outpoint: &OutPoint) -> Option<&TxOut> {
+        let prev_tx = self.txs.get(&outpoint.txid)?.transaction.as_ref()?;
+        prev_tx.output.get(outpoint.vout as usize)
+    }
+
+    /// Apply db changes.
+    fn apply<D: BatchDatabase>(&self, db: &mut D) -> Result<(), Error> {
+        // delete stale txs from db
+        // stale = not retained
+        self.txs
+            .keys()
+            .filter(|&txid| !self.retained_txs.contains(txid))
+            .try_for_each(|txid| db.del_tx(txid, false).map(|_| ()))?;
+
+        // update txs
+        self.updated_txs
+            .iter()
+            .filter_map(|txid| self.txs.get(txid))
+            .try_for_each(|txd| db.set_tx(txd))?;
+
+        // update utxos
+        self.updated_utxos
+            .iter()
+            .try_for_each(|utxo| db.set_utxo(utxo))?;
+
+        Ok(())
+    }
+}
+
+fn import_descriptors<'a, S>(
+    client: &Client,
+    start_epoch: u64,
+    scripts_iter: S,
+) -> Result<(), Error>
+where
+    S: Iterator<Item = &'a Script>,
+{
+    let requests = Value::Array(
+        scripts_iter
+            .map(|script| {
+                let desc = descriptor_from_script_pubkey(script);
+                json!({ "timestamp": start_epoch, "desc": desc })
+            })
+            .collect(),
+    );
+    for v in client.call::<Vec<Value>>("importdescriptors", &[requests])? {
+        match v["success"].as_bool() {
+            Some(true) => continue,
+            Some(false) => {
+                return Err(Error::Generic(
+                    v["error"]["message"]
+                        .as_str()
+                        .map_or("unknown error".into(), ToString::to_string),
+                ))
+            }
+            _ => return Err(Error::Generic("Unexpected response form Core".to_string())),
+        }
+    }
+    Ok(())
+}
+
+fn import_multi<'a, S>(client: &Client, start_epoch: u64, scripts_iter: S) -> Result<(), Error>
+where
+    S: Iterator<Item = &'a Script>,
+{
+    let requests = scripts_iter
+        .map(|script| ImportMultiRequest {
+            timestamp: ImportMultiRescanSince::Timestamp(start_epoch),
+            script_pubkey: Some(ImportMultiRequestScriptPubkey::Script(script)),
+            watchonly: Some(true),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let options = ImportMultiOptions { rescan: Some(true) };
+    for v in client.import_multi(&requests, Some(&options))? {
+        if let Some(err) = v.error {
+            return Err(Error::Generic(format!(
+                "{} (code: {})",
+                err.message, err.code
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn get_scanning_details(client: &Client) -> Result<ScanningDetails, Error> {
+    #[derive(Deserialize)]
+    struct CallResult {
+        scanning: ScanningDetails,
+    }
+    let result: CallResult = client.call("getwalletinfo", &[])?;
+    Ok(result.scanning)
+}
+
+fn await_wallet_scan(
+    client: &Client,
+    poll_rate_sec: u64,
+    progress_update: &dyn Progress,
+) -> Result<(), Error> {
+    let dur = Duration::from_secs(poll_rate_sec);
+    loop {
+        match get_scanning_details(client)? {
+            ScanningDetails::Scanning { duration, progress } => {
+                println!("scanning: duration={}, progress={}", duration, progress);
+                progress_update
+                    .update(progress, Some(format!("elapsed for {} seconds", duration)))?;
+                thread::sleep(dur);
+            }
+            ScanningDetails::NotScanning(_) => {
+                progress_update.update(1.0, None)?;
+                println!("scanning: done!");
+                return Ok(());
+            }
+        };
+    }
+}
+
 /// Returns whether a wallet is legacy or descriptors by calling `getwalletinfo`.
 ///
 /// This API is mapped by bitcoincore_rpc, but it doesn't have the fields we need (either
@@ -507,6 +789,11 @@ fn is_wallet_descriptor(client: &Client) -> Result<bool, Error> {
 
     let result: CallResult = client.call("getwalletinfo", &[])?;
     Ok(result.descriptors.unwrap_or(false))
+}
+
+fn descriptor_from_script_pubkey(script: &Script) -> String {
+    let desc = format!("raw({})", script.to_hex());
+    format!("{}#{}", desc, get_checksum(&desc).unwrap())
 }
 
 /// Factory of [`RpcBlockchain`] instances, implements [`BlockchainFactory`]
@@ -529,6 +816,7 @@ fn is_wallet_descriptor(client: &Client) -> Result<bool, Error> {
 ///     network: Network::Testnet,
 ///     wallet_name_prefix: Some("prefix-".to_string()),
 ///     default_skip_blocks: 100_000,
+///     sync_params: None,
 /// };
 /// let main_wallet_blockchain = factory.build("main_wallet", Some(200_000))?;
 /// # Ok(())
@@ -546,6 +834,8 @@ pub struct RpcBlockchainFactory {
     pub wallet_name_prefix: Option<String>,
     /// Default number of blocks to skip which will be inherited by blockchain unless overridden
     pub default_skip_blocks: u32,
+    /// Sync parameters
+    pub sync_params: Option<RpcSyncParams>,
 }
 
 impl BlockchainFactory for RpcBlockchainFactory {
@@ -554,7 +844,7 @@ impl BlockchainFactory for RpcBlockchainFactory {
     fn build(
         &self,
         checksum: &str,
-        override_skip_blocks: Option<u32>,
+        _override_skip_blocks: Option<u32>,
     ) -> Result<Self::Inner, Error> {
         RpcBlockchain::from_config(&RpcConfig {
             url: self.url.clone(),
@@ -565,7 +855,7 @@ impl BlockchainFactory for RpcBlockchainFactory {
                 self.wallet_name_prefix.as_ref().unwrap_or(&String::new()),
                 checksum
             ),
-            skip_blocks: Some(override_skip_blocks.unwrap_or(self.default_skip_blocks)),
+            sync_params: self.sync_params.clone(),
         })
     }
 }
@@ -573,8 +863,12 @@ impl BlockchainFactory for RpcBlockchainFactory {
 #[cfg(test)]
 #[cfg(any(feature = "test-rpc", feature = "test-rpc-legacy"))]
 mod test {
+    use std::time;
+
     use super::*;
-    use crate::testutils::blockchain_tests::TestClient;
+    use crate::testutils::{
+        blockchain_tests::TestClient, configurable_blockchain_tests::ConfigurableBlockchainTester,
+    };
 
     use bitcoin::Network;
     use bitcoincore_rpc::RpcApi;
@@ -586,7 +880,7 @@ mod test {
                 auth: Auth::Cookie { file: test_client.bitcoind.params.cookie_file.clone() },
                 network: Network::Regtest,
                 wallet_name: format!("client-wallet-test-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() ),
-                skip_blocks: None,
+                sync_params: None,
             };
             RpcBlockchain::from_config(&config).unwrap()
         }
@@ -603,6 +897,7 @@ mod test {
             network: Network::Regtest,
             wallet_name_prefix: Some("prefix-".into()),
             default_skip_blocks: 0,
+            sync_params: None,
         };
 
         (test_client, factory)
@@ -613,7 +908,6 @@ mod test {
         let (_test_client, factory) = get_factory();
 
         let a = factory.build("aaaaaa", None).unwrap();
-        assert_eq!(a.skip_blocks, Some(0));
         assert_eq!(
             a.client
                 .get_wallet_info()
@@ -623,7 +917,6 @@ mod test {
         );
 
         let b = factory.build("bbbbbb", Some(100)).unwrap();
-        assert_eq!(b.skip_blocks, Some(100));
         assert_eq!(
             b.client
                 .get_wallet_info()
@@ -631,5 +924,40 @@ mod test {
                 .wallet_name,
             "prefix-bbbbbb"
         );
+    }
+
+    #[test]
+    fn test_rpc_with_variable_configs() {
+        struct RpcTester;
+
+        impl RpcTester {
+            fn rand_wallet_name(&self) -> String {
+                let now = time::UNIX_EPOCH.elapsed().unwrap();
+                now.as_micros().to_string()
+            }
+        }
+
+        impl ConfigurableBlockchainTester<RpcBlockchain> for RpcTester {
+            const BLOCKCHAIN_NAME: &'static str = "Rpc";
+
+            fn config_with_stop_gap(
+                &self,
+                test_client: &mut TestClient,
+                stop_gap: usize,
+            ) -> Option<<RpcBlockchain as ConfigurableBlockchain>::Config> {
+                Some(RpcConfig {
+                    url: test_client.bitcoind.rpc_url(),
+                    auth: Auth::Cookie {
+                        file: test_client.bitcoind.params.cookie_file.clone(),
+                    },
+                    network: Network::Regtest,
+                    wallet_name: self.rand_wallet_name(),
+                    sync_params: Some(RpcSyncParams {
+                        stop_gap,
+                        ..Default::default()
+                    }),
+                })
+            }
+        }
     }
 }

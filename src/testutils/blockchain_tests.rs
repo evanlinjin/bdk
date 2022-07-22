@@ -1267,7 +1267,7 @@ macro_rules! bdk_blockchain_tests {
                 wallet.sync(&blockchain, SyncOptions::default()).unwrap();
 
                 let _ = test_client.receive(testutils! {
-                    @tx ( (@external descriptors, 0)   => 50_000 )
+                    @tx ( (@external descriptors, 0) => 50_000 )
                 });
 
                 wallet.sync(&blockchain, SyncOptions::default()).unwrap();
