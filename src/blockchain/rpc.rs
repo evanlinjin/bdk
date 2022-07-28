@@ -41,8 +41,9 @@ use crate::error::MissingCachedScripts;
 use crate::{BlockTime, Error, FeeRate, KeychainKind, LocalUtxo, TransactionDetails};
 use bitcoin::Script;
 use bitcoincore_rpc::json::{
-    GetTransactionResult, ImportMultiOptions, ImportMultiRequest, ImportMultiRequestScriptPubkey,
-    ImportMultiRescanSince, ScanningDetails,
+    GetTransactionResult, GetTransactionResultDetailCategory, ImportMultiOptions,
+    ImportMultiRequest, ImportMultiRequestScriptPubkey, ImportMultiRescanSince,
+    ListReceivedByAddressResult, ScanningDetails,
 };
 use bitcoincore_rpc::jsonrpc::serde_json::{json, Value};
 use bitcoincore_rpc::Auth as RpcAuth;
@@ -408,8 +409,7 @@ impl ScriptsState {
                 ))
             })?;
 
-            let recv_list =
-                client.list_received_by_address(Some(&addr), Some(0), Some(true), Some(true))?;
+            let recv_list = list_received_by_address(client, &addr, 0)?;
 
             if recv_list.is_empty() {
                 continue;
@@ -551,6 +551,29 @@ impl DbState {
                 db_tx.received = received;
             }
 
+            // check if tx has a coinbase UTXO (add to updated UTXOs)
+            if let Some(d) = tx_res
+                .details
+                .iter()
+                .find(|d| d.category == GetTransactionResultDetailCategory::Immature)
+            {
+                let txout = raw_tx.output.get(d.vout as usize).cloned().ok_or_else(|| {
+                    Error::Generic(format!("Core RPC returned tx detail with invalid vout"))
+                })?;
+                println!("got immature detail!");
+
+                if let Some((keychain, _)) = db.get_path_from_script_pubkey(&txout.script_pubkey)? {
+                    let utxo = LocalUtxo {
+                        outpoint: OutPoint::new(tx_res.info.txid, d.vout),
+                        txout,
+                        keychain,
+                        is_spent: false,
+                    };
+                    self.updated_utxos.insert(utxo);
+                }
+            }
+
+            // update tx deltas
             self.retained_txs.insert(tx_res.info.txid);
             if updated {
                 self.updated_txs.insert(tx_res.info.txid);
@@ -623,6 +646,7 @@ impl DbState {
         if res.info.confirmations > 0 || client.get_mempool_entry(&res.info.txid).is_ok() {
             Some(res)
         } else {
+            debug!("tx filtered: {}", res.info.txid);
             None
         }
     }
@@ -743,6 +767,26 @@ where
         }
     }
     Ok(())
+}
+
+fn list_received_by_address(
+    client: &Client,
+    address: &Address,
+    minconf: u32,
+) -> Result<Vec<ListReceivedByAddressResult>, Error> {
+    client
+        .call(
+            "listreceivedbyaddress",
+            &[
+                Value::from(minconf),             // minconf
+                Value::from(true),                // include_empty
+                Value::from(true),                // include_watchonly
+                Value::from(address.to_string()), // address_filter
+                // TODO: Not all Bitcoin Core versions support this
+                // Value::from(true),                // include_immature_coinbase
+            ],
+        )
+        .map_err(Error::Rpc)
 }
 
 fn get_scanning_details(client: &Client) -> Result<ScanningDetails, Error> {
