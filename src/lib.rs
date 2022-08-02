@@ -260,6 +260,7 @@ pub mod testutils;
 #[allow(unused_imports)]
 #[macro_use]
 pub(crate) mod error;
+pub mod core;
 pub mod blockchain;
 pub mod database;
 pub mod descriptor;
