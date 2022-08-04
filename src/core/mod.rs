@@ -1,4 +1,3 @@
-
 // Bitcoin Dev Kit
 // Written in 2020 by Alekos Filini <alekos.filini@gmail.com>
 //
@@ -12,23 +11,42 @@
 
 //! BDK Core
 
+mod coin_filter;
+mod delta;
 mod sparse_chain;
-use std::collections::BTreeSet;
 
-use bitcoin::{BlockHash};
+use bitcoin::{BlockHash, Transaction, Txid};
+pub use coin_filter::*;
+pub use delta::*;
 pub use sparse_chain::*;
 
-/// Represents the position of a transaction in the blockchain
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TxPos {
-    /// height of block this transaction is included in
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockTime {
+    /// confirmation block height
     pub height: u32,
-    /// position of the transaction in the block
-    pub pos: u32,
+    /// confirmation block timestamp
+    pub time: u32,
 }
 
-/// Represents the blocks that a structure is synced from
-pub struct SyncedFrom {
-    // set of blocks (height, hash)
-    blocks: BTreeSet<(u32, BlockHash)>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainTx {
+    pub tx: Transaction,
+    pub confirmed_at: Option<BlockTime>,
+}
+
+/// Block header data that we are interested in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialHeader {
+    /// Block hash
+    pub hash: BlockHash,
+    /// Block time
+    pub time: u32,
+}
+
+/// Represents a candidate transaction to be introduced to [SparseChain].
+pub struct CandidateTx {
+    /// Txid of candidate.
+    pub txid: Txid,
+    /// Confirmed height and header (if any).
+    pub confirmed_at: Option<(u32, PartialHeader)>,
 }
