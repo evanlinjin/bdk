@@ -15,12 +15,13 @@ mod coin_filter;
 mod delta;
 mod sparse_chain;
 
-use bitcoin::{BlockHash, Transaction, Txid};
+use bitcoin::{BlockHash, OutPoint, Transaction, TxOut, Txid};
 pub use coin_filter::*;
 pub use delta::*;
 pub use sparse_chain::*;
 
-#[derive(Debug, Clone, PartialEq)]
+/// Contains the time + height of a block.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockTime {
     /// confirmation block height
     pub height: u32,
@@ -28,9 +29,12 @@ pub struct BlockTime {
     pub time: u32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// This is a transactions with `confirmed_at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainTx {
+    /// The raw transaction.
     pub tx: Transaction,
+    /// Confirmed at (if any).
     pub confirmed_at: Option<BlockTime>,
 }
 
@@ -49,4 +53,17 @@ pub struct CandidateTx {
     pub txid: Txid,
     /// Confirmed height and header (if any).
     pub confirmed_at: Option<(u32, PartialHeader)>,
+}
+
+/// A `TxOut` with as much data as we can retreive about it
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullTxOut {
+    /// Outpoint
+    pub outpoint: OutPoint,
+    /// TxOut
+    pub txout: TxOut,
+    /// Confirmed at (if any)
+    pub confirmed_at: Option<BlockTime>,
+    /// Spent by (if any)
+    pub spent_by: Option<Txid>,
 }

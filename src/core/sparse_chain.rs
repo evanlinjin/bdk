@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::{Debug, Display},
+    ops::RangeBounds,
 };
 
 use bitcoin::{OutPoint, Transaction, Txid};
@@ -19,7 +20,7 @@ pub enum CoreError {
 
 impl Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "core error: {}", self)
+        write!(f, "core error: {:?}", self)
     }
 }
 
@@ -53,7 +54,8 @@ pub struct SparseChain {
     // unconfirmed txs have block_height as `u32::Max`
     pub(crate) txs: BTreeMap<(u32, Txid), Transaction>,
     // last attempted spends that we are aware of <spent_outpoint, (spending_txid, spending_vin)>
-    pub(crate) spends: BTreeMap<OutPoint, (Txid, u32)>,
+    // TODO: Do we need to record multiple spends?
+    pub(crate) spends: BTreeMap<OutPoint, Txid>,
     // ref from tx to block height
     pub(crate) at_height: HashMap<Txid, u32>,
     // records persistence storage state changes (None: no change, Some: changes from...)
@@ -62,11 +64,19 @@ pub struct SparseChain {
 
 impl SparseChain {
     /// Iterates all txs.
-    pub fn iter_txs(&self) -> impl Iterator<Item = ChainTx> + '_ {
+    pub fn iter_txs(&self) -> impl DoubleEndedIterator<Item = ChainTx> + '_ {
         self.txs.iter().map(move |((height, _), tx)| ChainTx {
             tx: tx.clone(),
             confirmed_at: self.get_confirmed_at(height),
         })
+    }
+
+    /// Iterates [PartialHeader]s of relevant blocks.
+    pub fn iter_blocks(
+        &self,
+        range: impl RangeBounds<u32>,
+    ) -> impl DoubleEndedIterator<Item = (&u32, &PartialHeader)> + '_ {
+        self.blocks.range(range)
     }
 
     /// Generates a vector of avaliable coins.
@@ -96,15 +106,65 @@ impl SparseChain {
         coins
     }
 
-    /// A coin is spent when...
+    /// Returns whether an output of [OutPoint] is spent.
     pub fn is_spent(&self, outpoint: &OutPoint) -> bool {
-        matches!(self.spends.get(outpoint), Some((txid, _)) if self.at_height.contains_key(txid))
+        self.outspend(outpoint).is_some()
+    }
+
+    /// If the output is spent by a transaction that is tracked, this returns the [Txid] that spent
+    /// it. Otherwise, we return [None].
+    pub fn outspend(&self, outpoint: &OutPoint) -> Option<Txid> {
+        self.spends
+            .get(outpoint)
+            .and_then(|txid| {
+                if self.at_height.contains_key(txid) {
+                    Some(txid)
+                } else {
+                    None
+                }
+            })
+            .cloned()
+    }
+
+    /// The outputs from the transaction with id `txid` that have been spent.
+    ///
+    /// Each item contains the output index and the txid that spent that output.
+    pub fn outspends(&self, txid: Txid) -> impl DoubleEndedIterator<Item = (u32, Txid)> + '_ {
+        let start = OutPoint { txid, vout: 0 };
+        let end = OutPoint {
+            txid,
+            vout: u32::MAX,
+        };
+        self.spends
+            .range(start..=end)
+            .filter(move |(_, txid)| self.at_height.contains_key(*txid))
+            .map(|(outpoint, txid)| (outpoint.vout, *txid))
+    }
+
+    /// Obtain a [FullTxOut].
+    pub fn full_txout(&self, outpoint: &OutPoint) -> Option<FullTxOut> {
+        let height = *self.at_height.get(&outpoint.txid)?;
+        let tx = self
+            .txs
+            .get(&(height, outpoint.txid))
+            .expect("a tx back-ref should always be associated with an actual tx");
+
+        let txout = tx.output.get(outpoint.vout as usize)?;
+        let confirmed_at = self.get_confirmed_at(&height);
+        let spent_by = self.outspend(outpoint);
+
+        Some(FullTxOut {
+            outpoint: *outpoint,
+            txout: txout.clone(),
+            confirmed_at, // todo
+            spent_by,
+        })
     }
 
     /// Given the introduced transactions, calculate the deltas to be applied to [SparseChain].
     ///
     /// TODO: Conflict detection.
-    pub fn calculate_deltas<I>(&self, mut candidates: I) -> Result<Delta<Unready>, CoreError>
+    pub fn calculate_deltas<I>(&self, mut candidates: I) -> Result<Delta<Unfilled>, CoreError>
     where
         I: Iterator<Item = CandidateTx>,
     {
@@ -159,6 +219,11 @@ impl SparseChain {
         Ok(deltas)
     }
 
+    /// Apply [Delta] to [SparseChain].
+    pub fn apply_delta(&mut self, delta: Delta<Filled>) -> Result<(), CoreError> {
+        delta.apply_to_sparsechain(self)
+    }
+
     /// Flush [SparseChain] changes into persistence storage.
     pub fn flush<P: SparseChainPersister>(&mut self, p: P) -> Result<bool, CoreError> {
         match self.persist_from {
@@ -176,25 +241,74 @@ impl SparseChain {
         }
     }
 
-    /// Rollback all transactions from the given height and above.
+    /// Rollback all transactions from the given height and above and return the resultant [Delta].
+    ///
+    /// WARNING: The resultant [Delta<Negated>] should be applied to all `SpkTracker`s associated
+    /// with this [SparseChain], otherwise the `SpkTracker`s will end up in an inconsistent state.
     pub fn rollback(&mut self, height: u32) -> Delta<Negated> {
         let key = (height, Txid::default());
 
         let removed_blocks = self.blocks.split_off(&height);
         let removed_txs = self.txs.split_off(&key);
-        let removed_tx_keys = removed_txs
-            .keys()
-            .inspect(|(height, txid)| assert_eq!(self.at_height.remove(txid), Some(*height)))
-            .cloned()
-            .collect();
+
+        let mut delta = Delta::<Negated> {
+            blocks: removed_blocks,
+            tx_keys: BTreeSet::new(),
+            tx_values: HashMap::with_capacity(removed_txs.len()),
+            ..Default::default()
+        };
+
+        for ((height, txid), tx) in removed_txs {
+            // remove back ref
+            assert_eq!(self.at_height.remove(&txid), Some(height));
+
+            delta.tx_keys.insert((height, txid));
+            delta.tx_values.insert(txid, tx);
+        }
 
         self.update_persist_from(key);
 
-        Delta {
-            blocks: removed_blocks,
-            tx_keys: removed_tx_keys,
+        delta
+    }
+
+    /// Clear all unconfirmed txs, returning the resultant delta.
+    ///
+    /// This is the same as calling [SparseChain]::rollback(u32::MAX).
+    pub fn remove_unconfirmed(&mut self) -> Delta<Negated> {
+        self.rollback(u32::MAX)
+    }
+
+    /// Selectively remove multiple transactions of txids.
+    pub fn remove_txs<I: Iterator<Item = Txid>>(&mut self, txids: I) -> Delta<Negated> {
+        let mut delta = Delta {
+            tx_values: HashMap::with_capacity({
+                let (lower, upper) = txids.size_hint();
+                upper.unwrap_or(lower)
+            }),
             ..Default::default()
+        };
+
+        for txid in txids {
+            let removed_tx = self.at_height.remove_entry(&txid).map(|(txid, height)| {
+                self.txs
+                    .remove_entry(&(height, txid))
+                    .expect("a previous operation forgot to clear the tx-back-ref in `::at_height`")
+            });
+
+            if let Some(((height, txid), tx)) = removed_tx {
+                self.update_persist_from((height, txid));
+
+                delta.tx_keys.insert((height, txid));
+                delta.tx_values.insert(txid, tx);
+            }
         }
+
+        // clear empty blocks
+        if let Some((from_height, _)) = self.persist_from {
+            delta.blocks = self.remove_irrelevant_blocks(from_height);
+        }
+
+        delta
     }
 
     /// Get transaction of txid.
@@ -213,20 +327,7 @@ impl SparseChain {
         })
     }
 
-    /// Selectively remove a single transaction of txid.
-    pub fn remove_tx(&mut self, txid: Txid) -> bool {
-        let height = match self.at_height.remove(&txid) {
-            Some(height) => height,
-            None => return false,
-        };
-
-        let key = (height, txid);
-        self.txs.remove(&key).expect("tx back ref was not cleared");
-        self.update_persist_from(key);
-
-        return true;
-    }
-
+    /// helper: get [BlockTime] from `height`
     fn get_confirmed_at(&self, height: &u32) -> Option<BlockTime> {
         let at = self
             .blocks
@@ -245,6 +346,36 @@ impl SparseChain {
         at
     }
 
+    /// helper: clear irrelevant blocks from `persist_from`
+    ///
+    /// irrelevant blocks are blocks which do not have transactions that we track
+    fn remove_irrelevant_blocks(&mut self, from_height: u32) -> BTreeMap<u32, PartialHeader> {
+        let irrelevant_heights = self
+            .blocks
+            .range(from_height..)
+            .filter_map(|(&height, _)| {
+                // get count of txs of height
+                let tx_count = self
+                    .txs
+                    .range((height, Txid::default())..(height + 1, Txid::default()))
+                    .count();
+
+                // mark for deletion if height has no txs
+                if tx_count == 0 {
+                    Some(height)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        irrelevant_heights
+            .iter()
+            .filter_map(|height| self.blocks.remove_entry(height))
+            .collect()
+    }
+
+    /// helper: update `persist_from`
     fn update_persist_from(&mut self, from: (u32, Txid)) {
         self.persist_from = Some(match self.persist_from {
             Some(persist_from) => std::cmp::min(persist_from, from),

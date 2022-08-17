@@ -7,21 +7,21 @@ use bitcoin::{Transaction, Txid};
 
 use super::*;
 
-/// State of [Deltas].
+/// State of [Delta].
 pub trait DeltaState {}
-impl DeltaState for Unready {}
-impl DeltaState for Ready {}
+impl DeltaState for Unfilled {}
+impl DeltaState for Filled {}
 impl DeltaState for Negated {}
 
-/// [Deltas] is in an unready state (not all transactions exist).
+/// [Delta] is in an unfilled state (not all referenced transactions exist).
 #[derive(Debug, Default, Clone, Copy)]
-pub struct Unready;
+pub struct Unfilled;
 
-/// [Deltas] is in a ready state (we can apply to [SparseChain]).
+/// [Delta] is in a filled state (we can apply to [SparseChain]).
 #[derive(Debug, Default, Clone, Copy)]
-pub struct Ready;
+pub struct Filled;
 
-/// [Deltas] is in a negated state (to remove data).
+/// [Delta] is in a negated state (to remove data).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Negated;
 
@@ -30,14 +30,28 @@ pub struct Negated;
 pub struct Delta<S: DeltaState> {
     pub(crate) blocks: BTreeMap<u32, PartialHeader>,
     pub(crate) tx_keys: BTreeSet<(u32, Txid)>,
-
-    // needs to be filled for the `Ready` state
-    pub(crate) tx_values: HashMap<Txid, Transaction>,
+    pub(crate) tx_values: HashMap<Txid, Transaction>, // needs to be filled for the `Filled` state
 
     pub(crate) marker: PhantomData<S>,
 }
 
-impl Delta<Unready> {
+impl<S: DeltaState> Delta<S> {
+    /// Returns `true` if the [Delta] is empty (no changes).
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty() && self.tx_keys.is_empty()
+    }
+
+    /// Iterates through transactions that are contained in [Delta].
+    ///
+    /// [Txid]s in which the raw transaction is missing, are skipped.
+    pub fn iter_txs(&self) -> impl Iterator<Item = ((u32, Txid), Transaction)> + '_ {
+        self.tx_keys
+            .iter()
+            .filter_map(move |k| self.tx_values.get(&k.1).map(|tx| (*k, tx.clone())))
+    }
+}
+
+impl Delta<Unfilled> {
     /// Iterates through missing txids.
     pub fn missing_txids(&self) -> impl Iterator<Item = Txid> + '_ {
         self.tx_keys
@@ -47,14 +61,14 @@ impl Delta<Unready> {
     }
 
     /// Fill all transactions.
-    pub fn fill_transactions<I>(mut self, tx_iter: I) -> Result<Delta<Ready>, Self>
+    pub fn fill_transactions<I>(mut self, tx_iter: I) -> Result<Delta<Filled>, Self>
     where
         I: Iterator<Item = Transaction>,
     {
         self.tx_values.extend(tx_iter.map(|tx| (tx.txid(), tx)));
 
         if self.missing_txids().count() == 0 {
-            Ok(Delta::<Ready> {
+            Ok(Delta::<Filled> {
                 blocks: self.blocks,
                 tx_keys: self.tx_keys,
                 tx_values: self.tx_values,
@@ -66,38 +80,42 @@ impl Delta<Unready> {
     }
 }
 
-impl Delta<Ready> {
+impl Delta<Filled> {
     /// Applies deltas to the given [SparseChain].
     ///
     /// TODO: This can also be made to be appliable to [AvaliableCoins].
+    // TODO: We can return an `AppliedToSparseChain` struct that records confirmed txs.
     pub fn apply_to_sparsechain(self, sparsechain: &mut SparseChain) -> Result<(), CoreError> {
         let tx_heights = self
             .tx_keys
             .iter()
             .map(|(height, txid)| (*txid, *height))
             .collect::<Vec<_>>();
+
         let spends = self
             .tx_values
             .iter()
-            .map(|(txid, tx)| {
+            .flat_map(|(txid, tx)| {
                 tx.input
                     .iter()
-                    .enumerate()
-                    .map(|(vin, txin)| (txin.previous_output, (tx.txid(), vin as u32)))
-                    .collect::<Vec<_>>()
+                    .map(move |txin| (txin.previous_output, *txid))
+                    // .collect::<Vec<_>>()
             })
-            .flatten()
             .collect::<Vec<_>>();
+
         let persistence_state = self.tx_keys.iter().cloned().next();
 
-        // mark txs as confirmed
+        // mark txs as confirmed: remove txs of `(u32::MAX, txid)` as unconfired txs are stored
+        // with height u32::MAX
+        //
+        // TODO: We can return an `AppliedToSparseChain` struct that records confirmed txs.
         self.tx_keys.iter().for_each(|(_, txid)| {
             sparsechain.txs.remove(&(u32::MAX, *txid));
         });
 
         // update sparse chain
-        sparsechain.blocks.extend(self.blocks);
-        // sparsechain.txs.extend(todo!()); // TODO: Actually implement this!!!
+        sparsechain.blocks.extend(&self.blocks);
+        sparsechain.txs.extend(self.iter_txs());
         sparsechain.at_height.extend(tx_heights);
         sparsechain.spends.extend(spends);
         sparsechain.persist_from = match (sparsechain.persist_from, persistence_state) {
