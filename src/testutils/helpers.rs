@@ -135,7 +135,8 @@ pub(crate) fn get_funded_wallet(
     };
 
     wallet
-        .database_mut()
+        .database
+        .borrow_mut()
         .set_script_pubkey(
             &bitcoin::Address::from_str(&tx_meta.output.get(0).unwrap().to_address)
                 .unwrap()
@@ -145,11 +146,17 @@ pub(crate) fn get_funded_wallet(
         )
         .unwrap();
     wallet
-        .database_mut()
+        .database
+        .borrow_mut()
         .set_last_index(KeychainKind::External, funding_address_kix)
         .unwrap();
 
-    let txid = populate_test_db(&mut *wallet.database_mut(), tx_meta, Some(100), false);
+    let txid = populate_test_db(
+        &mut *wallet.database.borrow_mut(),
+        tx_meta,
+        Some(100),
+        false,
+    );
 
     (wallet, descriptors, txid)
 }
