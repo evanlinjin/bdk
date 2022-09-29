@@ -1142,7 +1142,6 @@ mod test {
     use crate::descriptor::{ExtractPolicy, IntoWalletDescriptor};
 
     use super::*;
-    use crate::descriptor::derived::AsDerived;
     use crate::descriptor::policy::SatisfiableItem::{EcdsaSignature, Multisig, Thresh};
     use crate::keys::{DescriptorKey, IntoDescriptorKey};
     use crate::wallet::signer::SignersContainer;
@@ -1592,7 +1591,7 @@ mod test {
             .unwrap();
 
         let addr = wallet_desc
-            .as_derived(0, &secp)
+            .at_derivation_index(0)
             .address(Network::Testnet)
             .unwrap();
         assert_eq!(

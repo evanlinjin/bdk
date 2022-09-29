@@ -708,9 +708,9 @@ where
 
         let n_sequence = match (params.rbf, requirements.csv) {
             // No RBF or CSV but there's an nLockTime, so the nSequence cannot be final
-            (None, None) if lock_time != 0 => 0xFFFFFFFE,
+            (None, None) if lock_time != 0 => Sequence::ENABLE_LOCKTIME_NO_RBF,
             // No RBF, CSV or nLockTime, make the transaction final
-            (None, None) => 0xFFFFFFFF,
+            (None, None) => Sequence::MAX,
 
             // No RBF requested, use the value from CSV. Note that this value is by definition
             // non-final, so even if a timelock is enabled this nSequence is fine, hence why we
@@ -1850,7 +1850,7 @@ pub fn get_funded_wallet(
 
 #[cfg(test)]
 pub(crate) mod test {
-    use bitcoin::{util::psbt, Network};
+    use bitcoin::{util::psbt, Network, Sequence, PackedLockTime};
 
     use crate::database::Database;
     use crate::types::KeychainKind;
@@ -2163,7 +2163,7 @@ pub(crate) mod test {
 
         // Since we never synced the wallet we don't have a last_sync_height
         // we could use to try to prevent fee sniping. We default to 0.
-        assert_eq!(psbt.unsigned_tx.lock_time, 0);
+        assert_eq!(psbt.unsigned_tx.lock_time, PackedLockTime(0));
     }
 
     #[test]
@@ -2188,7 +2188,7 @@ pub(crate) mod test {
         let (psbt, _) = builder.finish().unwrap();
 
         // current_height will override the last sync height
-        assert_eq!(psbt.unsigned_tx.lock_time, current_height);
+        assert_eq!(psbt.unsigned_tx.lock_time, PackedLockTime(current_height));
     }
 
     #[test]
@@ -2211,7 +2211,7 @@ pub(crate) mod test {
         let (psbt, _) = builder.finish().unwrap();
 
         // If there's no current_height we're left with using the last sync height
-        assert_eq!(psbt.unsigned_tx.lock_time, sync_time.block_time.height);
+        assert_eq!(psbt.unsigned_tx.lock_time, PackedLockTime(sync_time.block_time.height));
     }
 
     #[test]
@@ -2222,7 +2222,7 @@ pub(crate) mod test {
         builder.add_recipient(addr.script_pubkey(), 25_000);
         let (psbt, _) = builder.finish().unwrap();
 
-        assert_eq!(psbt.unsigned_tx.lock_time, 100_000);
+        assert_eq!(psbt.unsigned_tx.lock_time, PackedLockTime(100_000));
     }
 
     #[test]
@@ -2239,7 +2239,7 @@ pub(crate) mod test {
         // When we explicitly specify a nlocktime
         // we don't try any fee sniping prevention trick
         // (we ignore the current_height)
-        assert_eq!(psbt.unsigned_tx.lock_time, 630_000);
+        assert_eq!(psbt.unsigned_tx.lock_time, PackedLockTime(630_000));
     }
 
     #[test]
@@ -2252,7 +2252,7 @@ pub(crate) mod test {
             .nlocktime(630_000);
         let (psbt, _) = builder.finish().unwrap();
 
-        assert_eq!(psbt.unsigned_tx.lock_time, 630_000);
+        assert_eq!(psbt.unsigned_tx.lock_time, PackedLockTime(630_000));
     }
 
     #[test]
@@ -2277,7 +2277,7 @@ pub(crate) mod test {
         builder.add_recipient(addr.script_pubkey(), 25_000);
         let (psbt, _) = builder.finish().unwrap();
 
-        assert_eq!(psbt.unsigned_tx.input[0].sequence, 6);
+        assert_eq!(psbt.unsigned_tx.input[0].sequence, Sequence(6));
     }
 
     #[test]
@@ -2291,7 +2291,7 @@ pub(crate) mod test {
         let (psbt, _) = builder.finish().unwrap();
         // When CSV is enabled it takes precedence over the rbf value (unless forced by the user).
         // It will be set to the OP_CSV value, in this case 6
-        assert_eq!(psbt.unsigned_tx.input[0].sequence, 6);
+        assert_eq!(psbt.unsigned_tx.input[0].sequence, Sequence(6));
     }
 
     #[test]
@@ -2316,7 +2316,7 @@ pub(crate) mod test {
         builder.add_recipient(addr.script_pubkey(), 25_000);
         let (psbt, _) = builder.finish().unwrap();
 
-        assert_eq!(psbt.unsigned_tx.input[0].sequence, 0xFFFFFFFE);
+        assert_eq!(psbt.unsigned_tx.input[0].sequence, Sequence(0xFFFFFFFE));
     }
 
     #[test]
@@ -2341,7 +2341,7 @@ pub(crate) mod test {
             .enable_rbf_with_sequence(0xDEADBEEF);
         let (psbt, _) = builder.finish().unwrap();
 
-        assert_eq!(psbt.unsigned_tx.input[0].sequence, 0xDEADBEEF);
+        assert_eq!(psbt.unsigned_tx.input[0].sequence, Sequence(0xDEADBEEF));
     }
 
     #[test]
@@ -2368,7 +2368,7 @@ pub(crate) mod test {
         builder.add_recipient(addr.script_pubkey(), 25_000);
         let (psbt, _) = builder.finish().unwrap();
 
-        assert_eq!(psbt.unsigned_tx.input[0].sequence, 0xFFFFFFFF);
+        assert_eq!(psbt.unsigned_tx.input[0].sequence, Sequence(0xFFFFFFFF));
     }
 
     #[test]
@@ -2889,7 +2889,7 @@ pub(crate) mod test {
             .policy_path(path, KeychainKind::External);
         let (psbt, _) = builder.finish().unwrap();
 
-        assert_eq!(psbt.unsigned_tx.input[0].sequence, 0xFFFFFFFF);
+        assert_eq!(psbt.unsigned_tx.input[0].sequence, Sequence(0xFFFFFFFF));
     }
 
     #[test]
@@ -2908,7 +2908,7 @@ pub(crate) mod test {
             .policy_path(path, KeychainKind::External);
         let (psbt, _) = builder.finish().unwrap();
 
-        assert_eq!(psbt.unsigned_tx.input[0].sequence, 144);
+        assert_eq!(psbt.unsigned_tx.input[0].sequence, Sequence(144));
     }
 
     #[test]
