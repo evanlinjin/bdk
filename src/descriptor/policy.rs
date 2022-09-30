@@ -1148,7 +1148,6 @@ mod test {
     use bitcoin::secp256k1::Secp256k1;
     use bitcoin::util::bip32;
     use bitcoin::Network;
-    use miniscript::DescriptorTrait;
     use std::str::FromStr;
     use std::sync::Arc;
 
@@ -1346,9 +1345,8 @@ mod test {
         let (wallet_desc, keymap) = desc
             .into_wallet_descriptor(&secp, Network::Testnet)
             .unwrap();
-        let single_key = wallet_desc.derive(0);
         let signers_container = Arc::new(SignersContainer::build(keymap, &wallet_desc, &secp));
-        let policy = single_key
+        let policy = wallet_desc
             .extract_policy(&signers_container, BuildSatisfaction::None, &secp)
             .unwrap()
             .unwrap();
@@ -1360,16 +1358,15 @@ mod test {
         let (wallet_desc, keymap) = desc
             .into_wallet_descriptor(&secp, Network::Testnet)
             .unwrap();
-        let single_key = wallet_desc.derive(0);
         let signers_container = Arc::new(SignersContainer::build(keymap, &wallet_desc, &secp));
-        let policy = single_key
+        let policy = wallet_desc
             .extract_policy(&signers_container, BuildSatisfaction::None, &secp)
             .unwrap()
             .unwrap();
 
-        assert!(matches!(&policy.item, EcdsaSignature(PkOrF::Fingerprint(f)) if f == &fingerprint));
+        assert!(matches!(policy.item, EcdsaSignature(PkOrF::Fingerprint(f)) if f == fingerprint));
         assert!(
-            matches!(&policy.contribution, Satisfaction::Complete {condition} if condition.csv == None && condition.timelock == None)
+            matches!(policy.contribution, Satisfaction::Complete {condition} if condition.csv == None && condition.timelock == None)
         );
     }
 
@@ -1385,21 +1382,20 @@ mod test {
         let (wallet_desc, keymap) = desc
             .into_wallet_descriptor(&secp, Network::Testnet)
             .unwrap();
-        let single_key = wallet_desc.derive(0);
         let signers_container = Arc::new(SignersContainer::build(keymap, &wallet_desc, &secp));
-        let policy = single_key
+        let policy = wallet_desc
             .extract_policy(&signers_container, BuildSatisfaction::None, &secp)
             .unwrap()
             .unwrap();
 
         assert!(
-            matches!(&policy.item, Multisig { keys, threshold } if threshold == &1
+            matches!(policy.item, Multisig { keys, threshold } if threshold == 1
             && keys[0] == PkOrF::Fingerprint(fingerprint0)
             && keys[1] == PkOrF::Fingerprint(fingerprint1))
         );
         assert!(
-            matches!(&policy.contribution, Satisfaction::PartialComplete { n, m, items, conditions, .. } if n == &2
-             && m == &1
+            matches!(policy.contribution, Satisfaction::PartialComplete { n, m, items, conditions, .. } if n == 2
+             && m == 1
              && items.len() == 2
              && conditions.contains_key(&vec![0])
              && conditions.contains_key(&vec![1])
@@ -1663,7 +1659,7 @@ mod test {
         let signers_container = Arc::new(SignersContainer::build(keymap, &wallet_desc, &secp));
 
         let addr = wallet_desc
-            .as_derived(0, &secp)
+            .at_derivation_index(0)
             .address(Network::Testnet)
             .unwrap();
         assert_eq!(

@@ -856,10 +856,12 @@ mod test {
     }
 
     fn get_test_utxos() -> Vec<LocalUtxo> {
+        use bitcoin::hashes::Hash;
+
         vec![
             LocalUtxo {
                 outpoint: OutPoint {
-                    txid: Default::default(),
+                    txid: bitcoin::Txid::from_inner([0; 32]),
                     vout: 0,
                 },
                 txout: Default::default(),
@@ -868,7 +870,7 @@ mod test {
             },
             LocalUtxo {
                 outpoint: OutPoint {
-                    txid: Default::default(),
+                    txid: bitcoin::Txid::from_inner([0; 32]),
                     vout: 1,
                 },
                 txout: Default::default(),

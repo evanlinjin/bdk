@@ -690,7 +690,7 @@ where
             // No RBF requested, use the value from CSV. Note that this value is by definition
             // non-final, so even if a timelock is enabled this nSequence is fine, hence why we
             // don't bother checking for it here. The same is true for all the other branches below
-            (None, Some(csv)) => csv,
+            (None, Some(csv)) => Sequence(csv),
 
             // RBF with a specific value but that value is too high
             (Some(tx_builder::RbfValue::Value(rbf)), _) if rbf >= 0xFFFFFFFE => {
@@ -709,10 +709,10 @@ where
             }
 
             // RBF enabled with the default value with CSV also enabled. CSV takes precedence
-            (Some(tx_builder::RbfValue::Default), Some(csv)) => csv,
+            (Some(tx_builder::RbfValue::Default), Some(csv)) => Sequence(csv),
             // Valid RBF, either default or with a specific value. We ignore the `CSV` value
             // because we've already checked it before
-            (Some(rbf), _) => rbf.get_value(),
+            (Some(rbf), _) => Sequence(rbf.get_value()), // TODO: remove wrapping Sequence
         };
 
         let (fee_rate, mut fee_amount) = match params
@@ -840,7 +840,7 @@ where
             .map(|u| bitcoin::TxIn {
                 previous_output: u.outpoint(),
                 script_sig: Script::default(),
-                sequence: Sequence(n_sequence),
+                sequence: n_sequence,
                 witness: Witness::new(),
             })
             .collect();
@@ -1615,29 +1615,41 @@ where
         &self,
         psbt: &mut psbt::PartiallySignedTransaction,
     ) -> Result<(), Error> {
-        // We need to borrow `psbt` mutably within the loop, so we have to allocate a vec for all
-        // the utxos first
+        // We need to borrow `psbt` mutably within the loops, so we have to allocate a vec for all
+        // the input utxos and outputs
         let utxos = (0..psbt.inputs.len())
-            .filter_map(|i| psbt.get_utxo_for(i))
+            .filter_map(|i| psbt.get_utxo_for(i).map(|utxo| (true, i, utxo)))
+            .chain(
+                psbt.unsigned_tx
+                    .output
+                    .iter()
+                    .enumerate()
+                    .map(|(i, out)| (false, i, out.clone())),
+            )
             .collect::<Vec<_>>();
 
-        // Try to figure out the keychain and derivation for every input
-        for (index, out) in utxos.into_iter().enumerate() {
+        // Try to figure out the keychain and derivation for every input and output
+        for (is_input, index, out) in utxos.into_iter() {
             if let Some((keychain, child)) = self
                 .database
                 .borrow()
                 .get_path_from_script_pubkey(&out.script_pubkey)?
             {
-                debug!("Found descriptor {:?}/{}", keychain, child);
+                debug!(
+                    "Found descriptor for input #{} {:?}/{}",
+                    index, keychain, child
+                );
 
-                // Update the metadata
                 let desc = self.get_descriptor_for_keychain(keychain);
                 let desc = desc.at_derivation_index(child);
 
-                psbt.update_input_with_descriptor(index, &desc)
-                    .map_err(MiniscriptPsbtError::UtxoUpdateError)?;
-                psbt.update_output_with_descriptor(index, &desc)
-                    .map_err(MiniscriptPsbtError::OutputUpdateError)?;
+                if is_input {
+                    psbt.update_input_with_descriptor(index, &desc)
+                        .map_err(MiniscriptPsbtError::UtxoUpdateError)?;
+                } else {
+                    psbt.update_output_with_descriptor(index, &desc)
+                        .map_err(MiniscriptPsbtError::OutputUpdateError)?;
+                }
             }
         }
 
@@ -1815,7 +1827,7 @@ pub fn get_funded_wallet(
 
 #[cfg(test)]
 pub(crate) mod test {
-    use bitcoin::{util::psbt, Network, Sequence, PackedLockTime};
+    use bitcoin::{util::psbt, Network, PackedLockTime, Sequence};
 
     use crate::database::Database;
     use crate::types::KeychainKind;
@@ -2176,7 +2188,10 @@ pub(crate) mod test {
         let (psbt, _) = builder.finish().unwrap();
 
         // If there's no current_height we're left with using the last sync height
-        assert_eq!(psbt.unsigned_tx.lock_time, PackedLockTime(sync_time.block_time.height));
+        assert_eq!(
+            psbt.unsigned_tx.lock_time,
+            PackedLockTime(sync_time.block_time.height)
+        );
     }
 
     #[test]
@@ -4736,48 +4751,50 @@ pub(crate) mod test {
             .policy_path(path, KeychainKind::External);
         let (psbt, _) = builder.finish().unwrap();
 
+        let mut input_key_origins = psbt.inputs[0]
+            .tap_key_origins
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>();
+        input_key_origins.sort();
+
         assert_eq!(
-            psbt.inputs[0]
-                .tap_key_origins
-                .clone()
-                .into_iter()
-                .collect::<Vec<_>>(),
-            vec![(
-                from_str!("2b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3"),
+            input_key_origins,
+            vec![
                 (
-                    vec![
-                        from_str!(
-                            "858ad7a7d7f270e2c490c4d6ba00c499e46b18fdd59ea3c2c47d20347110271e"
-                        ),
-                        from_str!(
-                            "f6e927ad4492c051fe325894a4f5f14538333b55a35f099876be42009ec8f903"
-                        )
-                    ],
-                    (Default::default(), Default::default())
+                    from_str!("b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55"),
+                    (
+                        vec![],
+                        (FromStr::from_str("871fd295").unwrap(), vec![].into())
+                    )
+                ),
+                (
+                    from_str!("2b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3"),
+                    (
+                        vec![
+                            from_str!(
+                                "858ad7a7d7f270e2c490c4d6ba00c499e46b18fdd59ea3c2c47d20347110271e"
+                            ),
+                            from_str!(
+                                "f6e927ad4492c051fe325894a4f5f14538333b55a35f099876be42009ec8f903"
+                            ),
+                        ],
+                        (FromStr::from_str("ece52657").unwrap(), vec![].into())
+                    )
                 )
-            )],
+            ],
             "Wrong input tap_key_origins"
         );
+
+        let mut output_key_origins = psbt.outputs[0]
+            .tap_key_origins
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>();
+        output_key_origins.sort();
+
         assert_eq!(
-            psbt.outputs[0]
-                .tap_key_origins
-                .clone()
-                .into_iter()
-                .collect::<Vec<_>>(),
-            vec![(
-                from_str!("2b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3"),
-                (
-                    vec![
-                        from_str!(
-                            "858ad7a7d7f270e2c490c4d6ba00c499e46b18fdd59ea3c2c47d20347110271e"
-                        ),
-                        from_str!(
-                            "f6e927ad4492c051fe325894a4f5f14538333b55a35f099876be42009ec8f903"
-                        )
-                    ],
-                    (Default::default(), Default::default())
-                )
-            )],
+            input_key_origins, output_key_origins,
             "Wrong output tap_key_origins"
         );
     }
@@ -5029,7 +5046,7 @@ pub(crate) mod test {
     #[test]
     fn test_taproot_script_spend_sign_include_some_leaves() {
         use crate::signer::TapLeavesOptions;
-        use crate::wallet::taproot::TapLeafHash;
+        use bitcoin::util::taproot::TapLeafHash;
 
         let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
         let addr = wallet.get_address(AddressIndex::New).unwrap();
@@ -5071,7 +5088,7 @@ pub(crate) mod test {
     #[test]
     fn test_taproot_script_spend_sign_exclude_some_leaves() {
         use crate::signer::TapLeavesOptions;
-        use crate::wallet::taproot::TapLeafHash;
+        use bitcoin::util::taproot::TapLeafHash;
 
         let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
         let addr = wallet.get_address(AddressIndex::New).unwrap();
