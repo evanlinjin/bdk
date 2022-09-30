@@ -45,7 +45,7 @@ use serde::{Serialize, Serializer};
 
 use bitcoin::hashes::{hash160, ripemd160, sha256};
 use bitcoin::util::bip32::Fingerprint;
-use bitcoin::{PublicKey, XOnlyPublicKey};
+use bitcoin::{LockTime, PublicKey, Sequence, XOnlyPublicKey};
 
 use miniscript::descriptor::{
     DescriptorPublicKey, ShInner, SinglePub, SinglePubKey, SortedMultiVec, WshInner,
@@ -61,7 +61,7 @@ use log::{debug, error, info, trace};
 use crate::descriptor::ExtractPolicy;
 use crate::keys::ExtScriptContext;
 use crate::wallet::signer::{SignerId, SignersContainer};
-use crate::wallet::utils::{self, After, Older, SecpCtx};
+use crate::wallet::utils::{After, Older, SecpCtx};
 
 use super::checksum::get_checksum;
 use super::error::Error;
@@ -128,13 +128,13 @@ pub enum SatisfiableItem {
     },
     /// Absolute timeclock timestamp
     AbsoluteTimelock {
-        /// The timestamp value
-        value: u32,
+        /// The timelock value
+        value: LockTime,
     },
     /// Relative timelock locktime
     RelativeTimelock {
-        /// The locktime value
-        value: u32,
+        /// The timelock value
+        value: Sequence,
     },
     /// Multi-signature public keys with threshold count
     Multisig {
@@ -442,32 +442,29 @@ pub struct Policy {
 
 /// An extra condition that must be satisfied but that is out of control of the user
 /// TODO: use `bitcoin::LockTime` and `bitcoin::Sequence`
-#[derive(Hash, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Serialize)]
+#[derive(Hash, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Default, Serialize)]
 pub struct Condition {
     /// Optional CheckSequenceVerify condition
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub csv: Option<u32>,
+    pub csv: Option<Sequence>,
     /// Optional timelock condition
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timelock: Option<u32>,
+    pub timelock: Option<LockTime>,
 }
 
 impl Condition {
-    fn merge_nlocktime(a: u32, b: u32) -> Result<u32, PolicyError> {
-        if (a < utils::BLOCKS_TIMELOCK_THRESHOLD) != (b < utils::BLOCKS_TIMELOCK_THRESHOLD) {
+    fn merge_nlocktime(a: LockTime, b: LockTime) -> Result<LockTime, PolicyError> {
+        if !a.is_same_unit(b) {
             Err(PolicyError::MixedTimelockUnits)
+        } else if a > b {
+            Ok(a)
         } else {
-            Ok(max(a, b))
+            Ok(b)
         }
     }
 
-    fn merge_nsequence(a: u32, b: u32) -> Result<u32, PolicyError> {
-        let mask = utils::SEQUENCE_LOCKTIME_TYPE_FLAG | utils::SEQUENCE_LOCKTIME_MASK;
-
-        let a = a & mask;
-        let b = b & mask;
-
-        if (a < utils::SEQUENCE_LOCKTIME_TYPE_FLAG) != (b < utils::SEQUENCE_LOCKTIME_TYPE_FLAG) {
+    fn merge_nsequence(a: Sequence, b: Sequence) -> Result<Sequence, PolicyError> {
+        if a.is_time_locked() != b.is_time_locked() {
             Err(PolicyError::MixedTimelockUnits)
         } else {
             Ok(max(a, b))
@@ -899,12 +896,12 @@ impl<Ctx: ScriptContext + 'static> ExtractPolicy for Miniscript<DescriptorPublic
             }
             Terminal::After(value) => {
                 let mut policy: Policy = SatisfiableItem::AbsoluteTimelock {
-                    value: value.to_u32(),
+                    value: value.into(),
                 }
                 .into();
                 policy.contribution = Satisfaction::Complete {
                     condition: Condition {
-                        timelock: Some(value.to_u32()),
+                        timelock: Some(value.into()),
                         csv: None,
                     },
                 };
@@ -928,14 +925,11 @@ impl<Ctx: ScriptContext + 'static> ExtractPolicy for Miniscript<DescriptorPublic
                 Some(policy)
             }
             Terminal::Older(value) => {
-                let mut policy: Policy = SatisfiableItem::RelativeTimelock {
-                    value: value.to_consensus_u32(),
-                }
-                .into();
+                let mut policy: Policy = SatisfiableItem::RelativeTimelock { value: *value }.into();
                 policy.contribution = Satisfaction::Complete {
                     condition: Condition {
                         timelock: None,
-                        csv: Some(value.to_consensus_u32()),
+                        csv: Some(*value),
                     },
                 };
                 if let BuildSatisfaction::PsbtTimelocks {
@@ -1440,8 +1434,8 @@ mod test {
              && m == &2
              && items.len() == 3
              && conditions.get(&vec![0,1]).unwrap().iter().next().unwrap().csv.is_none()
-             && conditions.get(&vec![0,2]).unwrap().iter().next().unwrap().csv == Some(sequence)
-             && conditions.get(&vec![1,2]).unwrap().iter().next().unwrap().csv == Some(sequence)
+             && conditions.get(&vec![0,2]).unwrap().iter().next().unwrap().csv == Some(Sequence(sequence))
+             && conditions.get(&vec![1,2]).unwrap().iter().next().unwrap().csv == Some(Sequence(sequence))
             )
         );
     }

@@ -461,7 +461,7 @@ impl DescriptorMeta for ExtendedDescriptor {
                         // that come before the wildcard, so we take them directly from `xpub` and then append
                         // the final index
                         if verify_key(
-                            &xpub,
+                            xpub,
                             &xpub.derivation_path.extend(derive_path.clone()),
                             expected,
                         ) {

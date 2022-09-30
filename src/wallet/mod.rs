@@ -26,8 +26,8 @@ use bitcoin::secp256k1::Secp256k1;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::util::psbt;
 use bitcoin::{
-    Address, EcdsaSighashType, Network, OutPoint, PackedLockTime, SchnorrSighashType, Script,
-    Sequence, Transaction, TxOut, Txid, Witness,
+    Address, EcdsaSighashType, LockTime, Network, OutPoint, SchnorrSighashType, Script, Sequence,
+    Transaction, TxOut, Txid, Witness,
 };
 
 use miniscript::psbt::{PsbtExt, PsbtInputExt, PsbtInputSatisfier};
@@ -54,7 +54,7 @@ pub use utils::IsDust;
 use coin_selection::DefaultCoinSelectionAlgorithm;
 use signer::{SignOptions, SignerOrdering, SignersContainer, TransactionSigner};
 use tx_builder::{BumpFee, CreateTx, FeePolicy, TxBuilder, TxParams};
-use utils::{check_nlocktime, check_nsequence_rbf, After, Older, SecpCtx};
+use utils::{check_nsequence_rbf, After, Older, SecpCtx};
 
 use crate::blockchain::{GetHeight, NoopProgress, Progress, WalletSync};
 use crate::database::memory::MemoryDatabase;
@@ -133,7 +133,7 @@ pub enum AddressIndex {
 
 /// A derived address and the index it was found at
 /// For convenience this automatically derefs to `Address`
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct AddressInfo {
     /// Child index of this address
     pub index: u32,
@@ -655,10 +655,9 @@ where
         // We use a match here instead of a map_or_else as it's way more readable :)
         let current_height = match params.current_height {
             // If they didn't tell us the current height, we assume it's the latest sync height.
-            None => self
-                .database()
-                .get_sync_time()?
-                .map(|sync_time| sync_time.block_time.height),
+            None => self.database().get_sync_time()?.map(|sync_time| {
+                LockTime::from_height(sync_time.block_time.height).expect("Invalid height")
+            }),
             h => h,
         };
 
@@ -668,32 +667,41 @@ where
                 // Fee sniping can be partially prevented by setting the timelock
                 // to current_height. If we don't know the current_height,
                 // we default to 0.
-                let fee_sniping_height = current_height.unwrap_or(0);
+                let fee_sniping_height = current_height.unwrap_or(LockTime::ZERO);
+
                 // We choose the biggest between the required nlocktime and the fee sniping
                 // height
-                std::cmp::max(requirements.timelock.unwrap_or(0), fee_sniping_height)
+                match requirements.timelock {
+                    // No requirement, just use the fee_sniping_height
+                    None => fee_sniping_height,
+                    // There's a block-based requirement, but the value is lower than the fee_sniping_height
+                    Some(value @ LockTime::Blocks(_)) if value < fee_sniping_height => fee_sniping_height,
+                    // There's a time-based requirement or a block-based requirement greater
+                    // than the fee_sniping_height use that value
+                    Some(value) => value,
+                }
             }
             // Specific nLockTime required and we have no constraints, so just set to that value
             Some(x) if requirements.timelock.is_none() => x,
             // Specific nLockTime required and it's compatible with the constraints
-            Some(x) if check_nlocktime(x, requirements.timelock.unwrap()) => x,
+            Some(x) if requirements.timelock.unwrap().is_same_unit(x) && x >= requirements.timelock.unwrap() => x,
             // Invalid nLockTime required
-            Some(x) => return Err(Error::Generic(format!("TxBuilder requested timelock of `{}`, but at least `{}` is required to spend from this script", x, requirements.timelock.unwrap())))
+            Some(x) => return Err(Error::Generic(format!("TxBuilder requested timelock of `{:?}`, but at least `{:?}` is required to spend from this script", x, requirements.timelock.unwrap())))
         };
 
         let n_sequence = match (params.rbf, requirements.csv) {
             // No RBF or CSV but there's an nLockTime, so the nSequence cannot be final
-            (None, None) if lock_time != 0 => Sequence::ENABLE_LOCKTIME_NO_RBF,
+            (None, None) if lock_time != LockTime::ZERO => Sequence::ENABLE_LOCKTIME_NO_RBF,
             // No RBF, CSV or nLockTime, make the transaction final
             (None, None) => Sequence::MAX,
 
             // No RBF requested, use the value from CSV. Note that this value is by definition
             // non-final, so even if a timelock is enabled this nSequence is fine, hence why we
             // don't bother checking for it here. The same is true for all the other branches below
-            (None, Some(csv)) => Sequence(csv),
+            (None, Some(csv)) => csv,
 
             // RBF with a specific value but that value is too high
-            (Some(tx_builder::RbfValue::Value(rbf)), _) if rbf >= 0xFFFFFFFE => {
+            (Some(tx_builder::RbfValue::Value(rbf)), _) if !rbf.is_rbf() => {
                 return Err(Error::Generic(
                     "Cannot enable RBF with a nSequence >= 0xFFFFFFFE".into(),
                 ))
@@ -703,16 +711,16 @@ where
                 if !check_nsequence_rbf(rbf, csv) =>
             {
                 return Err(Error::Generic(format!(
-                    "Cannot enable RBF with nSequence `{}` given a required OP_CSV of `{}`",
+                    "Cannot enable RBF with nSequence `{:?}` given a required OP_CSV of `{:?}`",
                     rbf, csv
                 )))
             }
 
             // RBF enabled with the default value with CSV also enabled. CSV takes precedence
-            (Some(tx_builder::RbfValue::Default), Some(csv)) => Sequence(csv),
+            (Some(tx_builder::RbfValue::Default), Some(csv)) => csv,
             // Valid RBF, either default or with a specific value. We ignore the `CSV` value
             // because we've already checked it before
-            (Some(rbf), _) => Sequence(rbf.get_value()), // TODO: remove wrapping Sequence
+            (Some(rbf), _) => rbf.get_value(),
         };
 
         let (fee_rate, mut fee_amount) = match params
@@ -746,7 +754,7 @@ where
 
         let mut tx = Transaction {
             version,
-            lock_time: PackedLockTime(lock_time).into(),
+            lock_time: lock_time.into(),
             input: vec![],
             output: vec![],
         };
@@ -811,7 +819,7 @@ where
             params.drain_wallet,
             params.manually_selected_only,
             params.bumping_fee.is_some(), // we mandate confirmed transactions if we're bumping the fee
-            current_height,
+            current_height.map(LockTime::to_consensus_u32),
         )?;
 
         // get drain script
@@ -1597,7 +1605,7 @@ where
 
         psbt_input
             .update_with_descriptor_unchecked(&derived_descriptor)
-            .map_err(MiniscriptPsbtError::ConversionError)?;
+            .map_err(MiniscriptPsbtError::Conversion)?;
 
         let prev_output = utxo.outpoint;
         if let Some(prev_tx) = self.database.borrow().get_raw_tx(&prev_output.txid)? {
@@ -1617,6 +1625,9 @@ where
     ) -> Result<(), Error> {
         // We need to borrow `psbt` mutably within the loops, so we have to allocate a vec for all
         // the input utxos and outputs
+        //
+        // Clippy complains that the collect is not required, but that's wrong
+        #[allow(clippy::needless_collect)]
         let utxos = (0..psbt.inputs.len())
             .filter_map(|i| psbt.get_utxo_for(i).map(|utxo| (true, i, utxo)))
             .chain(
@@ -1645,10 +1656,10 @@ where
 
                 if is_input {
                     psbt.update_input_with_descriptor(index, &desc)
-                        .map_err(MiniscriptPsbtError::UtxoUpdateError)?;
+                        .map_err(MiniscriptPsbtError::UtxoUpdate)?;
                 } else {
                     psbt.update_output_with_descriptor(index, &desc)
-                        .map_err(MiniscriptPsbtError::OutputUpdateError)?;
+                        .map_err(MiniscriptPsbtError::OutputUpdate)?;
                 }
             }
         }
@@ -2213,7 +2224,7 @@ pub(crate) mod test {
         builder
             .add_recipient(addr.script_pubkey(), 25_000)
             .current_height(630_001)
-            .nlocktime(630_000);
+            .nlocktime(LockTime::from_height(630_000).unwrap());
         let (psbt, _) = builder.finish().unwrap();
 
         // When we explicitly specify a nlocktime
@@ -2229,7 +2240,7 @@ pub(crate) mod test {
         let mut builder = wallet.build_tx();
         builder
             .add_recipient(addr.script_pubkey(), 25_000)
-            .nlocktime(630_000);
+            .nlocktime(LockTime::from_height(630_000).unwrap());
         let (psbt, _) = builder.finish().unwrap();
 
         assert_eq!(psbt.unsigned_tx.lock_time, PackedLockTime(630_000));
@@ -2237,7 +2248,7 @@ pub(crate) mod test {
 
     #[test]
     #[should_panic(
-        expected = "TxBuilder requested timelock of `50000`, but at least `100000` is required to spend from this script"
+        expected = "TxBuilder requested timelock of `Blocks(Height(50000))`, but at least `Blocks(Height(100000))` is required to spend from this script"
     )]
     fn test_create_tx_custom_locktime_incompatible_with_cltv() {
         let (wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
@@ -2245,7 +2256,7 @@ pub(crate) mod test {
         let mut builder = wallet.build_tx();
         builder
             .add_recipient(addr.script_pubkey(), 25_000)
-            .nlocktime(50000);
+            .nlocktime(LockTime::from_height(50000).unwrap());
         builder.finish().unwrap();
     }
 
@@ -2276,7 +2287,7 @@ pub(crate) mod test {
 
     #[test]
     #[should_panic(
-        expected = "Cannot enable RBF with nSequence `3` given a required OP_CSV of `6`"
+        expected = "Cannot enable RBF with nSequence `Sequence(3)` given a required OP_CSV of `Sequence(6)`"
     )]
     fn test_create_tx_with_custom_rbf_csv() {
         let (wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
@@ -2284,7 +2295,7 @@ pub(crate) mod test {
         let mut builder = wallet.build_tx();
         builder
             .add_recipient(addr.script_pubkey(), 25_000)
-            .enable_rbf_with_sequence(3);
+            .enable_rbf_with_sequence(Sequence(3));
         builder.finish().unwrap();
     }
 
@@ -2307,7 +2318,7 @@ pub(crate) mod test {
         let mut builder = wallet.build_tx();
         builder
             .add_recipient(addr.script_pubkey(), 25_000)
-            .enable_rbf_with_sequence(0xFFFFFFFE);
+            .enable_rbf_with_sequence(Sequence(0xFFFFFFFE));
         builder.finish().unwrap();
     }
 
@@ -2318,7 +2329,7 @@ pub(crate) mod test {
         let mut builder = wallet.build_tx();
         builder
             .add_recipient(addr.script_pubkey(), 25_000)
-            .enable_rbf_with_sequence(0xDEADBEEF);
+            .enable_rbf_with_sequence(Sequence(0xDEADBEEF));
         let (psbt, _) = builder.finish().unwrap();
 
         assert_eq!(psbt.unsigned_tx.input[0].sequence, Sequence(0xDEADBEEF));
@@ -4741,7 +4752,7 @@ pub(crate) mod test {
         let (wallet, _, _) = get_funded_wallet(get_test_tr_repeated_key());
         let addr = wallet.get_address(AddressIndex::New).unwrap();
 
-        let path = vec![("rn4nre9c".to_string(), vec![0])]
+        let path = vec![("e5mmg3xh".to_string(), vec![0])]
             .into_iter()
             .collect();
 

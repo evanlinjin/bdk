@@ -152,9 +152,9 @@ pub enum Error {
 /// Errors returned by miniscript when updating inconsistent PSBTs
 #[derive(Debug, Clone)]
 pub enum MiniscriptPsbtError {
-    ConversionError(miniscript::descriptor::ConversionError),
-    UtxoUpdateError(miniscript::psbt::UtxoUpdateError),
-    OutputUpdateError(miniscript::psbt::OutputUpdateError),
+    Conversion(miniscript::descriptor::ConversionError),
+    UtxoUpdate(miniscript::psbt::UtxoUpdateError),
+    OutputUpdate(miniscript::psbt::OutputUpdateError),
 }
 
 /// Represents the last failed [`crate::blockchain::WalletSync`] sync attempt in which we were short

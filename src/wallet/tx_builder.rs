@@ -42,7 +42,7 @@ use std::default::Default;
 use std::marker::PhantomData;
 
 use bitcoin::util::psbt::{self, PartiallySignedTransaction as Psbt};
-use bitcoin::{OutPoint, Script, Transaction};
+use bitcoin::{LockTime, OutPoint, Script, Sequence, Transaction};
 
 use super::coin_selection::{CoinSelectionAlgorithm, DefaultCoinSelectionAlgorithm};
 use crate::{database::BatchDatabase, Error, Utxo, Wallet};
@@ -137,7 +137,7 @@ pub(crate) struct TxParams {
     pub(crate) manually_selected_only: bool,
     pub(crate) sighash: Option<psbt::PsbtSighashType>,
     pub(crate) ordering: TxOrdering,
-    pub(crate) locktime: Option<u32>,
+    pub(crate) locktime: Option<LockTime>,
     pub(crate) rbf: Option<RbfValue>,
     pub(crate) version: Option<Version>,
     pub(crate) change_policy: ChangeSpendPolicy,
@@ -145,7 +145,7 @@ pub(crate) struct TxParams {
     pub(crate) add_global_xpubs: bool,
     pub(crate) include_output_redeem_witness_script: bool,
     pub(crate) bumping_fee: Option<PreviousFee>,
-    pub(crate) current_height: Option<u32>,
+    pub(crate) current_height: Option<LockTime>,
     pub(crate) allow_dust: bool,
 }
 
@@ -424,7 +424,7 @@ impl<'a, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext>
     /// Use a specific nLockTime while creating the transaction
     ///
     /// This can cause conflicts if the wallet's descriptors contain an "after" (OP_CLTV) operator.
-    pub fn nlocktime(&mut self, locktime: u32) -> &mut Self {
+    pub fn nlocktime(&mut self, locktime: LockTime) -> &mut Self {
         self.params.locktime = Some(locktime);
         self
     }
@@ -539,7 +539,7 @@ impl<'a, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext>
     ///
     /// If the `nsequence` is higher than `0xFFFFFFFD` an error will be thrown, since it would not
     /// be a valid nSequence to signal RBF.
-    pub fn enable_rbf_with_sequence(&mut self, nsequence: u32) -> &mut Self {
+    pub fn enable_rbf_with_sequence(&mut self, nsequence: Sequence) -> &mut Self {
         self.params.rbf = Some(RbfValue::Value(nsequence));
         self
     }
@@ -556,7 +556,7 @@ impl<'a, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext>
     ///
     /// In both cases, if you don't provide a current height, we use the last sync height.
     pub fn current_height(&mut self, height: u32) -> &mut Self {
-        self.params.current_height = Some(height);
+        self.params.current_height = Some(LockTime::from_height(height).expect("Invalid height"));
         self
     }
 
@@ -734,13 +734,13 @@ impl Default for Version {
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy)]
 pub(crate) enum RbfValue {
     Default,
-    Value(u32),
+    Value(Sequence),
 }
 
 impl RbfValue {
-    pub(crate) fn get_value(&self) -> u32 {
+    pub(crate) fn get_value(&self) -> Sequence {
         match self {
-            RbfValue::Default => 0xFFFFFFFD,
+            RbfValue::Default => Sequence::ENABLE_RBF_NO_LOCKTIME,
             RbfValue::Value(v) => *v,
         }
     }
