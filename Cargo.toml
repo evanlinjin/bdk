@@ -44,6 +44,7 @@ bitcoincore-rpc = { version = "0.16", optional = true }
 tokio = { version = "1", features = ["rt"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = "0.2"
 async-trait = "0.1"
 js-sys = "0.3"
 
@@ -97,10 +98,13 @@ test-esplora = ["electrsd/legacy", "electrsd/esplora_a33e97e1", "electrsd/bitcoi
 test-md-docs = ["electrum"]
 test-hardware-signer = ["hardware-signer"]
 
+dev-getrandom-wasm = ["getrandom/js"]
+
 [dev-dependencies]
 lazy_static = "1.4"
 env_logger = "0.7"
 electrsd = "0.21"
+base64 = "^0.13"
 
 [[example]]
 name = "compact_filters_balance"

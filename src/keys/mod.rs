@@ -224,8 +224,8 @@ impl<Ctx: ScriptContext + 'static> ExtScriptContext for Ctx {
 /// use bdk::bitcoin::PublicKey;
 ///
 /// use bdk::keys::{
-///     mainnet_network, DescriptorKey, DescriptorPublicKey, SinglePub,
-///     IntoDescriptorKey, KeyError, ScriptContext, SinglePubKey,
+///     mainnet_network, DescriptorKey, DescriptorPublicKey, IntoDescriptorKey, KeyError,
+///     ScriptContext, SinglePub, SinglePubKey,
 /// };
 ///
 /// pub struct MyKeyType {
