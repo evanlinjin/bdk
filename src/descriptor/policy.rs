@@ -43,14 +43,17 @@ use std::fmt;
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 
-use bitcoin::hashes::*;
+use bitcoin::hashes::{hash160, ripemd160, sha256};
 use bitcoin::util::bip32::Fingerprint;
 use bitcoin::{PublicKey, XOnlyPublicKey};
 
 use miniscript::descriptor::{
-    DescriptorPublicKey, DescriptorSinglePub, ShInner, SinglePubKey, SortedMultiVec, WshInner,
+    DescriptorPublicKey, ShInner, SinglePub, SinglePubKey, SortedMultiVec, WshInner,
 };
-use miniscript::{Descriptor, Miniscript, MiniscriptKey, Satisfier, ScriptContext, Terminal};
+use miniscript::hash256;
+use miniscript::{
+    Descriptor, Miniscript, Satisfier, ScriptContext, SigType, Terminal, ToPublicKey,
+};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -81,11 +84,11 @@ pub enum PkOrF {
 impl PkOrF {
     fn from_key(k: &DescriptorPublicKey, secp: &SecpCtx) -> Self {
         match k {
-            DescriptorPublicKey::SinglePub(DescriptorSinglePub {
+            DescriptorPublicKey::Single(SinglePub {
                 key: SinglePubKey::FullKey(pk),
                 ..
             }) => PkOrF::Pubkey(*pk),
-            DescriptorPublicKey::SinglePub(DescriptorSinglePub {
+            DescriptorPublicKey::Single(SinglePub {
                 key: SinglePubKey::XOnly(pk),
                 ..
             }) => PkOrF::XOnlyPubkey(*pk),
@@ -111,7 +114,7 @@ pub enum SatisfiableItem {
     /// Double SHA256 preimage hash
     Hash256Preimage {
         /// The digest value
-        hash: sha256d::Hash,
+        hash: hash256::Hash,
     },
     /// RIPEMD160 preimage hash
     Ripemd160Preimage {
@@ -438,6 +441,7 @@ pub struct Policy {
 }
 
 /// An extra condition that must be satisfied but that is out of control of the user
+/// TODO: use `bitcoin::LockTime` and `bitcoin::Sequence`
 #[derive(Hash, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Serialize)]
 pub struct Condition {
     /// Optional CheckSequenceVerify condition
@@ -720,15 +724,18 @@ impl From<SatisfiableItem> for Policy {
 }
 
 fn signer_id(key: &DescriptorPublicKey, secp: &SecpCtx) -> SignerId {
+    // For consistency we always compute the key hash in "ecdsa" form (with the leading sign
+    // prefix) even if we are in a taproot descriptor. We just want some kind of unique identifier
+    // for a key, so it doesn't really matter how the identifier is computed.
     match key {
-        DescriptorPublicKey::SinglePub(DescriptorSinglePub {
+        DescriptorPublicKey::Single(SinglePub {
             key: SinglePubKey::FullKey(pk),
             ..
-        }) => pk.to_pubkeyhash().into(),
-        DescriptorPublicKey::SinglePub(DescriptorSinglePub {
+        }) => pk.to_pubkeyhash(SigType::Ecdsa).into(),
+        DescriptorPublicKey::Single(SinglePub {
             key: SinglePubKey::XOnly(pk),
             ..
-        }) => pk.to_pubkeyhash().into(),
+        }) => pk.to_pubkeyhash(SigType::Ecdsa).into(),
         DescriptorPublicKey::XPub(xpub) => xpub.root_fingerprint(secp).into(),
     }
 }
@@ -779,7 +786,7 @@ fn generic_sig_in_psbt<
 ) -> bool {
     //TODO check signature validity
     psbt.inputs.iter().all(|input| match key {
-        DescriptorPublicKey::SinglePub(DescriptorSinglePub { key, .. }) => check(input, key),
+        DescriptorPublicKey::Single(SinglePub { key, .. }) => check(input, key),
         DescriptorPublicKey::XPub(xpub) => {
             //TODO check actual derivation matches
             match extract(input, xpub.root_fingerprint(secp)) {
@@ -891,10 +898,13 @@ impl<Ctx: ScriptContext + 'static> ExtractPolicy for Miniscript<DescriptorPublic
                 Some(Ctx::make_signature(pubkey_hash, signers, build_sat, secp))
             }
             Terminal::After(value) => {
-                let mut policy: Policy = SatisfiableItem::AbsoluteTimelock { value: *value }.into();
+                let mut policy: Policy = SatisfiableItem::AbsoluteTimelock {
+                    value: value.to_u32(),
+                }
+                .into();
                 policy.contribution = Satisfaction::Complete {
                     condition: Condition {
-                        timelock: Some(*value),
+                        timelock: Some(value.to_u32()),
                         csv: None,
                     },
                 };
@@ -905,9 +915,11 @@ impl<Ctx: ScriptContext + 'static> ExtractPolicy for Miniscript<DescriptorPublic
                 } = build_sat
                 {
                     let after = After::new(Some(current_height), false);
-                    let after_sat = Satisfier::<bitcoin::PublicKey>::check_after(&after, *value);
-                    let inputs_sat = psbt_inputs_sat(psbt)
-                        .all(|sat| Satisfier::<bitcoin::PublicKey>::check_after(&sat, *value));
+                    let after_sat =
+                        Satisfier::<bitcoin::PublicKey>::check_after(&after, value.into());
+                    let inputs_sat = psbt_inputs_sat(psbt).all(|sat| {
+                        Satisfier::<bitcoin::PublicKey>::check_after(&sat, value.into())
+                    });
                     if after_sat && inputs_sat {
                         policy.satisfaction = policy.contribution.clone();
                     }
@@ -916,11 +928,14 @@ impl<Ctx: ScriptContext + 'static> ExtractPolicy for Miniscript<DescriptorPublic
                 Some(policy)
             }
             Terminal::Older(value) => {
-                let mut policy: Policy = SatisfiableItem::RelativeTimelock { value: *value }.into();
+                let mut policy: Policy = SatisfiableItem::RelativeTimelock {
+                    value: value.to_consensus_u32(),
+                }
+                .into();
                 policy.contribution = Satisfaction::Complete {
                     condition: Condition {
                         timelock: None,
-                        csv: Some(*value),
+                        csv: Some(value.to_consensus_u32()),
                     },
                 };
                 if let BuildSatisfaction::PsbtTimelocks {
@@ -999,6 +1014,9 @@ impl<Ctx: ScriptContext + 'static> ExtractPolicy for Miniscript<DescriptorPublic
 
                 Policy::make_thresh(mapped, threshold)?
             }
+
+            // Unsupported
+            Terminal::RawPkH(_) => None,
         })
     }
 }

@@ -38,7 +38,7 @@ pub trait IsDust {
 
 impl IsDust for u64 {
     fn is_dust(&self, script: &Script) -> bool {
-        *self < script.dust_value().as_sat()
+        *self < script.dust_value().to_sat()
     }
 }
 
@@ -95,9 +95,9 @@ pub(crate) fn check_nlocktime(nlocktime: u32, required: u32) -> bool {
 }
 
 impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk> for After {
-    fn check_after(&self, n: u32) -> bool {
+    fn check_after(&self, n: bitcoin::LockTime) -> bool {
         if let Some(current_height) = self.current_height {
-            current_height >= n
+            current_height >= n.to_consensus_u32()
         } else {
             self.assume_height_reached
         }
@@ -125,10 +125,15 @@ impl Older {
 }
 
 impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk> for Older {
-    fn check_older(&self, n: u32) -> bool {
+    fn check_older(&self, n: bitcoin::Sequence) -> bool {
         if let Some(current_height) = self.current_height {
             // TODO: test >= / >
-            current_height as u64 >= self.create_height.unwrap_or(0) as u64 + n as u64
+            current_height
+                >= self
+                    .create_height
+                    .unwrap_or(0)
+                    .checked_add(n.to_consensus_u32())
+                    .expect("Overflowing addition")
         } else {
             self.assume_height_reached
         }

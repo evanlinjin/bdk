@@ -24,15 +24,13 @@ use std::sync::Arc;
 use bitcoin::secp256k1::Secp256k1;
 
 use bitcoin::consensus::encode::serialize;
-use bitcoin::util::{psbt, taproot};
+use bitcoin::util::psbt;
 use bitcoin::{
-    Address, EcdsaSighashType, Network, OutPoint, SchnorrSighashType, Script, Transaction, TxOut,
-    Txid, Witness,
+    Address, EcdsaSighashType, Network, OutPoint, PackedLockTime, SchnorrSighashType, Script,
+    Sequence, Transaction, TxOut, Txid, Witness,
 };
 
-use miniscript::descriptor::DescriptorTrait;
-use miniscript::psbt::PsbtInputSatisfier;
-use miniscript::ToPublicKey;
+use miniscript::psbt::{PsbtExt, PsbtInputExt, PsbtInputSatisfier};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -64,14 +62,12 @@ use utils::{check_nlocktime, check_nsequence_rbf, After, Older, SecpCtx};
 use crate::blockchain::{GetHeight, NoopProgress, Progress, WalletSync};
 use crate::database::memory::MemoryDatabase;
 use crate::database::{AnyDatabase, BatchDatabase, BatchOperations, DatabaseUtils, SyncTime};
-use crate::descriptor::derived::AsDerived;
 use crate::descriptor::policy::BuildSatisfaction;
 use crate::descriptor::{
-    get_checksum, into_wallet_descriptor_checked, DerivedDescriptor, DerivedDescriptorMeta,
-    DescriptorMeta, DescriptorScripts, ExtendedDescriptor, ExtractPolicy, IntoWalletDescriptor,
-    Policy, XKeyUtils,
+    get_checksum, into_wallet_descriptor_checked, DerivedDescriptor, DescriptorMeta,
+    ExtendedDescriptor, ExtractPolicy, IntoWalletDescriptor, Policy, XKeyUtils,
 };
-use crate::error::Error;
+use crate::error::{Error, MiniscriptPsbtError};
 use crate::psbt::PsbtUtils;
 use crate::signer::SignerError;
 use crate::testutils;
@@ -254,7 +250,7 @@ where
 
         let address_result = self
             .get_descriptor_for_keychain(keychain)
-            .as_derived(incremented_index, &self.secp)
+            .at_derivation_index(incremented_index)
             .address(self.network);
 
         address_result
@@ -273,7 +269,7 @@ where
 
         let derived_key = self
             .get_descriptor_for_keychain(keychain)
-            .as_derived(current_index, &self.secp);
+            .at_derivation_index(current_index);
 
         let script_pubkey = derived_key.script_pubkey();
 
@@ -301,7 +297,7 @@ where
     // Return derived address for the descriptor of given [`KeychainKind`] at a specific index
     fn peek_address(&self, index: u32, keychain: KeychainKind) -> Result<AddressInfo, Error> {
         self.get_descriptor_for_keychain(keychain)
-            .as_derived(index, &self.secp)
+            .at_derivation_index(index)
             .address(self.network)
             .map(|address| AddressInfo {
                 index,
@@ -317,7 +313,7 @@ where
         self.set_index(keychain, index)?;
 
         self.get_descriptor_for_keychain(keychain)
-            .as_derived(index, &self.secp)
+            .at_derivation_index(index)
             .address(self.network)
             .map(|address| AddressInfo {
                 index,
@@ -366,7 +362,7 @@ where
     /// transaction output scripts.
     pub fn ensure_addresses_cached(&self, max_addresses: u32) -> Result<bool, Error> {
         let mut new_addresses_cached = false;
-        let max_address = match self.descriptor.is_deriveable() {
+        let max_address = match self.descriptor.has_wildcard() {
             false => 0,
             true => max_addresses,
         };
@@ -383,7 +379,7 @@ where
         }
 
         if let Some(change_descriptor) = &self.change_descriptor {
-            let max_address = match change_descriptor.is_deriveable() {
+            let max_address = match change_descriptor.has_wildcard() {
                 false => 0,
                 true => max_addresses,
             };
@@ -775,7 +771,7 @@ where
 
         let mut tx = Transaction {
             version,
-            lock_time,
+            lock_time: PackedLockTime(lock_time).into(),
             input: vec![],
             output: vec![],
         };
@@ -869,7 +865,7 @@ where
             .map(|u| bitcoin::TxIn {
                 previous_output: u.outpoint(),
                 script_sig: Script::default(),
-                sequence: n_sequence,
+                sequence: Sequence(n_sequence),
                 witness: Witness::new(),
             })
             .collect();
@@ -992,7 +988,11 @@ where
             Some(tx) => tx,
         };
         let mut tx = details.transaction.take().unwrap();
-        if !tx.input.iter().any(|txin| txin.sequence <= 0xFFFFFFFD) {
+        if !tx
+            .input
+            .iter()
+            .any(|txin| txin.sequence.to_consensus_u32() <= 0xFFFFFFFD)
+        {
             return Err(Error::IrreplaceableTransaction);
         }
 
@@ -1118,8 +1118,9 @@ where
         psbt: &mut psbt::PartiallySignedTransaction,
         sign_options: SignOptions,
     ) -> Result<bool, Error> {
-        // this helps us doing our job later
-        self.add_input_hd_keypaths(psbt)?;
+        // This adds all the PSBT metadata for the inputs, which will help us later figure out how
+        // to derive our keys
+        self.update_psbt_with_descriptor(psbt)?;
 
         // If we aren't allowed to use `witness_utxo`, ensure that every input (except p2tr and finalized ones)
         // has the `non_witness_utxo`
@@ -1320,21 +1321,18 @@ where
         }
     }
 
-    fn get_descriptor_for_txout(
-        &self,
-        txout: &TxOut,
-    ) -> Result<Option<DerivedDescriptor<'_>>, Error> {
+    fn get_descriptor_for_txout(&self, txout: &TxOut) -> Result<Option<DerivedDescriptor>, Error> {
         Ok(self
             .database
             .borrow()
             .get_path_from_script_pubkey(&txout.script_pubkey)?
             .map(|(keychain, child)| (self.get_descriptor_for_keychain(keychain), child))
-            .map(|(desc, child)| desc.as_derived(child, &self.secp)))
+            .map(|(desc, child)| desc.at_derivation_index(child)))
     }
 
     fn fetch_and_increment_index(&self, keychain: KeychainKind) -> Result<u32, Error> {
         let (descriptor, keychain) = self._get_descriptor_for_keychain(keychain);
-        let index = match descriptor.is_deriveable() {
+        let index = match descriptor.has_wildcard() {
             false => 0,
             true => self.database.borrow_mut().increment_last_index(keychain)?,
         };
@@ -1348,22 +1346,22 @@ where
             self.cache_addresses(keychain, index, CACHE_ADDR_BATCH_SIZE)?;
         }
 
-        let derived_descriptor = descriptor.as_derived(index, &self.secp);
-
-        let hd_keypaths = derived_descriptor.get_hd_keypaths(&self.secp);
-        let script = derived_descriptor.script_pubkey();
-
-        for validator in &self.address_validators {
-            #[allow(deprecated)]
-            validator.validate(keychain, &hd_keypaths, &script)?;
-        }
+        // TODO: remove address validators entirely
+        //
+        // let derived_descriptor = descriptor.at_derivation_index(index);
+        // let hd_keypaths = derived_descriptor.get_hd_keypaths(&self.secp);
+        // let script = derived_descriptor.script_pubkey();
+        // for validator in &self.address_validators {
+        //     #[allow(deprecated)]
+        //     validator.validate(keychain, &hd_keypaths, &script)?;
+        // }
 
         Ok(index)
     }
 
     fn fetch_index(&self, keychain: KeychainKind) -> Result<u32, Error> {
         let (descriptor, keychain) = self._get_descriptor_for_keychain(keychain);
-        let index = match descriptor.is_deriveable() {
+        let index = match descriptor.has_wildcard() {
             false => Some(0),
             true => self.database.borrow_mut().get_last_index(keychain)?,
         };
@@ -1387,7 +1385,7 @@ where
         mut count: u32,
     ) -> Result<(), Error> {
         let (descriptor, keychain) = self._get_descriptor_for_keychain(keychain);
-        if !descriptor.is_deriveable() {
+        if !descriptor.has_wildcard() {
             if from > 0 {
                 return Ok(());
             }
@@ -1400,7 +1398,7 @@ where
         let start_time = time::Instant::new();
         for i in from..(from + count) {
             address_batch.set_script_pubkey(
-                &descriptor.as_derived(i, &self.secp).script_pubkey(),
+                &descriptor.at_derivation_index(i).script_pubkey(),
                 keychain,
                 i,
             )?;
@@ -1604,52 +1602,7 @@ where
             }
         }
 
-        // probably redundant but it doesn't hurt...
-        self.add_input_hd_keypaths(&mut psbt)?;
-
-        // add metadata for the outputs
-        for (psbt_output, tx_output) in psbt.outputs.iter_mut().zip(psbt.unsigned_tx.output.iter())
-        {
-            if let Some((keychain, child)) = self
-                .database
-                .borrow()
-                .get_path_from_script_pubkey(&tx_output.script_pubkey)?
-            {
-                let (desc, _) = self._get_descriptor_for_keychain(keychain);
-                let derived_descriptor = desc.as_derived(child, &self.secp);
-
-                if let miniscript::Descriptor::Tr(tr) = &derived_descriptor {
-                    let tap_tree = if tr.taptree().is_some() {
-                        let mut builder = taproot::TaprootBuilder::new();
-                        for (depth, ms) in tr.iter_scripts() {
-                            let script = ms.encode();
-                            builder = builder.add_leaf(depth, script).expect(
-                                "Computing spend data on a valid Tree should always succeed",
-                            );
-                        }
-                        Some(
-                            psbt::TapTree::from_builder(builder)
-                                .expect("The tree should always be valid"),
-                        )
-                    } else {
-                        None
-                    };
-                    psbt_output.tap_tree = tap_tree;
-                    psbt_output
-                        .tap_key_origins
-                        .append(&mut derived_descriptor.get_tap_key_origins(&self.secp));
-                    psbt_output.tap_internal_key = Some(tr.internal_key().to_x_only_pubkey());
-                } else {
-                    psbt_output
-                        .bip32_derivation
-                        .append(&mut derived_descriptor.get_hd_keypaths(&self.secp));
-                }
-                if params.include_output_redeem_witness_script {
-                    psbt_output.witness_script = derived_descriptor.psbt_witness_script();
-                    psbt_output.redeem_script = derived_descriptor.psbt_redeem_script();
-                };
-            }
-        }
+        self.update_psbt_with_descriptor(&mut psbt)?;
 
         Ok(psbt)
     }
@@ -1675,29 +1628,11 @@ where
         };
 
         let desc = self.get_descriptor_for_keychain(keychain);
-        let derived_descriptor = desc.as_derived(child, &self.secp);
+        let derived_descriptor = desc.at_derivation_index(child);
 
-        if let miniscript::Descriptor::Tr(tr) = &derived_descriptor {
-            psbt_input.tap_key_origins = derived_descriptor.get_tap_key_origins(&self.secp);
-            psbt_input.tap_internal_key = Some(tr.internal_key().to_x_only_pubkey());
-
-            let spend_info = tr.spend_info();
-            psbt_input.tap_merkle_root = spend_info.merkle_root();
-            psbt_input.tap_scripts = spend_info
-                .as_script_map()
-                .keys()
-                .filter_map(|script_ver| {
-                    spend_info
-                        .control_block(script_ver)
-                        .map(|cb| (cb, script_ver.clone()))
-                })
-                .collect();
-        } else {
-            psbt_input.bip32_derivation = derived_descriptor.get_hd_keypaths(&self.secp);
-        }
-
-        psbt_input.redeem_script = derived_descriptor.psbt_redeem_script();
-        psbt_input.witness_script = derived_descriptor.psbt_witness_script();
+        psbt_input
+            .update_with_descriptor_unchecked(&derived_descriptor)
+            .map_err(MiniscriptPsbtError::ConversionError)?;
 
         let prev_output = utxo.outpoint;
         if let Some(prev_tx) = self.database.borrow().get_raw_tx(&prev_output.txid)? {
@@ -1711,39 +1646,33 @@ where
         Ok(psbt_input)
     }
 
-    fn add_input_hd_keypaths(
+    fn update_psbt_with_descriptor(
         &self,
         psbt: &mut psbt::PartiallySignedTransaction,
     ) -> Result<(), Error> {
-        let mut input_utxos = Vec::with_capacity(psbt.inputs.len());
-        for n in 0..psbt.inputs.len() {
-            input_utxos.push(psbt.get_utxo_for(n).clone());
-        }
+        // We need to borrow `psbt` mutably within the loop, so we have to allocate a vec for all
+        // the utxos first
+        let utxos = (0..psbt.inputs.len())
+            .filter_map(|i| psbt.get_utxo_for(i))
+            .collect::<Vec<_>>();
 
-        // try to add hd_keypaths if we've already seen the output
-        for (psbt_input, out) in psbt.inputs.iter_mut().zip(input_utxos.iter()) {
-            if let Some(out) = out {
-                if let Some((keychain, child)) = self
-                    .database
-                    .borrow()
-                    .get_path_from_script_pubkey(&out.script_pubkey)?
-                {
-                    debug!("Found descriptor {:?}/{}", keychain, child);
+        // Try to figure out the keychain and derivation for every input
+        for (index, out) in utxos.into_iter().enumerate() {
+            if let Some((keychain, child)) = self
+                .database
+                .borrow()
+                .get_path_from_script_pubkey(&out.script_pubkey)?
+            {
+                debug!("Found descriptor {:?}/{}", keychain, child);
 
-                    // merge hd_keypaths or tap_key_origins
-                    let desc = self.get_descriptor_for_keychain(keychain);
-                    if desc.is_taproot() {
-                        let mut tap_key_origins = desc
-                            .as_derived(child, &self.secp)
-                            .get_tap_key_origins(&self.secp);
-                        psbt_input.tap_key_origins.append(&mut tap_key_origins);
-                    } else {
-                        let mut hd_keypaths = desc
-                            .as_derived(child, &self.secp)
-                            .get_hd_keypaths(&self.secp);
-                        psbt_input.bip32_derivation.append(&mut hd_keypaths);
-                    }
-                }
+                // Update the metadata
+                let desc = self.get_descriptor_for_keychain(keychain);
+                let desc = desc.at_derivation_index(child);
+
+                psbt.update_input_with_descriptor(index, &desc)
+                    .map_err(MiniscriptPsbtError::UtxoUpdateError)?;
+                psbt.update_output_with_descriptor(index, &desc)
+                    .map_err(MiniscriptPsbtError::OutputUpdateError)?;
             }
         }
 
@@ -1781,12 +1710,12 @@ where
 
         // We need to ensure descriptor is derivable to fullfil "missing cache", otherwise we will
         // end up with an infinite loop
-        let is_deriveable = self.descriptor.is_deriveable()
+        let has_wildcard = self.descriptor.has_wildcard()
             && (self.change_descriptor.is_none()
-                || self.change_descriptor.as_ref().unwrap().is_deriveable());
+                || self.change_descriptor.as_ref().unwrap().has_wildcard());
 
         // Restrict max rounds in case of faulty "missing cache" implementation by blockchain
-        let max_rounds = if is_deriveable { 100 } else { 1 };
+        let max_rounds = if has_wildcard { 100 } else { 1 };
 
         for _ in 0..max_rounds {
             let sync_res =

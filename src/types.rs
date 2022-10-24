@@ -224,7 +224,7 @@ impl Utxo {
 }
 
 /// A wallet transaction
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TransactionDetails {
     /// Optional transaction
     pub transaction: Option<Transaction>,

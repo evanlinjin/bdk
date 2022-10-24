@@ -105,6 +105,8 @@ pub enum Error {
     Encode(bitcoin::consensus::encode::Error),
     /// Miniscript error
     Miniscript(miniscript::Error),
+    /// Miniscript PSBT error
+    MiniscriptPsbt(MiniscriptPsbtError),
     /// BIP32 error
     Bip32(bitcoin::util::bip32::Error),
     /// An ECDSA error
@@ -147,6 +149,14 @@ pub enum Error {
     #[cfg(feature = "sqlite")]
     /// Rusqlite client error
     Rusqlite(rusqlite::Error),
+}
+
+/// Errors returned by miniscript when updating inconsistent PSBTs
+#[derive(Debug, Clone)]
+pub enum MiniscriptPsbtError {
+    ConversionError(miniscript::descriptor::ConversionError),
+    UtxoUpdateError(miniscript::psbt::UtxoUpdateError),
+    OutputUpdateError(miniscript::psbt::OutputUpdateError),
 }
 
 /// Represents the last failed [`crate::blockchain::WalletSync`] sync attempt in which we were short
@@ -198,6 +208,7 @@ impl From<crate::keys::KeyError> for Error {
 
 impl_error!(bitcoin::consensus::encode::Error, Encode);
 impl_error!(miniscript::Error, Miniscript);
+impl_error!(MiniscriptPsbtError, MiniscriptPsbt);
 impl_error!(bitcoin::util::bip32::Error, Bip32);
 impl_error!(bitcoin::secp256k1::Error, Secp256k1);
 impl_error!(serde_json::Error, Json);

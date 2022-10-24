@@ -44,8 +44,6 @@ use std::marker::PhantomData;
 use bitcoin::util::psbt::{self, PartiallySignedTransaction as Psbt};
 use bitcoin::{OutPoint, Script, Transaction};
 
-use miniscript::descriptor::DescriptorTrait;
-
 use super::coin_selection::{CoinSelectionAlgorithm, DefaultCoinSelectionAlgorithm};
 use crate::{database::BatchDatabase, Error, Utxo, Wallet};
 use crate::{
