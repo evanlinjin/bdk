@@ -187,12 +187,18 @@ macro_rules! testutils {
         use $crate::miniscript::descriptor::Descriptor;
         use $crate::miniscript::TranslatePk;
 
-        struct Translator(HashMap<&'static str, (String, Option<String>, Option<String>)>);
+        struct Translator {
+            keys: HashMap<&'static str, (String, Option<String>, Option<String>)>,
+            is_internal: bool,
+        }
 
         impl $crate::miniscript::Translator<String, String, Infallible> for Translator {
             fn pk(&mut self, pk: &String) -> Result<String, Infallible> {
-                match self.0.get(pk.as_str()) {
-                    Some((key, ext_path, _)) =>  Ok(format!("{}{}", key, ext_path.clone().unwrap_or_default())),
+                match self.keys.get(pk.as_str()) {
+                    Some((key, ext_path, int_path)) => {
+                        let path = if self.is_internal { int_path } else { ext_path };
+                        Ok(format!("{}{}", key, path.clone().unwrap_or_default()))
+                    }
                     None => Ok(pk.clone()),
                 }
             }
@@ -208,11 +214,13 @@ macro_rules! testutils {
             keys = testutils!{ @keys $( $keys )* };
         )*
 
-        let mut translator = Translator(keys);
+        let mut translator = Translator { keys, is_internal: false };
 
         let external: Descriptor<String> = FromStr::from_str($external_descriptor).unwrap();
         let external = external.translate_pk(&mut translator).expect("Infallible conversion");
         let external = external.to_string();
+
+        translator.is_internal = true;
 
         let internal = None::<String>$(.or({
             let internal: Descriptor<String> = FromStr::from_str($internal_descriptor).unwrap();
