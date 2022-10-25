@@ -22,15 +22,13 @@ use std::sync::Arc;
 use bitcoin::secp256k1::Secp256k1;
 
 use bitcoin::consensus::encode::serialize;
-use bitcoin::util::{psbt, taproot};
+use bitcoin::util::psbt;
 use bitcoin::{
-    Address, EcdsaSighashType, Network, OutPoint, SchnorrSighashType, Script, Transaction, TxOut,
-    Txid, Witness,
+    Address, EcdsaSighashType, LockTime, Network, OutPoint, SchnorrSighashType, Script, Sequence,
+    Transaction, TxOut, Txid, Witness,
 };
 
-use miniscript::descriptor::DescriptorTrait;
-use miniscript::psbt::PsbtInputSatisfier;
-use miniscript::ToPublicKey;
+use miniscript::psbt::{PsbtExt, PsbtInputExt, PsbtInputSatisfier};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -55,16 +53,14 @@ pub use utils::IsDust;
 use coin_selection::DefaultCoinSelectionAlgorithm;
 use signer::{SignOptions, SignerOrdering, SignersContainer, TransactionSigner};
 use tx_builder::{BumpFee, CreateTx, FeePolicy, TxBuilder, TxParams};
-use utils::{check_nlocktime, check_nsequence_rbf, After, Older, SecpCtx};
+use utils::{check_nsequence_rbf, After, Older, SecpCtx};
 
-use crate::descriptor::derived::AsDerived;
 use crate::descriptor::policy::BuildSatisfaction;
 use crate::descriptor::{
-    get_checksum, into_wallet_descriptor_checked, DerivedDescriptor, DerivedDescriptorMeta,
-    DescriptorMeta, DescriptorScripts, ExtendedDescriptor, ExtractPolicy, IntoWalletDescriptor,
-    Policy, XKeyUtils,
+    get_checksum, into_wallet_descriptor_checked, DerivedDescriptor, DescriptorMeta,
+    ExtendedDescriptor, ExtractPolicy, IntoWalletDescriptor, Policy, XKeyUtils,
 };
-use crate::error::Error;
+use crate::error::{Error, MiniscriptPsbtError};
 use crate::psbt::PsbtUtils;
 use crate::signer::SignerError;
 use crate::testutils;
@@ -131,7 +127,7 @@ pub enum AddressIndex {
 
 /// A derived address and the index it was found at
 /// For convenience this automatically derefs to `Address`
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct AddressInfo {
     /// Child index of this address
     pub index: u32,
@@ -208,7 +204,7 @@ impl Wallet {
 
         let address_result = self
             .get_descriptor_for_keychain(keychain)
-            .as_derived(incremented_index, &self.secp)
+            .at_derivation_index(incremented_index)
             .address(self.network);
 
         address_result
@@ -227,7 +223,7 @@ impl Wallet {
 
         let derived_key = self
             .get_descriptor_for_keychain(keychain)
-            .as_derived(current_index, &self.secp);
+            .at_derivation_index(current_index);
 
         let script_pubkey = derived_key.script_pubkey();
 
@@ -255,7 +251,7 @@ impl Wallet {
     // Return derived address for the descriptor of given [`KeychainKind`] at a specific index
     fn peek_address(&self, index: u32, keychain: KeychainKind) -> Result<AddressInfo, Error> {
         self.get_descriptor_for_keychain(keychain)
-            .as_derived(index, &self.secp)
+            .at_derivation_index(index)
             .address(self.network)
             .map(|address| AddressInfo {
                 index,
@@ -271,7 +267,7 @@ impl Wallet {
         self.set_index(keychain, index)?;
 
         self.get_descriptor_for_keychain(keychain)
-            .as_derived(index, &self.secp)
+            .at_derivation_index(index)
             .address(self.network)
             .map(|address| AddressInfo {
                 index,
@@ -1063,8 +1059,9 @@ impl Wallet {
         psbt: &mut psbt::PartiallySignedTransaction,
         sign_options: SignOptions,
     ) -> Result<bool, Error> {
-        // this helps us doing our job later
-        self.add_input_hd_keypaths(psbt)?;
+        // This adds all the PSBT metadata for the inputs, which will help us later figure out how
+        // to derive our keys
+        self.update_psbt_with_descriptor(psbt)?;
 
         // If we aren't allowed to use `witness_utxo`, ensure that every input (except p2tr and finalized ones)
         // has the `non_witness_utxo`
@@ -1269,7 +1266,7 @@ impl Wallet {
     fn get_descriptor_for_txout(
         &self,
         txout: &TxOut,
-    ) -> Result<Option<DerivedDescriptor<'_>>, Error> {
+    ) -> Result<Option<DerivedDescriptor>, Error> {
         // Ok(self
         //     .database
         //     .borrow()
@@ -1665,7 +1662,7 @@ impl Wallet {
         todo!()
     }
 
-    fn add_input_hd_keypaths(
+    fn update_psbt_with_descriptor(
         &self,
         psbt: &mut psbt::PartiallySignedTransaction,
     ) -> Result<(), Error> {

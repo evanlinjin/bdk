@@ -204,6 +204,8 @@ pub extern crate miniscript;
 extern crate serde;
 #[macro_use]
 extern crate serde_json;
+#[cfg(feature = "hardware-signer")]
+pub extern crate hwi;
 
 #[cfg(all(feature = "reqwest", feature = "ureq"))]
 compile_error!("Features reqwest and ureq are mutually exclusive and cannot be enabled together");
@@ -262,7 +264,7 @@ pub mod descriptor;
 #[cfg(feature = "test-md-docs")]
 mod doctest;
 pub mod keys;
-pub(crate) mod psbt;
+pub mod psbt;
 pub(crate) mod types;
 pub mod wallet;
 
