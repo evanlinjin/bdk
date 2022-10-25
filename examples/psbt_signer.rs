@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ElectrumBlockchain::from(Client::new("ssl://electrum.blockstream.info:60002")?);
 
     // create watch only wallet
-    let watch_only_wallet: Wallet<MemoryDatabase> = Wallet::new(
+    let watch_only_wallet: Wallet = Wallet::new(
         watch_only_external_descriptor,
         Some(watch_only_internal_descriptor),
         Network::Testnet,
@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     // create signing wallet
-    let signing_wallet: Wallet<MemoryDatabase> = Wallet::new(
+    let signing_wallet: Wallet = Wallet::new(
         signing_external_descriptor,
         Some(signing_internal_descriptor),
         Network::Testnet,

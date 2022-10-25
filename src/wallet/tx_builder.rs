@@ -47,11 +47,11 @@ use bitcoin::{OutPoint, Script, Transaction};
 use miniscript::descriptor::DescriptorTrait;
 
 use super::coin_selection::{CoinSelectionAlgorithm, DefaultCoinSelectionAlgorithm};
-use crate::{database::BatchDatabase, Error, Utxo, Wallet};
 use crate::{
     types::{FeeRate, KeychainKind, LocalUtxo, WeightedUtxo},
     TransactionDetails,
 };
+use crate::{Error, Utxo, Wallet};
 /// Context in which the [`TxBuilder`] is valid
 pub trait TxBuilderContext: std::fmt::Debug + Default + Clone {}
 
@@ -117,8 +117,8 @@ impl TxBuilderContext for BumpFee {}
 /// [`finish`]: Self::finish
 /// [`coin_selection`]: Self::coin_selection
 #[derive(Debug)]
-pub struct TxBuilder<'a, D, Cs, Ctx> {
-    pub(crate) wallet: &'a Wallet<D>,
+pub struct TxBuilder<'a, Cs, Ctx> {
+    pub(crate) wallet: &'a Wallet,
     pub(crate) params: TxParams,
     pub(crate) coin_selection: Cs,
     pub(crate) phantom: PhantomData<Ctx>,
@@ -169,7 +169,7 @@ impl std::default::Default for FeePolicy {
     }
 }
 
-impl<'a, Cs: Clone, Ctx, D> Clone for TxBuilder<'a, D, Cs, Ctx> {
+impl<'a, Cs: Clone, Ctx> Clone for TxBuilder<'a, Cs, Ctx> {
     fn clone(&self) -> Self {
         TxBuilder {
             wallet: self.wallet,
@@ -181,9 +181,7 @@ impl<'a, Cs: Clone, Ctx, D> Clone for TxBuilder<'a, D, Cs, Ctx> {
 }
 
 // methods supported by both contexts, for any CoinSelectionAlgorithm
-impl<'a, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext>
-    TxBuilder<'a, D, Cs, Ctx>
-{
+impl<'a, Cs: CoinSelectionAlgorithm, Ctx: TxBuilderContext> TxBuilder<'a, Cs, Ctx> {
     /// Set a custom fee rate
     pub fn fee_rate(&mut self, fee_rate: FeeRate) -> &mut Self {
         self.params.fee_policy = Some(FeePolicy::FeeRate(fee_rate));
@@ -505,10 +503,10 @@ impl<'a, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext>
     /// Overrides the [`DefaultCoinSelectionAlgorithm`](super::coin_selection::DefaultCoinSelectionAlgorithm).
     ///
     /// Note that this function consumes the builder and returns it so it is usually best to put this as the first call on the builder.
-    pub fn coin_selection<P: CoinSelectionAlgorithm<D>>(
+    pub fn coin_selection<P: CoinSelectionAlgorithm>(
         self,
         coin_selection: P,
-    ) -> TxBuilder<'a, D, P, Ctx> {
+    ) -> TxBuilder<'a, P, Ctx> {
         TxBuilder {
             wallet: self.wallet,
             params: self.params,
@@ -571,7 +569,7 @@ impl<'a, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext>
     }
 }
 
-impl<'a, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>> TxBuilder<'a, D, Cs, CreateTx> {
+impl<'a, Cs: CoinSelectionAlgorithm> TxBuilder<'a, Cs, CreateTx> {
     /// Replace the recipients already added with a new list
     pub fn set_recipients(&mut self, recipients: Vec<(Script, u64)>) -> &mut Self {
         self.params.recipients = recipients;
@@ -642,7 +640,7 @@ impl<'a, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>> TxBuilder<'a, D, Cs, C
 }
 
 // methods supported only by bump_fee
-impl<'a, D: BatchDatabase> TxBuilder<'a, D, DefaultCoinSelectionAlgorithm, BumpFee> {
+impl<'a> TxBuilder<'a, DefaultCoinSelectionAlgorithm, BumpFee> {
     /// Explicitly tells the wallet that it is allowed to reduce the amount of the output matching this
     /// `script_pubkey` in order to bump the transaction fee. Without specifying this the wallet
     /// will attempt to find a change output to shrink instead.

@@ -384,7 +384,7 @@ macro_rules! bdk_blockchain_tests {
                 $block
             }
 
-            fn get_wallet_from_descriptors(descriptors: &(String, Option<String>)) -> Wallet<MemoryDatabase> {
+            fn get_wallet_from_descriptors(descriptors: &(String, Option<String>)) -> Wallet {
                 Wallet::new(&descriptors.0.to_string(), descriptors.1.as_ref(), Network::Regtest, MemoryDatabase::new()).unwrap()
             }
 
@@ -397,7 +397,7 @@ macro_rules! bdk_blockchain_tests {
                 TaprootScriptSpend3,
             }
 
-            fn init_wallet(ty: WalletType) -> (Wallet<MemoryDatabase>, $blockchain, (String, Option<String>), TestClient) {
+            fn init_wallet(ty: WalletType) -> (Wallet, $blockchain, (String, Option<String>), TestClient) {
                 let _ = env_logger::try_init();
 
                 let descriptors = match ty {
@@ -429,7 +429,7 @@ macro_rules! bdk_blockchain_tests {
                 (wallet, blockchain, descriptors, test_client)
             }
 
-            fn init_single_sig() -> (Wallet<MemoryDatabase>, $blockchain, (String, Option<String>), TestClient) {
+            fn init_single_sig() -> (Wallet, $blockchain, (String, Option<String>), TestClient) {
                 init_wallet(WalletType::WpkhSingleSig)
             }
 

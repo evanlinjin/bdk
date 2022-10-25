@@ -1,3 +1,4 @@
+#![allow(unused)]
 // Bitcoin Dev Kit
 // Written in 2020 by Alekos Filini <alekos.filini@gmail.com>
 //
@@ -250,15 +251,13 @@ pub extern crate rusqlite;
 // to wait until https://github.com/rust-lang/rust/issues/67295 is fixed.
 //
 // Stuff in here is too rough to document atm
-#[doc(hidden)]
-#[macro_use]
+// #[doc(hidden)]
+// #[macro_use]
 pub mod testutils;
 
 #[allow(unused_imports)]
 #[macro_use]
 pub(crate) mod error;
-pub mod blockchain;
-pub mod database;
 pub mod descriptor;
 #[cfg(feature = "test-md-docs")]
 mod doctest;
@@ -271,11 +270,9 @@ pub use descriptor::template;
 pub use descriptor::HdKeyPaths;
 pub use error::Error;
 pub use types::*;
-pub use wallet::address_validator;
 pub use wallet::signer;
 pub use wallet::signer::SignOptions;
 pub use wallet::tx_builder::TxBuilder;
-pub use wallet::SyncOptions;
 pub use wallet::Wallet;
 
 /// Get the version of BDK at runtime
