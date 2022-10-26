@@ -36,10 +36,12 @@
 //! # Ok::<(), bdk::Error>(())
 //! ```
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::default::Default;
 use std::marker::PhantomData;
+use std::rc::Rc;
 
 use bitcoin::util::psbt::{self, PartiallySignedTransaction as Psbt};
 use bitcoin::{LockTime, OutPoint, Script, Sequence, Transaction};
@@ -116,7 +118,7 @@ impl TxBuilderContext for BumpFee {}
 /// [`coin_selection`]: Self::coin_selection
 #[derive(Debug)]
 pub struct TxBuilder<'a, Cs, Ctx> {
-    pub(crate) wallet: &'a Wallet,
+    pub(crate) wallet: Rc<RefCell<&'a mut Wallet>>,
     pub(crate) params: TxParams,
     pub(crate) coin_selection: Cs,
     pub(crate) phantom: PhantomData<Ctx>,
@@ -170,7 +172,7 @@ impl std::default::Default for FeePolicy {
 impl<'a, Cs: Clone, Ctx> Clone for TxBuilder<'a, Cs, Ctx> {
     fn clone(&self) -> Self {
         TxBuilder {
-            wallet: self.wallet,
+            wallet: self.wallet.clone(),
             params: self.params.clone(),
             coin_selection: self.coin_selection.clone(),
             phantom: PhantomData,
@@ -272,18 +274,21 @@ impl<'a, Cs: CoinSelectionAlgorithm, Ctx: TxBuilderContext> TxBuilder<'a, Cs, Ct
     /// These have priority over the "unspendable" utxos, meaning that if a utxo is present both in
     /// the "utxos" and the "unspendable" list, it will be spent.
     pub fn add_utxos(&mut self, outpoints: &[OutPoint]) -> Result<&mut Self, Error> {
-        let utxos = outpoints
-            .iter()
-            .map(|outpoint| self.wallet.get_utxo(*outpoint)?.ok_or(Error::UnknownUtxo))
-            .collect::<Result<Vec<_>, _>>()?;
+        {
+            let wallet = self.wallet.borrow();
+            let utxos = outpoints
+                .iter()
+                .map(|outpoint| wallet.get_utxo(*outpoint).ok_or(Error::UnknownUtxo))
+                .collect::<Result<Vec<_>, _>>()?;
 
-        for utxo in utxos {
-            let descriptor = self.wallet.get_descriptor_for_keychain(utxo.keychain);
-            let satisfaction_weight = descriptor.max_satisfaction_weight().unwrap();
-            self.params.utxos.push(WeightedUtxo {
-                satisfaction_weight,
-                utxo: Utxo::Local(utxo),
-            });
+            for utxo in utxos {
+                let descriptor = wallet.get_descriptor_for_keychain(utxo.keychain);
+                let satisfaction_weight = descriptor.max_satisfaction_weight().unwrap();
+                self.params.utxos.push(WeightedUtxo {
+                    satisfaction_weight,
+                    utxo: Utxo::Local(utxo),
+                });
+            }
         }
 
         Ok(self)
@@ -519,7 +524,9 @@ impl<'a, Cs: CoinSelectionAlgorithm, Ctx: TxBuilderContext> TxBuilder<'a, Cs, Ct
     ///
     /// [`BIP174`]: https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki
     pub fn finish(self) -> Result<(Psbt, TransactionDetails), Error> {
-        self.wallet.create_tx(self.coin_selection, self.params)
+        self.wallet
+            .borrow_mut()
+            .create_tx(self.coin_selection, self.params)
     }
 
     /// Enable signaling RBF

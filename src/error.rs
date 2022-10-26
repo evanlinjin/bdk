@@ -86,9 +86,6 @@ pub enum Error {
         /// found network, for example the network of the bitcoin node
         found: Network,
     },
-    #[cfg(feature = "verify")]
-    /// Transaction verification error
-    Verification(crate::wallet::verify::VerifyError),
 
     /// Progress value must be between `0.0` (included) and `100.0` (included)
     InvalidProgressValue(f32),

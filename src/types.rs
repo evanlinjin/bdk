@@ -18,7 +18,7 @@ use bitcoin::{hash_types::Txid, util::psbt};
 use serde::{Deserialize, Serialize};
 
 /// Types of keychains
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum KeychainKind {
     /// External
     External = 0,
