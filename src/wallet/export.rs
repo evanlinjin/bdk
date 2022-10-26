@@ -130,19 +130,17 @@ impl FullyNodedExport {
         let descriptor = remove_checksum(descriptor);
         Self::is_compatible_with_core(&descriptor)?;
 
-        let blockheight = todo!(); // match wallet.borrow().iter_txs(false) {
-                                   //     _ if !include_blockheight => 0,
-                                   //     Err(_) => 0,
-                                   //     Ok(txs) => {
-                                   //         let mut heights = txs
-                                   //             .into_iter()
-                                   //             .map(|tx| tx.confirmation_time.map(|c| c.height).unwrap_or(0))
-                                   //             .collect::<Vec<_>>();
-                                   //         heights.sort_unstable();
-
-        //         *heights.last().unwrap_or(&0)
-        //     }
-        // };
+        let blockheight = if include_blockheight {
+            wallet
+                .list_transactions(false)
+                .into_iter()
+                .into_iter()
+                .filter_map(|tx| tx.confirmation_time.map(|c| c.height))
+                .min()
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         let export = FullyNodedExport {
             descriptor,
@@ -226,40 +224,42 @@ impl FullyNodedExport {
 mod test {
     use std::str::FromStr;
 
-    use bitcoin::{Network, Txid};
+    use bdk_core::BlockId;
+    use bitcoin::hashes::Hash;
+    use bitcoin::{BlockHash, Network, Transaction, Txid};
 
     use super::*;
     use crate::types::TransactionDetails;
     use crate::wallet::Wallet;
     use crate::BlockTime;
 
-    // fn get_test_db() -> MemoryDatabase {
-    //     db.set_tx(&TransactionDetails {
-    //         transaction: None,
-    //         txid: Txid::from_str(
-    //             "4ddff1fa33af17f377f62b72357b43107c19110a8009b36fb832af505efed98a",
-    //         )
-    //         .unwrap(),
-
-    //         received: 100_000,
-    //         sent: 0,
-    //         fee: Some(500),
-    //         confirmation_time: Some(BlockTime {
-    //             timestamp: 12345678,
-    //             height: 5000,
-    //         }),
-    //     })
-    //     .unwrap();
-
-    //     db
-    // }
+    fn get_test_wallet(
+        descriptor: &str,
+        change_descriptor: Option<&str>,
+        network: Network,
+    ) -> Wallet {
+        let mut wallet = Wallet::new(descriptor, change_descriptor, network).unwrap();
+        let transaction = Transaction {
+            input: vec![],
+            output: vec![],
+            version: 0,
+            lock_time: bitcoin::PackedLockTime::ZERO,
+        };
+        let txid = transaction.txid();
+        wallet.add_checkpoint(BlockId {
+            height: 5001,
+            hash: BlockHash::all_zeros(),
+        });
+        wallet.add_tx_in_chain(transaction, 5000);
+        wallet
+    }
 
     #[test]
     fn test_export_bip44() {
         let descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)";
         let change_descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/1/*)";
 
-        let wallet = Wallet::new(descriptor, Some(change_descriptor), Network::Bitcoin).unwrap();
+        let wallet = get_test_wallet(descriptor, Some(change_descriptor), Network::Bitcoin);
         let export = FullyNodedExport::export_wallet(&wallet, "Test Label", true).unwrap();
 
         assert_eq!(export.descriptor(), descriptor);
@@ -277,7 +277,7 @@ mod test {
 
         let descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)";
 
-        let wallet = Wallet::new(descriptor, None, Network::Bitcoin).unwrap();
+        let wallet = get_test_wallet(descriptor, None, Network::Bitcoin);
         FullyNodedExport::export_wallet(&wallet, "Test Label", true).unwrap();
     }
 
@@ -290,7 +290,7 @@ mod test {
         let descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)";
         let change_descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/50'/0'/1/*)";
 
-        let wallet = Wallet::new(descriptor, Some(change_descriptor), Network::Bitcoin).unwrap();
+        let wallet = get_test_wallet(descriptor, Some(change_descriptor), Network::Bitcoin);
         FullyNodedExport::export_wallet(&wallet, "Test Label", true).unwrap();
     }
 
@@ -307,7 +307,7 @@ mod test {
                                        [c98b1535/48'/0'/0'/2']tpubDCDi5W4sP6zSnzJeowy8rQDVhBdRARaPhK1axABi8V1661wEPeanpEXj4ZLAUEoikVtoWcyK26TKKJSecSfeKxwHCcRrge9k1ybuiL71z4a/1/*\
                                  ))";
 
-        let wallet = Wallet::new(descriptor, Some(change_descriptor), Network::Testnet).unwrap();
+        let wallet = get_test_wallet(descriptor, Some(change_descriptor), Network::Testnet);
         let export = FullyNodedExport::export_wallet(&wallet, "Test Label", true).unwrap();
 
         assert_eq!(export.descriptor(), descriptor);
@@ -321,7 +321,7 @@ mod test {
         let descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)";
         let change_descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/1/*)";
 
-        let wallet = Wallet::new(descriptor, Some(change_descriptor), Network::Bitcoin).unwrap();
+        let wallet = get_test_wallet(descriptor, Some(change_descriptor), Network::Bitcoin);
         let export = FullyNodedExport::export_wallet(&wallet, "Test Label", true).unwrap();
 
         assert_eq!(export.to_string(), "{\"descriptor\":\"wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44\'/0\'/0\'/0/*)\",\"blockheight\":5000,\"label\":\"Test Label\"}");

@@ -19,14 +19,14 @@ use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use bdk_core::{SparseChain, SpkTracker, TxGraph, TxHeight, UnspentIndex};
+use bdk_core::{BlockId, SparseChain, SpkTracker, TxGraph, TxHeight, UnspentIndex};
 use bitcoin::secp256k1::Secp256k1;
 
 use bitcoin::consensus::encode::serialize;
 use bitcoin::util::psbt;
 use bitcoin::{
-    Address, EcdsaSighashType, LockTime, Network, OutPoint, SchnorrSighashType, Script, Sequence,
-    Transaction, TxOut, Txid, Witness,
+    Address, BlockHash, EcdsaSighashType, LockTime, Network, OutPoint, SchnorrSighashType, Script,
+    Sequence, Transaction, TxOut, Txid, Witness,
 };
 
 use miniscript::psbt::{PsbtExt, PsbtInputExt, PsbtInputSatisfier};
@@ -408,11 +408,23 @@ impl Wallet {
             confirmation_time: match height {
                 TxHeight::Confirmed(height) => Some(BlockTime {
                     height,
-                    timestamp: todo!(),
+                    timestamp: u64::MAX, //FIXME
                 }),
                 TxHeight::Unconfirmed => None,
             },
         })
+    }
+
+    /// Add a new checkpoint to the wallet
+    pub(crate) fn add_checkpoint(&mut self, block_id: BlockId) {
+        self.sparse_chain.insert_block(block_id);
+    }
+
+    /// Add a transaction to the wallet. Will only work if height <= latest checkpoint
+    pub(crate) fn add_tx_in_chain(&mut self, tx: Transaction, height: u32) {
+        self.tx_graph.insert_tx(&tx);
+        self.sparse_chain
+            .insert_tx(tx.txid(), TxHeight::Confirmed(height));
     }
 
     /// Return an unsorted list of transactions made and received by the wallet
