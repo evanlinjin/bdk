@@ -20,6 +20,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bdk_core::{BlockId, SparseChain, SpkTracker, TxGraph, TxHeight, UnspentIndex};
+use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::Secp256k1;
 
 use bitcoin::consensus::encode::serialize;
@@ -423,8 +424,16 @@ impl Wallet {
     /// Add a transaction to the wallet. Will only work if height <= latest checkpoint
     pub(crate) fn add_tx_in_chain(&mut self, tx: Transaction, height: u32) {
         self.tx_graph.insert_tx(&tx);
-        self.sparse_chain
-            .insert_tx(tx.txid(), TxHeight::Confirmed(height));
+        let changeset = self
+            .sparse_chain
+            .insert_tx(tx.txid(), TxHeight::Confirmed(height))
+            .unwrap();
+        self.spk_tracker.sync(&self.tx_graph, &changeset);
+        self.unspent_index.sync(&self.spk_tracker, &changeset);
+    }
+
+    pub(crate) fn last_sync_height(&self) -> Option<u32> {
+        self.sparse_chain.latest_checkpoint().map(|cp| cp.height)
     }
 
     /// Return an unsorted list of transactions made and received by the wallet
@@ -1643,80 +1652,70 @@ where
 /// Return a fake wallet that appears to be funded for testing.
 pub fn get_funded_wallet(descriptor: &str) -> (Wallet, (String, Option<String>), bitcoin::Txid) {
     let descriptors = testutils!(@descriptors (descriptor));
-    let wallet = Wallet::new(&descriptors.0, None, Network::Regtest).unwrap();
+    let mut wallet = Wallet::new(&descriptors.0, None, Network::Regtest).unwrap();
+    let address = wallet.get_address(AddressIndex::New).address;
 
-    let funding_address_kix = 0;
-
-    let tx_meta = testutils! {
-            @tx ( (@external descriptors, funding_address_kix) => 50_000 ) (@confirmations 1)
+    let tx = Transaction {
+        version: 1,
+        lock_time: bitcoin::PackedLockTime(0),
+        input: vec![],
+        output: vec![TxOut {
+            value: 50_000,
+            script_pubkey: address.script_pubkey(),
+        }],
     };
 
-    dbg!(tx_meta);
+    wallet.add_checkpoint(BlockId {
+        height: 1_000,
+        hash: BlockHash::all_zeros(),
+    });
+    wallet.add_tx_in_chain(tx.clone(), 1_000);
 
-    // wallet
-    //     .database
-    //     .borrow_mut()
-    //     .set_script_pubkey(
-    //         &bitcoin::Address::from_str(&tx_meta.output.get(0).unwrap().to_address)
-    //             .unwrap()
-    //             .script_pubkey(),
-    //         KeychainKind::External,
-    //         funding_address_kix,
-    //     )
-    //     .unwrap();
-    // wallet
-    //     .database
-    //     .borrow_mut()
-    //     .set_last_index(KeychainKind::External, funding_address_kix)
-    //     .unwrap();
-
-    // let txid = crate::populate_test_db!(wallet.database.borrow_mut(), tx_meta, Some(100));
-
-    // (wallet, descriptors, txid)
-    //
-    todo!()
+    (wallet, descriptors, tx.txid())
 }
 
 #[cfg(test)]
 pub(crate) mod test {
-    //     use bitcoin::{util::psbt, Network};
+    use bitcoin::PackedLockTime;
+    use bitcoin::{util::psbt, Network};
 
-    //     use crate::types::KeychainKind;
+    use crate::types::KeychainKind;
 
-    //     use super::*;
-    //     use crate::signer::{SignOptions, SignerError};
-    //     use crate::wallet::AddressIndex::{LastUnused, New, Peek, Reset};
+    use super::*;
+    use crate::signer::{SignOptions, SignerError};
+    use crate::wallet::AddressIndex::{LastUnused, New, Peek};
 
-    //     // The satisfaction size of a P2WPKH is 112 WU =
-    //     // 1 (elements in witness) + 1 (OP_PUSH) + 33 (pk) + 1 (OP_PUSH) + 72 (signature + sighash) + 1*4 (script len)
-    //     // On the witness itself, we have to push once for the pk (33WU) and once for signature + sighash (72WU), for
-    //     // a total of 105 WU.
-    //     // Here, we push just once for simplicity, so we have to add an extra byte for the missing
-    //     // OP_PUSH.
-    //     const P2WPKH_FAKE_WITNESS_SIZE: usize = 106;
+    // The satisfaction size of a P2WPKH is 112 WU =
+    // 1 (elements in witness) + 1 (OP_PUSH) + 33 (pk) + 1 (OP_PUSH) + 72 (signature + sighash) + 1*4 (script len)
+    // On the witness itself, we have to push once for the pk (33WU) and once for signature + sighash (72WU), for
+    // a total of 105 WU.
+    // Here, we push just once for simplicity, so we have to add an extra byte for the missing
+    // OP_PUSH.
+    const P2WPKH_FAKE_WITNESS_SIZE: usize = 106;
 
-    //     #[test]
-    //     fn test_descriptor_checksum() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let checksum = wallet.descriptor_checksum(KeychainKind::External);
-    //         assert_eq!(checksum.len(), 8);
+    #[test]
+    fn test_descriptor_checksum() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+        let checksum = wallet.descriptor_checksum(KeychainKind::External);
+        assert_eq!(checksum.len(), 8);
 
-    //         let raw_descriptor = wallet
-    //             .descriptor
-    //             .to_string()
-    //             .split_once('#')
-    //             .unwrap()
-    //             .0
-    //             .to_string();
-    //         assert_eq!(get_checksum(&raw_descriptor).unwrap(), checksum);
-    //     }
+        let raw_descriptor = wallet
+            .descriptor
+            .to_string()
+            .split_once('#')
+            .unwrap()
+            .0
+            .to_string();
+        assert_eq!(get_checksum(&raw_descriptor).unwrap(), checksum);
+    }
 
-    //     #[test]
-    //     fn test_get_funded_wallet_balance() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         assert_eq!(wallet.get_balance().unwrap().confirmed, 50000);
-    //     }
+    #[test]
+    fn test_get_funded_wallet_balance() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+        assert_eq!(wallet.get_balance().confirmed, 50000);
+    }
 
+    // XXX: We're not testing these because they don't use public APIs
     //     #[test]
     //     fn test_cache_addresses_fixed() {
     //         let db = MemoryDatabase::new();
@@ -1729,11 +1728,11 @@ pub(crate) mod test {
     //         .unwrap();
 
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap().to_string(),
+    //             wallet.get_address(New).to_string(),
     //             "tb1qj08ys4ct2hzzc2hcz6h2hgrvlmsjynaw43s835"
     //         );
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap().to_string(),
+    //             wallet.get_address(New).to_string(),
     //             "tb1qj08ys4ct2hzzc2hcz6h2hgrvlmsjynaw43s835"
     //         );
 
@@ -1757,11 +1756,11 @@ pub(crate) mod test {
     //         let wallet = Wallet::new("wpkh(tpubEBr4i6yk5nf5DAaJpsi9N2pPYBeJ7fZ5Z9rmN4977iYLCGco1VyjB9tvvuvYtfZzjD5A8igzgw3HeWeeKFmanHYqksqZXYXGsw5zjnj7KM9/*)", None, Network::Testnet, db).unwrap();
 
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap().to_string(),
+    //             wallet.get_address(New).to_string(),
     //             "tb1q6yn66vajcctph75pvylgkksgpp6nq04ppwct9a"
     //         );
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap().to_string(),
+    //             wallet.get_address(New).to_string(),
     //             "tb1q4er7kxx6sssz3q7qp7zsqsdx4erceahhax77d7"
     //         );
 
@@ -1785,7 +1784,7 @@ pub(crate) mod test {
     //         let wallet = Wallet::new("wpkh(tpubEBr4i6yk5nf5DAaJpsi9N2pPYBeJ7fZ5Z9rmN4977iYLCGco1VyjB9tvvuvYtfZzjD5A8igzgw3HeWeeKFmanHYqksqZXYXGsw5zjnj7KM9/*)", None, Network::Testnet, db).unwrap();
 
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap().to_string(),
+    //             wallet.get_address(New).to_string(),
     //             "tb1q6yn66vajcctph75pvylgkksgpp6nq04ppwct9a"
     //         );
     //         assert!(wallet
@@ -1796,7 +1795,7 @@ pub(crate) mod test {
     //             .is_some());
 
     //         for _ in 0..CACHE_ADDR_BATCH_SIZE {
-    //             wallet.get_address(New).unwrap();
+    //             wallet.get_address(New);
     //         }
 
     //         assert!(wallet
@@ -1807,289 +1806,243 @@ pub(crate) mod test {
     //             .is_some());
     //     }
 
-    //     pub(crate) fn get_test_wpkh() -> &'static str {
-    //         "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)"
-    //     }
+    pub(crate) fn get_test_wpkh() -> &'static str {
+        "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)"
+    }
 
-    //     pub(crate) fn get_test_single_sig_csv() -> &'static str {
-    //         // and(pk(Alice),older(6))
-    //         "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),older(6)))"
-    //     }
+    pub(crate) fn get_test_single_sig_csv() -> &'static str {
+        // and(pk(Alice),older(6))
+        "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),older(6)))"
+    }
 
-    //     pub(crate) fn get_test_a_or_b_plus_csv() -> &'static str {
-    //         // or(pk(Alice),and(pk(Bob),older(144)))
-    //         "wsh(or_d(pk(cRjo6jqfVNP33HhSS76UhXETZsGTZYx8FMFvR9kpbtCSV1PmdZdu),and_v(v:pk(cMnkdebixpXMPfkcNEjjGin7s94hiehAH4mLbYkZoh9KSiNNmqC8),older(144))))"
-    //     }
+    pub(crate) fn get_test_a_or_b_plus_csv() -> &'static str {
+        // or(pk(Alice),and(pk(Bob),older(144)))
+        "wsh(or_d(pk(cRjo6jqfVNP33HhSS76UhXETZsGTZYx8FMFvR9kpbtCSV1PmdZdu),and_v(v:pk(cMnkdebixpXMPfkcNEjjGin7s94hiehAH4mLbYkZoh9KSiNNmqC8),older(144))))"
+    }
 
-    //     pub(crate) fn get_test_single_sig_cltv() -> &'static str {
-    //         // and(pk(Alice),after(100000))
-    //         "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100000)))"
-    //     }
+    pub(crate) fn get_test_single_sig_cltv() -> &'static str {
+        // and(pk(Alice),after(100000))
+        "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100000)))"
+    }
 
-    //     pub(crate) fn get_test_tr_single_sig() -> &'static str {
-    //         "tr(cNJmN3fH9DDbDt131fQNkVakkpzawJBSeybCUNmP1BovpmGQ45xG)"
-    //     }
+    pub(crate) fn get_test_tr_single_sig() -> &'static str {
+        "tr(cNJmN3fH9DDbDt131fQNkVakkpzawJBSeybCUNmP1BovpmGQ45xG)"
+    }
 
-    //     pub(crate) fn get_test_tr_with_taptree() -> &'static str {
-    //         "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{pk(cPZzKuNmpuUjD1e8jUU4PVzy2b5LngbSip8mBsxf4e7rSFZVb4Uh),pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642)})"
-    //     }
+    pub(crate) fn get_test_tr_with_taptree() -> &'static str {
+        "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{pk(cPZzKuNmpuUjD1e8jUU4PVzy2b5LngbSip8mBsxf4e7rSFZVb4Uh),pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642)})"
+    }
 
-    //     pub(crate) fn get_test_tr_with_taptree_both_priv() -> &'static str {
-    //         "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{pk(cPZzKuNmpuUjD1e8jUU4PVzy2b5LngbSip8mBsxf4e7rSFZVb4Uh),pk(cNaQCDwmmh4dS9LzCgVtyy1e1xjCJ21GUDHe9K98nzb689JvinGV)})"
-    //     }
+    pub(crate) fn get_test_tr_with_taptree_both_priv() -> &'static str {
+        "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{pk(cPZzKuNmpuUjD1e8jUU4PVzy2b5LngbSip8mBsxf4e7rSFZVb4Uh),pk(cNaQCDwmmh4dS9LzCgVtyy1e1xjCJ21GUDHe9K98nzb689JvinGV)})"
+    }
 
-    //     pub(crate) fn get_test_tr_repeated_key() -> &'static str {
-    //         "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100)),and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(200))})"
-    //     }
+    pub(crate) fn get_test_tr_repeated_key() -> &'static str {
+        "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100)),and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(200))})"
+    }
 
-    //     pub(crate) fn get_test_tr_single_sig_xprv() -> &'static str {
-    //         "tr(tprv8ZgxMBicQKsPdDArR4xSAECuVxeX1jwwSXR4ApKbkYgZiziDc4LdBy2WvJeGDfUSE4UT4hHhbgEwbdq8ajjUHiKDegkwrNU6V55CxcxonVN/*)"
-    //     }
+    pub(crate) fn get_test_tr_single_sig_xprv() -> &'static str {
+        "tr(tprv8ZgxMBicQKsPdDArR4xSAECuVxeX1jwwSXR4ApKbkYgZiziDc4LdBy2WvJeGDfUSE4UT4hHhbgEwbdq8ajjUHiKDegkwrNU6V55CxcxonVN/*)"
+    }
 
-    //     pub(crate) fn get_test_tr_with_taptree_xprv() -> &'static str {
-    //         "tr(cNJmN3fH9DDbDt131fQNkVakkpzawJBSeybCUNmP1BovpmGQ45xG,{pk(tprv8ZgxMBicQKsPdDArR4xSAECuVxeX1jwwSXR4ApKbkYgZiziDc4LdBy2WvJeGDfUSE4UT4hHhbgEwbdq8ajjUHiKDegkwrNU6V55CxcxonVN/*),pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642)})"
-    //     }
+    pub(crate) fn get_test_tr_with_taptree_xprv() -> &'static str {
+        "tr(cNJmN3fH9DDbDt131fQNkVakkpzawJBSeybCUNmP1BovpmGQ45xG,{pk(tprv8ZgxMBicQKsPdDArR4xSAECuVxeX1jwwSXR4ApKbkYgZiziDc4LdBy2WvJeGDfUSE4UT4hHhbgEwbdq8ajjUHiKDegkwrNU6V55CxcxonVN/*),pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642)})"
+    }
 
-    //     pub(crate) fn get_test_tr_dup_keys() -> &'static str {
-    //         "tr(cNJmN3fH9DDbDt131fQNkVakkpzawJBSeybCUNmP1BovpmGQ45xG,{pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642),pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642)})"
-    //     }
+    pub(crate) fn get_test_tr_dup_keys() -> &'static str {
+        "tr(cNJmN3fH9DDbDt131fQNkVakkpzawJBSeybCUNmP1BovpmGQ45xG,{pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642),pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642)})"
+    }
 
-    //     macro_rules! assert_fee_rate {
-    //         ($psbt:expr, $fees:expr, $fee_rate:expr $( ,@dust_change $( $dust_change:expr )* )* $( ,@add_signature $( $add_signature:expr )* )* ) => ({
-    //             let psbt = $psbt.clone();
-    //             #[allow(unused_mut)]
-    //             let mut tx = $psbt.clone().extract_tx();
-    //             $(
-    //                 $( $add_signature )*
-    //                 for txin in &mut tx.input {
-    //                     txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
-    //                 }
-    //             )*
+    macro_rules! assert_fee_rate {
+        ($psbt:expr, $fees:expr, $fee_rate:expr $( ,@dust_change $( $dust_change:expr )* )* $( ,@add_signature $( $add_signature:expr )* )* ) => ({
+            let psbt = $psbt.clone();
+            #[allow(unused_mut)]
+            let mut tx = $psbt.clone().extract_tx();
+            $(
+                $( $add_signature )*
+                    for txin in &mut tx.input {
+                        txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
+                    }
+            )*
 
-    //             #[allow(unused_mut)]
-    //             #[allow(unused_assignments)]
-    //             let mut dust_change = false;
-    //             $(
-    //                 $( $dust_change )*
-    //                 dust_change = true;
-    //             )*
+                #[allow(unused_mut)]
+            #[allow(unused_assignments)]
+            let mut dust_change = false;
+            $(
+                $( $dust_change )*
+                    dust_change = true;
+            )*
 
-    //             let fee_amount = psbt
-    //                 .inputs
-    //                 .iter()
-    //                 .fold(0, |acc, i| acc + i.witness_utxo.as_ref().unwrap().value)
-    //                 - psbt
-    //                     .unsigned_tx
-    //                     .output
-    //                     .iter()
-    //                     .fold(0, |acc, o| acc + o.value);
+                let fee_amount = psbt
+                .inputs
+                .iter()
+                .fold(0, |acc, i| acc + i.witness_utxo.as_ref().unwrap().value)
+                - psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .fold(0, |acc, o| acc + o.value);
 
-    //             assert_eq!(fee_amount, $fees);
+            assert_eq!(fee_amount, $fees);
 
-    //             let tx_fee_rate = FeeRate::from_wu($fees, tx.weight());
-    //             let fee_rate = $fee_rate;
+            let tx_fee_rate = FeeRate::from_wu($fees, tx.weight());
+            let fee_rate = $fee_rate;
 
-    //             if !dust_change {
-    //                 assert!(tx_fee_rate >= fee_rate && (tx_fee_rate - fee_rate).as_sat_per_vb().abs() < 0.5, "Expected fee rate of {:?}, the tx has {:?}", fee_rate, tx_fee_rate);
-    //             } else {
-    //                 assert!(tx_fee_rate >= fee_rate, "Expected fee rate of at least {:?}, the tx has {:?}", fee_rate, tx_fee_rate);
-    //             }
-    //         });
-    //     }
+            if !dust_change {
+                assert!(tx_fee_rate >= fee_rate && (tx_fee_rate - fee_rate).as_sat_per_vb().abs() < 0.5, "Expected fee rate of {:?}, the tx has {:?}", fee_rate, tx_fee_rate);
+            } else {
+                assert!(tx_fee_rate >= fee_rate, "Expected fee rate of at least {:?}, the tx has {:?}", fee_rate, tx_fee_rate);
+            }
+        });
+    }
 
-    //     macro_rules! from_str {
-    //         ($e:expr, $t:ty) => {{
-    //             use std::str::FromStr;
-    //             <$t>::from_str($e).unwrap()
-    //         }};
+    macro_rules! from_str {
+        ($e:expr, $t:ty) => {{
+            use std::str::FromStr;
+            <$t>::from_str($e).unwrap()
+        }};
 
-    //         ($e:expr) => {
-    //             from_str!($e, _)
-    //         };
-    //     }
+        ($e:expr) => {
+            from_str!($e, _)
+        };
+    }
 
-    //     #[test]
-    //     #[should_panic(expected = "NoRecipients")]
-    //     fn test_create_tx_empty_recipients() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         wallet.build_tx().finish().unwrap();
-    //     }
+    #[test]
+    #[should_panic(expected = "NoRecipients")]
+    fn test_create_tx_empty_recipients() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+        wallet.build_tx().finish().unwrap();
+    }
 
-    //     #[test]
-    //     #[should_panic(expected = "NoUtxosSelected")]
-    //     fn test_create_tx_manually_selected_empty_utxos() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
-    //         let mut builder = wallet.build_tx();
-    //         builder
-    //             .add_recipient(addr.script_pubkey(), 25_000)
-    //             .manually_selected_only();
-    //         builder.finish().unwrap();
-    //     }
+    #[test]
+    #[should_panic(expected = "NoUtxosSelected")]
+    fn test_create_tx_manually_selected_empty_utxos() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(addr.script_pubkey(), 25_000)
+            .manually_selected_only();
+        builder.finish().unwrap();
+    }
 
-    //     #[test]
-    //     #[should_panic(expected = "Invalid version `0`")]
-    //     fn test_create_tx_version_0() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
-    //         let mut builder = wallet.build_tx();
-    //         builder
-    //             .add_recipient(addr.script_pubkey(), 25_000)
-    //             .version(0);
-    //         builder.finish().unwrap();
-    //     }
+    #[test]
+    #[should_panic(expected = "Invalid version `0`")]
+    fn test_create_tx_version_0() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(addr.script_pubkey(), 25_000)
+            .version(0);
+        builder.finish().unwrap();
+    }
 
-    //     #[test]
-    //     #[should_panic(
-    //         expected = "TxBuilder requested version `1`, but at least `2` is needed to use OP_CSV"
-    //     )]
-    //     fn test_create_tx_version_1_csv() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
-    //         let addr = wallet.get_address(New).unwrap();
-    //         let mut builder = wallet.build_tx();
-    //         builder
-    //             .add_recipient(addr.script_pubkey(), 25_000)
-    //             .version(1);
-    //         builder.finish().unwrap();
-    //     }
+    #[test]
+    #[should_panic(
+        expected = "TxBuilder requested version `1`, but at least `2` is needed to use OP_CSV"
+    )]
+    fn test_create_tx_version_1_csv() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(addr.script_pubkey(), 25_000)
+            .version(1);
+        builder.finish().unwrap();
+    }
 
-    //     #[test]
-    //     fn test_create_tx_custom_version() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
-    //         let mut builder = wallet.build_tx();
-    //         builder
-    //             .add_recipient(addr.script_pubkey(), 25_000)
-    //             .version(42);
-    //         let (psbt, _) = builder.finish().unwrap();
+    #[test]
+    fn test_create_tx_custom_version() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(addr.script_pubkey(), 25_000)
+            .version(42);
+        let (psbt, _) = builder.finish().unwrap();
 
-    //         assert_eq!(psbt.unsigned_tx.version, 42);
-    //     }
+        assert_eq!(psbt.unsigned_tx.version, 42);
+    }
 
-    //     #[test]
-    //     fn test_create_tx_default_locktime() {
-    //         let descriptors = testutils!(@descriptors (get_test_wpkh()));
-    //         let wallet = Wallet::new(
-    //             &descriptors.0,
-    //             None,
-    //             Network::Regtest,
-    //             AnyDatabase::Memory(MemoryDatabase::new()),
-    //         )
-    //         .unwrap();
+    #[test]
+    fn test_create_tx_default_locktime_is_last_sync_height() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
 
-    //         let tx_meta = testutils! {
-    //                 @tx ( (@external descriptors, 0) => 50_000 )
-    //         };
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), 25_000);
+        let (psbt, _) = builder.finish().unwrap();
 
-    //         // Add the transaction to our db, but do not sync the db.
-    //         crate::populate_test_db!(wallet.database.borrow_mut(), tx_meta, None);
+        // Since we never synced the wallet we don't have a last_sync_height
+        // we could use to try to prevent fee sniping. We default to 0.
+        assert_eq!(psbt.unsigned_tx.lock_time.0, 1_000);
+    }
 
-    //         let addr = wallet.get_address(New).unwrap();
-    //         let mut builder = wallet.build_tx();
-    //         builder.add_recipient(addr.script_pubkey(), 25_000);
-    //         let (psbt, _) = builder.finish().unwrap();
+    #[test]
+    fn test_create_tx_fee_sniping_locktime_last_sync() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), 25_000);
 
-    //         // Since we never synced the wallet we don't have a last_sync_height
-    //         // we could use to try to prevent fee sniping. We default to 0.
-    //         assert_eq!(psbt.unsigned_tx.lock_time, 0);
-    //     }
+        let (psbt, _) = builder.finish().unwrap();
 
-    //     #[test]
-    //     fn test_create_tx_fee_sniping_locktime_provided_height() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
-    //         let mut builder = wallet.build_tx();
-    //         builder.add_recipient(addr.script_pubkey(), 25_000);
-    //         let sync_time = SyncTime {
-    //             block_time: BlockTime {
-    //                 height: 24,
-    //                 timestamp: 0,
-    //             },
-    //         };
-    //         wallet
-    //             .database
-    //             .borrow_mut()
-    //             .set_sync_time(sync_time)
-    //             .unwrap();
-    //         let current_height = 25;
-    //         builder.current_height(current_height);
-    //         let (psbt, _) = builder.finish().unwrap();
+        // If there's no current_height we're left with using the last sync height
+        assert_eq!(
+            psbt.unsigned_tx.lock_time.0,
+            wallet.last_sync_height().unwrap()
+        );
+    }
 
-    //         // current_height will override the last sync height
-    //         assert_eq!(psbt.unsigned_tx.lock_time, current_height);
-    //     }
+    #[test]
+    fn test_create_tx_default_locktime_cltv() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), 25_000);
+        let (psbt, _) = builder.finish().unwrap();
 
-    //     #[test]
-    //     fn test_create_tx_fee_sniping_locktime_last_sync() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
-    //         let mut builder = wallet.build_tx();
-    //         builder.add_recipient(addr.script_pubkey(), 25_000);
-    //         let sync_time = SyncTime {
-    //             block_time: BlockTime {
-    //                 height: 25,
-    //                 timestamp: 0,
-    //             },
-    //         };
-    //         wallet
-    //             .database
-    //             .borrow_mut()
-    //             .set_sync_time(sync_time.clone())
-    //             .unwrap();
-    //         let (psbt, _) = builder.finish().unwrap();
+        assert_eq!(psbt.unsigned_tx.lock_time.0, 100_000);
+    }
 
-    //         // If there's no current_height we're left with using the last sync height
-    //         assert_eq!(psbt.unsigned_tx.lock_time, sync_time.block_time.height);
-    //     }
+    #[test]
+    fn test_create_tx_custom_locktime() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(addr.script_pubkey(), 25_000)
+            .current_height(630_001)
+            .nlocktime(LockTime::from_height(630_000).unwrap());
+        let (psbt, _) = builder.finish().unwrap();
 
-    //     #[test]
-    //     fn test_create_tx_default_locktime_cltv() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
-    //         let addr = wallet.get_address(New).unwrap();
-    //         let mut builder = wallet.build_tx();
-    //         builder.add_recipient(addr.script_pubkey(), 25_000);
-    //         let (psbt, _) = builder.finish().unwrap();
+        // When we explicitly specify a nlocktime
+        // we don't try any fee sniping prevention trick
+        // (we ignore the current_height)
+        assert_eq!(psbt.unsigned_tx.lock_time.0, 630_000);
+    }
 
-    //         assert_eq!(psbt.unsigned_tx.lock_time, 100_000);
-    //     }
+    #[test]
+    fn test_create_tx_custom_locktime_compatible_with_cltv() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(addr.script_pubkey(), 25_000)
+            .nlocktime(LockTime::from_height(630_000).unwrap());
+        let (psbt, _) = builder.finish().unwrap();
 
-    //     #[test]
-    //     fn test_create_tx_custom_locktime() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
-    //         let mut builder = wallet.build_tx();
-    //         builder
-    //             .add_recipient(addr.script_pubkey(), 25_000)
-    //             .current_height(630_001)
-    //             .nlocktime(630_000);
-    //         let (psbt, _) = builder.finish().unwrap();
-
-    //         // When we explicitly specify a nlocktime
-    //         // we don't try any fee sniping prevention trick
-    //         // (we ignore the current_height)
-    //         assert_eq!(psbt.unsigned_tx.lock_time, 630_000);
-    //     }
-
-    //     #[test]
-    //     fn test_create_tx_custom_locktime_compatible_with_cltv() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
-    //         let addr = wallet.get_address(New).unwrap();
-    //         let mut builder = wallet.build_tx();
-    //         builder
-    //             .add_recipient(addr.script_pubkey(), 25_000)
-    //             .nlocktime(630_000);
-    //         let (psbt, _) = builder.finish().unwrap();
-
-    //         assert_eq!(psbt.unsigned_tx.lock_time, 630_000);
-    //     }
+        assert_eq!(psbt.unsigned_tx.lock_time.0, 630_000);
+    }
 
     //     #[test]
     //     #[should_panic(
     //         expected = "TxBuilder requested timelock of `50000`, but at least `100000` is required to spend from this script"
     //     )]
     //     fn test_create_tx_custom_locktime_incompatible_with_cltv() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -2099,8 +2052,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_no_rbf_csv() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.add_recipient(addr.script_pubkey(), 25_000);
     //         let (psbt, _) = builder.finish().unwrap();
@@ -2110,8 +2063,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_with_default_rbf_csv() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -2127,8 +2080,8 @@ pub(crate) mod test {
     //         expected = "Cannot enable RBF with nSequence `3` given a required OP_CSV of `6`"
     //     )]
     //     fn test_create_tx_with_custom_rbf_csv() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -2138,8 +2091,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_no_rbf_cltv() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.add_recipient(addr.script_pubkey(), 25_000);
     //         let (psbt, _) = builder.finish().unwrap();
@@ -2150,8 +2103,8 @@ pub(crate) mod test {
     //     #[test]
     //     #[should_panic(expected = "Cannot enable RBF with a nSequence >= 0xFFFFFFFE")]
     //     fn test_create_tx_invalid_rbf_sequence() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -2161,8 +2114,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_custom_rbf_sequence() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -2172,40 +2125,24 @@ pub(crate) mod test {
     //         assert_eq!(psbt.unsigned_tx.input[0].sequence, 0xDEADBEEF);
     //     }
 
-    //     #[test]
-    //     fn test_create_tx_default_sequence() {
-    //         let descriptors = testutils!(@descriptors (get_test_wpkh()));
-    //         let wallet = Wallet::new(
-    //             &descriptors.0,
-    //             None,
-    //             Network::Regtest,
-    //             AnyDatabase::Memory(MemoryDatabase::new()),
-    //         )
-    //         .unwrap();
+    #[test]
+    fn test_create_tx_default_sequence() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), 25_000);
+        let (psbt, _) = builder.finish().unwrap();
 
-    //         let tx_meta = testutils! {
-    //                 @tx ( (@external descriptors, 0) => 50_000 )
-    //         };
-
-    //         // Add the transaction to our db, but do not sync the db. Unsynced db
-    //         // should trigger the default sequence value for a new transaction as 0xFFFFFFFF
-    //         crate::populate_test_db!(wallet.database.borrow_mut(), tx_meta, None);
-
-    //         let addr = wallet.get_address(New).unwrap();
-    //         let mut builder = wallet.build_tx();
-    //         builder.add_recipient(addr.script_pubkey(), 25_000);
-    //         let (psbt, _) = builder.finish().unwrap();
-
-    //         assert_eq!(psbt.unsigned_tx.input[0].sequence, 0xFFFFFFFF);
-    //     }
+        assert_eq!(psbt.unsigned_tx.input[0].sequence, Sequence(0xFFFFFFFE));
+    }
 
     //     #[test]
     //     #[should_panic(
     //         expected = "The `change_policy` can be set only if the wallet has a change_descriptor"
     //     )]
     //     fn test_create_tx_change_policy_no_internal() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -2215,8 +2152,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_drain_wallet_and_drain_to() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (psbt, details) = builder.finish().unwrap();
@@ -2230,9 +2167,9 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_drain_wallet_and_drain_to_and_with_recipient() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
     //         let addr = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap();
-    //         let drain_addr = wallet.get_address(New).unwrap();
+    //         let drain_addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 20_000)
@@ -2256,8 +2193,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_drain_to_and_utxos() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let utxos: Vec<_> = wallet
     //             .get_available_utxos()
     //             .unwrap()
@@ -2281,8 +2218,8 @@ pub(crate) mod test {
     //     #[test]
     //     #[should_panic(expected = "NoRecipients")]
     //     fn test_create_tx_drain_to_no_drain_wallet_no_utxos() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let drain_addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let drain_addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(drain_addr.script_pubkey());
     //         builder.finish().unwrap();
@@ -2290,8 +2227,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_default_fee_rate() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.add_recipient(addr.script_pubkey(), 25_000);
     //         let (psbt, details) = builder.finish().unwrap();
@@ -2301,8 +2238,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_custom_fee_rate() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -2314,8 +2251,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_absolute_fee() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .drain_to(addr.script_pubkey())
@@ -2333,8 +2270,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_absolute_zero_fee() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .drain_to(addr.script_pubkey())
@@ -2353,8 +2290,8 @@ pub(crate) mod test {
     //     #[test]
     //     #[should_panic(expected = "InsufficientFunds")]
     //     fn test_create_tx_absolute_high_fee() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .drain_to(addr.script_pubkey())
@@ -2367,8 +2304,8 @@ pub(crate) mod test {
     //     fn test_create_tx_add_change() {
     //         use super::tx_builder::TxOrdering;
 
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -2385,8 +2322,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_skip_change_dust() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.add_recipient(addr.script_pubkey(), 49_800);
     //         let (psbt, details) = builder.finish().unwrap();
@@ -2399,8 +2336,8 @@ pub(crate) mod test {
     //     #[test]
     //     #[should_panic(expected = "InsufficientFunds")]
     //     fn test_create_tx_drain_to_dust_amount() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         // very high fee rate, so that the only output would be below dust
     //         let mut builder = wallet.build_tx();
     //         builder
@@ -2412,8 +2349,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_ordering_respected() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 30_000)
@@ -2432,8 +2369,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_default_sighash() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.add_recipient(addr.script_pubkey(), 30_000);
     //         let (psbt, _) = builder.finish().unwrap();
@@ -2443,8 +2380,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_custom_sighash() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 30_000)
@@ -2462,8 +2399,8 @@ pub(crate) mod test {
     //         use bitcoin::util::bip32::{DerivationPath, Fingerprint};
     //         use std::str::FromStr;
 
-    //         let (wallet, _, _) = get_funded_wallet("wpkh([d34db33f/44'/0'/0']tpubDEnoLuPdBep9bzw5LoGYpsxUQYheRQ9gcgrJhJEcdKFB9cWQRyYmkCyRoTqeD4tJYiVVgt6A3rN6rWn9RYhR9sBsGxji29LYWHuKKbdb1ev/0/*)");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh([d34db33f/44'/0'/0']tpubDEnoLuPdBep9bzw5LoGYpsxUQYheRQ9gcgrJhJEcdKFB9cWQRyYmkCyRoTqeD4tJYiVVgt6A3rN6rWn9RYhR9sBsGxji29LYWHuKKbdb1ev/0/*)");
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (psbt, _) = builder.finish().unwrap();
@@ -2483,9 +2420,9 @@ pub(crate) mod test {
     //         use bitcoin::util::bip32::{DerivationPath, Fingerprint};
     //         use std::str::FromStr;
 
-    //         let (wallet, descriptors, _) = get_funded_wallet("wpkh([d34db33f/44'/0'/0']tpubDEnoLuPdBep9bzw5LoGYpsxUQYheRQ9gcgrJhJEcdKFB9cWQRyYmkCyRoTqeD4tJYiVVgt6A3rN6rWn9RYhR9sBsGxji29LYWHuKKbdb1ev/0/*)");
+    //         let (mut wallet, descriptors, _) = get_funded_wallet("wpkh([d34db33f/44'/0'/0']tpubDEnoLuPdBep9bzw5LoGYpsxUQYheRQ9gcgrJhJEcdKFB9cWQRyYmkCyRoTqeD4tJYiVVgt6A3rN6rWn9RYhR9sBsGxji29LYWHuKKbdb1ev/0/*)");
     //         // cache some addresses
-    //         wallet.get_address(New).unwrap();
+    //         wallet.get_address(New);
 
     //         let addr = testutils!(@external descriptors, 5);
     //         let mut builder = wallet.build_tx();
@@ -2506,9 +2443,9 @@ pub(crate) mod test {
     //     fn test_create_tx_set_redeem_script_p2sh() {
     //         use bitcoin::hashes::hex::FromHex;
 
-    //         let (wallet, _, _) =
+    //         let (mut wallet, _, _) =
     //             get_funded_wallet("sh(pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW))");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (psbt, _) = builder.finish().unwrap();
@@ -2529,9 +2466,9 @@ pub(crate) mod test {
     //     fn test_create_tx_set_witness_script_p2wsh() {
     //         use bitcoin::hashes::hex::FromHex;
 
-    //         let (wallet, _, _) =
+    //         let (mut wallet, _, _) =
     //             get_funded_wallet("wsh(pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW))");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (psbt, _) = builder.finish().unwrap();
@@ -2552,9 +2489,9 @@ pub(crate) mod test {
     //     fn test_create_tx_set_redeem_witness_script_p2wsh_p2sh() {
     //         use bitcoin::hashes::hex::FromHex;
 
-    //         let (wallet, _, _) =
+    //         let (mut wallet, _, _) =
     //             get_funded_wallet("sh(wsh(pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)))");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (psbt, _) = builder.finish().unwrap();
@@ -2572,9 +2509,9 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_non_witness_utxo() {
-    //         let (wallet, _, _) =
+    //         let (mut wallet, _, _) =
     //             get_funded_wallet("sh(pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW))");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (psbt, _) = builder.finish().unwrap();
@@ -2585,9 +2522,9 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_only_witness_utxo() {
-    //         let (wallet, _, _) =
+    //         let (mut wallet, _, _) =
     //             get_funded_wallet("wsh(pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW))");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .drain_to(addr.script_pubkey())
@@ -2601,9 +2538,9 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_shwpkh_has_witness_utxo() {
-    //         let (wallet, _, _) =
+    //         let (mut wallet, _, _) =
     //             get_funded_wallet("sh(wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW))");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (psbt, _) = builder.finish().unwrap();
@@ -2613,9 +2550,9 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_both_non_witness_utxo_and_witness_utxo_default() {
-    //         let (wallet, _, _) =
+    //         let (mut wallet, _, _) =
     //             get_funded_wallet("wsh(pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW))");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (psbt, _) = builder.finish().unwrap();
@@ -2624,38 +2561,38 @@ pub(crate) mod test {
     //         assert!(psbt.inputs[0].witness_utxo.is_some());
     //     }
 
-    //     #[test]
-    //     fn test_create_tx_add_utxo() {
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
-    //         let small_output_txid = crate::populate_test_db!(
-    //             wallet.database.borrow_mut(),
-    //             testutils! (@tx ( (@external descriptors, 0) => 25_000 ) (@confirmations 1)),
-    //             Some(100),
-    //         );
+    // #[test]
+    // fn test_create_tx_add_utxo() {
+    //     let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //     let small_output_txid = crate::populate_test_db!(
+    //         wallet.database.borrow_mut(),
+    //         testutils! (@tx ( (@external descriptors, 0) => 25_000 ) (@confirmations 1)),
+    //         Some(100),
+    //     );
 
-    //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
-    //         let mut builder = wallet.build_tx();
-    //         builder
-    //             .add_recipient(addr.script_pubkey(), 30_000)
-    //             .add_utxo(OutPoint {
-    //                 txid: small_output_txid,
-    //                 vout: 0,
-    //             })
-    //             .unwrap();
-    //         let (psbt, details) = builder.finish().unwrap();
+    //     let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
+    //     let mut builder = wallet.build_tx();
+    //     builder
+    //         .add_recipient(addr.script_pubkey(), 30_000)
+    //         .add_utxo(OutPoint {
+    //             txid: small_output_txid,
+    //             vout: 0,
+    //         })
+    //         .unwrap();
+    //     let (psbt, details) = builder.finish().unwrap();
 
-    //         assert_eq!(
-    //             psbt.unsigned_tx.input.len(),
-    //             2,
-    //             "should add an additional input since 25_000 < 30_000"
-    //         );
-    //         assert_eq!(details.sent, 75_000, "total should be sum of both inputs");
-    //     }
+    //     assert_eq!(
+    //         psbt.unsigned_tx.input.len(),
+    //         2,
+    //         "should add an additional input since 25_000 < 30_000"
+    //     );
+    //     assert_eq!(details.sent, 75_000, "total should be sum of both inputs");
+    // }
 
     //     #[test]
     //     #[should_panic(expected = "InsufficientFunds")]
     //     fn test_create_tx_manually_selected_insufficient() {
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
     //         let small_output_txid = crate::populate_test_db!(
     //             wallet.database.borrow_mut(),
     //             testutils! (@tx ( (@external descriptors, 0) => 25_000 ) (@confirmations 1)),
@@ -2678,7 +2615,7 @@ pub(crate) mod test {
     //     #[test]
     //     #[should_panic(expected = "SpendingPolicyRequired(External)")]
     //     fn test_create_tx_policy_path_required() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_a_or_b_plus_csv());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_a_or_b_plus_csv());
 
     //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
     //         let mut builder = wallet.build_tx();
@@ -2722,7 +2659,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_create_tx_policy_path_use_csv() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_a_or_b_plus_csv());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_a_or_b_plus_csv());
 
     //         let external_policy = wallet.policies(KeychainKind::External).unwrap().unwrap();
     //         let root_id = external_policy.id;
@@ -2744,8 +2681,8 @@ pub(crate) mod test {
     //         use bitcoin::hashes::hex::FromHex;
     //         use bitcoin::util::bip32;
 
-    //         let (wallet, _, _) = get_funded_wallet("wpkh([73756c7f/48'/0'/0'/2']tpubDCKxNyM3bLgbEX13Mcd8mYxbVg9ajDkWXMh29hMWBurKfVmBfWAM96QVP3zaUcN51HvkZ3ar4VwP82kC8JZhhux8vFQoJintSpVBwpFvyU3/0/*)");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh([73756c7f/48'/0'/0'/2']tpubDCKxNyM3bLgbEX13Mcd8mYxbVg9ajDkWXMh29hMWBurKfVmBfWAM96QVP3zaUcN51HvkZ3ar4VwP82kC8JZhhux8vFQoJintSpVBwpFvyU3/0/*)");
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -2762,8 +2699,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_add_foreign_utxo() {
-    //         let (wallet1, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let (wallet2, _, _) =
+    //         let (mut wallet1, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet2, _, _) =
     //             get_funded_wallet("wpkh(cVbZ8ovhye9AoAHFsqobCf7LxbXDAECy9Kb8TZdfsDYMZGBUyCnm)");
 
     //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
@@ -2830,7 +2767,7 @@ pub(crate) mod test {
     //     #[test]
     //     #[should_panic(expected = "Generic(\"Foreign utxo missing witness_utxo or non_witness_utxo\")")]
     //     fn test_add_foreign_utxo_invalid_psbt_input() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
     //         let mut builder = wallet.build_tx();
     //         let outpoint = wallet.list_unspent().unwrap()[0].outpoint;
     //         let foreign_utxo_satisfaction = wallet
@@ -2844,8 +2781,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_add_foreign_utxo_where_outpoint_doesnt_match_psbt_input() {
-    //         let (wallet1, _, txid1) = get_funded_wallet(get_test_wpkh());
-    //         let (wallet2, _, txid2) =
+    //         let (mut wallet1, _, txid1) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet2, _, txid2) =
     //             get_funded_wallet("wpkh(cVbZ8ovhye9AoAHFsqobCf7LxbXDAECy9Kb8TZdfsDYMZGBUyCnm)");
 
     //         let utxo2 = wallet2.list_unspent().unwrap().remove(0);
@@ -2902,8 +2839,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_add_foreign_utxo_only_witness_utxo() {
-    //         let (wallet1, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let (wallet2, _, txid2) =
+    //         let (mut wallet1, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet2, _, txid2) =
     //             get_funded_wallet("wpkh(cVbZ8ovhye9AoAHFsqobCf7LxbXDAECy9Kb8TZdfsDYMZGBUyCnm)");
     //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
     //         let utxo2 = wallet2.list_unspent().unwrap().remove(0);
@@ -2974,7 +2911,7 @@ pub(crate) mod test {
     //     #[test]
     //     fn test_get_psbt_input() {
     //         // this should grab a known good utxo and set the input
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
     //         for utxo in wallet.list_unspent().unwrap() {
     //             let psbt_input = wallet.get_psbt_input(utxo, None, false).unwrap();
     //             assert!(psbt_input.witness_utxo.is_some() || psbt_input.non_witness_utxo.is_some());
@@ -2986,8 +2923,8 @@ pub(crate) mod test {
     //         expected = "MissingKeyOrigin(\"tpubDCKxNyM3bLgbEX13Mcd8mYxbVg9ajDkWXMh29hMWBurKfVmBfWAM96QVP3zaUcN51HvkZ3ar4VwP82kC8JZhhux8vFQoJintSpVBwpFvyU3\")"
     //     )]
     //     fn test_create_tx_global_xpubs_origin_missing() {
-    //         let (wallet, _, _) = get_funded_wallet("wpkh(tpubDCKxNyM3bLgbEX13Mcd8mYxbVg9ajDkWXMh29hMWBurKfVmBfWAM96QVP3zaUcN51HvkZ3ar4VwP82kC8JZhhux8vFQoJintSpVBwpFvyU3/0/*)");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh(tpubDCKxNyM3bLgbEX13Mcd8mYxbVg9ajDkWXMh29hMWBurKfVmBfWAM96QVP3zaUcN51HvkZ3ar4VwP82kC8JZhhux8vFQoJintSpVBwpFvyU3/0/*)");
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -3000,8 +2937,8 @@ pub(crate) mod test {
     //         use bitcoin::hashes::hex::FromHex;
     //         use bitcoin::util::bip32;
 
-    //         let (wallet, _, _) = get_funded_wallet("wpkh(tpubD6NzVbkrYhZ4Y55A58Gv9RSNF5hy84b5AJqYy7sCcjFrkcLpPre8kmgfit6kY1Zs3BLgeypTDBZJM222guPpdz7Cup5yzaMu62u7mYGbwFL/0/*)");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh(tpubD6NzVbkrYhZ4Y55A58Gv9RSNF5hy84b5AJqYy7sCcjFrkcLpPre8kmgfit6kY1Zs3BLgeypTDBZJM222guPpdz7Cup5yzaMu62u7mYGbwFL/0/*)");
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -3021,8 +2958,8 @@ pub(crate) mod test {
     //     #[test]
     //     #[should_panic(expected = "IrreplaceableTransaction")]
     //     fn test_bump_fee_irreplaceable_tx() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.add_recipient(addr.script_pubkey(), 25_000);
     //         let (psbt, mut details) = builder.finish().unwrap();
@@ -3039,8 +2976,8 @@ pub(crate) mod test {
     //     #[test]
     //     #[should_panic(expected = "TransactionConfirmed")]
     //     fn test_bump_fee_confirmed_tx() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.add_recipient(addr.script_pubkey(), 25_000);
     //         let (psbt, mut details) = builder.finish().unwrap();
@@ -3061,8 +2998,8 @@ pub(crate) mod test {
     //     #[test]
     //     #[should_panic(expected = "FeeRateTooLow")]
     //     fn test_bump_fee_low_fee_rate() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -3083,8 +3020,8 @@ pub(crate) mod test {
     //     #[test]
     //     #[should_panic(expected = "FeeTooLow")]
     //     fn test_bump_fee_low_abs() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -3105,8 +3042,8 @@ pub(crate) mod test {
     //     #[test]
     //     #[should_panic(expected = "FeeTooLow")]
     //     fn test_bump_fee_zero_abs() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .add_recipient(addr.script_pubkey(), 25_000)
@@ -3126,7 +3063,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_bump_fee_reduce_change() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
     //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
     //         let mut builder = wallet.build_tx();
     //         builder
@@ -3186,7 +3123,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_bump_fee_absolute_reduce_change() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
     //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
     //         let mut builder = wallet.build_tx();
     //         builder
@@ -3252,7 +3189,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_bump_fee_reduce_single_recipient() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
     //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
     //         let mut builder = wallet.build_tx();
     //         builder
@@ -3296,7 +3233,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_bump_fee_absolute_reduce_single_recipient() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
     //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
     //         let mut builder = wallet.build_tx();
     //         builder
@@ -3340,7 +3277,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_bump_fee_drain_wallet() {
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
     //         // receive an extra tx so that our wallet has two utxos.
     //         let incoming_txid = crate::populate_test_db!(
     //             wallet.database.borrow_mut(),
@@ -3393,7 +3330,7 @@ pub(crate) mod test {
     //     #[test]
     //     #[should_panic(expected = "InsufficientFunds")]
     //     fn test_bump_fee_remove_output_manually_selected_only() {
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
     //         // receive an extra tx so that our wallet has two utxos. then we manually pick only one of
     //         // them, and make sure that `bump_fee` doesn't try to add more. This fails because we've
     //         // told the wallet it's not allowed to add more inputs AND it can't reduce the value of the
@@ -3444,7 +3381,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_bump_fee_add_input() {
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
     //         crate::populate_test_db!(
     //             wallet.database.borrow_mut(),
     //             testutils! (@tx ( (@external descriptors, 0) => 25_000 ) (@confirmations 1)),
@@ -3507,7 +3444,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_bump_fee_absolute_add_input() {
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
     //         crate::populate_test_db!(
     //             wallet.database.borrow_mut(),
     //             testutils! (@tx ( (@external descriptors, 0) => 25_000 ) (@confirmations 1)),
@@ -3570,7 +3507,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_bump_fee_no_change_add_input_and_change() {
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
     //         let incoming_txid = crate::populate_test_db!(
     //             wallet.database.borrow_mut(),
     //             testutils! (@tx ( (@external descriptors, 0) => 25_000 ) (@confirmations 1)),
@@ -3647,7 +3584,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_bump_fee_add_input_change_dust() {
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
     //         crate::populate_test_db!(
     //             wallet.database.borrow_mut(),
     //             testutils! (@tx ( (@external descriptors, 0) => 25_000 ) (@confirmations 1)),
@@ -3724,7 +3661,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_bump_fee_force_add_input() {
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
     //         let incoming_txid = crate::populate_test_db!(
     //             wallet.database.borrow_mut(),
     //             testutils! (@tx ( (@external descriptors, 0) => 25_000 ) (@confirmations 1)),
@@ -3795,7 +3732,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_bump_fee_absolute_force_add_input() {
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
     //         let incoming_txid = crate::populate_test_db!(
     //             wallet.database.borrow_mut(),
     //             testutils! (@tx ( (@external descriptors, 0) => 25_000 ) (@confirmations 1)),
@@ -3873,7 +3810,7 @@ pub(crate) mod test {
     //         // So, we fail with "InsufficientFunds", as per RBF rule 2:
     //         // The replacement transaction may only include an unconfirmed input
     //         // if that input was included in one of the original transactions.
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
     //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
     //         let mut builder = wallet.build_tx();
     //         builder
@@ -3917,7 +3854,7 @@ pub(crate) mod test {
     //         // (BIP125 rule 2 only apply to newly added unconfirmed input, you can
     //         // always fee bump with an unconfirmed input if it was included in the
     //         // original transaction)
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
     //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
     //         // We receive a tx with 0 confirmations, which will be used as an input
     //         // in the drain tx.
@@ -3967,7 +3904,7 @@ pub(crate) mod test {
     //         // This caused a bug in master where we would calculate the wrong fee
     //         // for a transaction.
     //         // See https://github.com/bitcoindevkit/bdk/issues/660
-    //         let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
     //         let send_to = Address::from_str("tb1ql7w62elx9ucw4pj5lgw4l028hmuw80sndtntxt").unwrap();
     //         let fee_rate = FeeRate::from_sat_per_vb(2.01);
     //         let incoming_txid = crate::populate_test_db!(
@@ -3991,8 +3928,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_sign_single_xprv() {
-    //         let (wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (mut psbt, _) = builder.finish().unwrap();
@@ -4006,8 +3943,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_sign_single_xprv_with_master_fingerprint_and_path() {
-    //         let (wallet, _, _) = get_funded_wallet("wpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (mut psbt, _) = builder.finish().unwrap();
@@ -4021,8 +3958,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_sign_single_xprv_bip44_path() {
-    //         let (wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/44'/0'/0'/0/*)");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/44'/0'/0'/0/*)");
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (mut psbt, _) = builder.finish().unwrap();
@@ -4036,8 +3973,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_sign_single_xprv_sh_wpkh() {
-    //         let (wallet, _, _) = get_funded_wallet("sh(wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*))");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet("sh(wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*))");
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (mut psbt, _) = builder.finish().unwrap();
@@ -4051,9 +3988,9 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_sign_single_wif() {
-    //         let (wallet, _, _) =
+    //         let (mut wallet, _, _) =
     //             get_funded_wallet("wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (mut psbt, _) = builder.finish().unwrap();
@@ -4067,8 +4004,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_sign_single_xprv_no_hd_keypaths() {
-    //         let (wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (mut psbt, _) = builder.finish().unwrap();
@@ -4085,7 +4022,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_include_output_redeem_witness_script() {
-    //         let (wallet, _, _) = get_funded_wallet("sh(wsh(multi(1,cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW,cRjo6jqfVNP33HhSS76UhXETZsGTZYx8FMFvR9kpbtCSV1PmdZdu)))");
+    //         let (mut wallet, _, _) = get_funded_wallet("sh(wsh(multi(1,cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW,cRjo6jqfVNP33HhSS76UhXETZsGTZYx8FMFvR9kpbtCSV1PmdZdu)))");
     //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
     //         let mut builder = wallet.build_tx();
     //         builder
@@ -4102,7 +4039,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_signing_only_one_of_multiple_inputs() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
     //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
     //         let mut builder = wallet.build_tx();
     //         builder
@@ -4146,10 +4083,10 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_remove_partial_sigs_after_finalize_sign_option() {
-    //         let (wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
 
     //         for remove_partial_sigs in &[true, false] {
-    //             let addr = wallet.get_address(New).unwrap();
+    //             let addr = wallet.get_address(New);
     //             let mut builder = wallet.build_tx();
     //             builder.drain_to(addr.script_pubkey()).drain_wallet();
     //             let mut psbt = builder.finish().unwrap().0;
@@ -4176,10 +4113,10 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_try_finalize_sign_option() {
-    //         let (wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
 
     //         for try_finalize in &[true, false] {
-    //             let addr = wallet.get_address(New).unwrap();
+    //             let addr = wallet.get_address(New);
     //             let mut builder = wallet.build_tx();
     //             builder.drain_to(addr.script_pubkey()).drain_wallet();
     //             let mut psbt = builder.finish().unwrap().0;
@@ -4212,8 +4149,8 @@ pub(crate) mod test {
     //     fn test_sign_nonstandard_sighash() {
     //         let sighash = EcdsaSighashType::NonePlusAnyoneCanPay;
 
-    //         let (wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .drain_to(addr.script_pubkey())
@@ -4325,12 +4262,12 @@ pub(crate) mod test {
 
     //         // current new address is not affected
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap().to_string(),
+    //             wallet.get_address(New).to_string(),
     //             "tb1q6yn66vajcctph75pvylgkksgpp6nq04ppwct9a"
     //         );
 
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap().to_string(),
+    //             wallet.get_address(New).to_string(),
     //             "tb1q4er7kxx6sssz3q7qp7zsqsdx4erceahhax77d7"
     //         );
     //     }
@@ -4365,19 +4302,19 @@ pub(crate) mod test {
 
     //         // new index 0
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap().to_string(),
+    //             wallet.get_address(New).to_string(),
     //             "tb1q6yn66vajcctph75pvylgkksgpp6nq04ppwct9a"
     //         );
 
     //         // new index 1
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap().to_string(),
+    //             wallet.get_address(New).to_string(),
     //             "tb1q4er7kxx6sssz3q7qp7zsqsdx4erceahhax77d7"
     //         );
 
     //         // new index 2
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap().to_string(),
+    //             wallet.get_address(New).to_string(),
     //             "tb1qzntf2mqex4ehwkjlfdyy3ewdlk08qkvkvrz7x2"
     //         );
 
@@ -4389,7 +4326,7 @@ pub(crate) mod test {
 
     //         // new index 2 again
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap().to_string(),
+    //             wallet.get_address(New).to_string(),
     //             "tb1qzntf2mqex4ehwkjlfdyy3ewdlk08qkvkvrz7x2"
     //         );
     //     }
@@ -4402,7 +4339,7 @@ pub(crate) mod test {
 
     //         // new index 0
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap(),
+    //             wallet.get_address(New),
     //             AddressInfo {
     //                 index: 0,
     //                 address: Address::from_str("tb1q6yn66vajcctph75pvylgkksgpp6nq04ppwct9a").unwrap(),
@@ -4412,7 +4349,7 @@ pub(crate) mod test {
 
     //         // new index 1
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap(),
+    //             wallet.get_address(New),
     //             AddressInfo {
     //                 index: 1,
     //                 address: Address::from_str("tb1q4er7kxx6sssz3q7qp7zsqsdx4erceahhax77d7").unwrap(),
@@ -4432,7 +4369,7 @@ pub(crate) mod test {
 
     //         // new index 2
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap(),
+    //             wallet.get_address(New),
     //             AddressInfo {
     //                 index: 2,
     //                 address: Address::from_str("tb1qzntf2mqex4ehwkjlfdyy3ewdlk08qkvkvrz7x2").unwrap(),
@@ -4452,7 +4389,7 @@ pub(crate) mod test {
 
     //         // new index 2 again
     //         assert_eq!(
-    //             wallet.get_address(New).unwrap(),
+    //             wallet.get_address(New),
     //             AddressInfo {
     //                 index: 2,
     //                 address: Address::from_str("tb1qzntf2mqex4ehwkjlfdyy3ewdlk08qkvkvrz7x2").unwrap(),
@@ -4463,7 +4400,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_sending_to_bip350_bech32m_address() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_wpkh());
     //         let addr =
     //             Address::from_str("tb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesf3hn0c")
     //                 .unwrap();
@@ -4551,7 +4488,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_taproot_psbt_populate_tap_key_origins() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_single_sig_xprv());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_single_sig_xprv());
     //         let addr = wallet.get_address(AddressIndex::New).unwrap();
 
     //         let mut builder = wallet.build_tx();
@@ -4586,7 +4523,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_taproot_psbt_populate_tap_key_origins_repeated_key() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_repeated_key());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_repeated_key());
     //         let addr = wallet.get_address(AddressIndex::New).unwrap();
 
     //         let path = vec![("rn4nre9c".to_string(), vec![0])]
@@ -4652,7 +4589,7 @@ pub(crate) mod test {
     //         use bitcoin::hashes::hex::FromHex;
     //         use bitcoin::util::taproot;
 
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree());
     //         let addr = wallet.get_address(AddressIndex::Peek(0)).unwrap();
 
     //         let mut builder = wallet.build_tx();
@@ -4697,8 +4634,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_taproot_sign_missing_witness_utxo() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_single_sig());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_single_sig());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (mut psbt, _) = builder.finish().unwrap();
@@ -4743,8 +4680,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_taproot_sign_using_non_witness_utxo() {
-    //         let (wallet, _, prev_txid) = get_funded_wallet(get_test_tr_single_sig());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, prev_txid) = get_funded_wallet(get_test_tr_single_sig());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder.drain_to(addr.script_pubkey()).drain_wallet();
     //         let (mut psbt, _) = builder.finish().unwrap();
@@ -4766,8 +4703,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_taproot_foreign_utxo() {
-    //         let (wallet1, _, _) = get_funded_wallet(get_test_wpkh());
-    //         let (wallet2, _, _) = get_funded_wallet(get_test_tr_single_sig());
+    //         let (mut wallet1, _, _) = get_funded_wallet(get_test_wpkh());
+    //         let (mut wallet2, _, _) = get_funded_wallet(get_test_tr_single_sig());
 
     //         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
     //         let utxo = wallet2.list_unspent().unwrap().remove(0);
@@ -4819,16 +4756,16 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_taproot_key_spend() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_single_sig());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_single_sig());
     //         test_spend_from_wallet(wallet);
 
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_single_sig_xprv());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_single_sig_xprv());
     //         test_spend_from_wallet(wallet);
     //     }
 
     //     #[test]
     //     fn test_taproot_no_key_spend() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
     //         let addr = wallet.get_address(AddressIndex::New).unwrap();
 
     //         let mut builder = wallet.build_tx();
@@ -4853,17 +4790,17 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_taproot_script_spend() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree());
     //         test_spend_from_wallet(wallet);
 
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_xprv());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_xprv());
     //         test_spend_from_wallet(wallet);
     //     }
 
     //     #[test]
     //     fn test_taproot_script_spend_sign_all_leaves() {
     //         use crate::signer::TapLeavesOptions;
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
     //         let addr = wallet.get_address(AddressIndex::New).unwrap();
 
     //         let mut builder = wallet.build_tx();
@@ -4894,7 +4831,7 @@ pub(crate) mod test {
     //         use crate::signer::TapLeavesOptions;
     //         use crate::wallet::taproot::TapLeafHash;
 
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
     //         let addr = wallet.get_address(AddressIndex::New).unwrap();
 
     //         let mut builder = wallet.build_tx();
@@ -4936,7 +4873,7 @@ pub(crate) mod test {
     //         use crate::signer::TapLeavesOptions;
     //         use crate::wallet::taproot::TapLeafHash;
 
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
     //         let addr = wallet.get_address(AddressIndex::New).unwrap();
 
     //         let mut builder = wallet.build_tx();
@@ -4976,7 +4913,7 @@ pub(crate) mod test {
     //     #[test]
     //     fn test_taproot_script_spend_sign_no_leaves() {
     //         use crate::signer::TapLeavesOptions;
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
     //         let addr = wallet.get_address(AddressIndex::New).unwrap();
 
     //         let mut builder = wallet.build_tx();
@@ -4998,7 +4935,7 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_taproot_sign_derive_index_from_psbt() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_single_sig_xprv());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_single_sig_xprv());
 
     //         let addr = wallet.get_address(AddressIndex::New).unwrap();
 
@@ -5025,8 +4962,8 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_taproot_sign_explicit_sighash_all() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_single_sig());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_single_sig());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .drain_to(addr.script_pubkey())
@@ -5045,8 +4982,8 @@ pub(crate) mod test {
     //     fn test_taproot_sign_non_default_sighash() {
     //         let sighash = SchnorrSighashType::NonePlusAnyoneCanPay;
 
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_single_sig());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_single_sig());
+    //         let addr = wallet.get_address(New);
     //         let mut builder = wallet.build_tx();
     //         builder
     //             .drain_to(addr.script_pubkey())
@@ -5219,9 +5156,9 @@ pub(crate) mod test {
 
     //     #[test]
     //     fn test_allow_dust_limit() {
-    //         let (wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
 
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let addr = wallet.get_address(New);
 
     //         let mut builder = wallet.build_tx();
 
@@ -5246,8 +5183,8 @@ pub(crate) mod test {
     //         // Our goal is to obtain a transaction with a signature with high-R (71 bytes
     //         // instead of 70). We then check that our fee rate and fee calculation is
     //         // alright.
-    //         let (wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
+    //         let addr = wallet.get_address(New);
     //         let fee_rate = FeeRate::from_sat_per_vb(1.0);
     //         let mut builder = wallet.build_tx();
     //         let mut data = vec![0];
@@ -5311,8 +5248,8 @@ pub(crate) mod test {
     //         // by setting the `allow_grinding` signing option as true.
     //         // We then check that our fee rate and fee calculation is alright and that our
     //         // signature is 70 bytes.
-    //         let (wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
+    //         let addr = wallet.get_address(New);
     //         let fee_rate = FeeRate::from_sat_per_vb(1.0);
     //         let mut builder = wallet.build_tx();
     //         builder
@@ -5373,8 +5310,8 @@ pub(crate) mod test {
     //         //
     //         // Having the same key in multiple taproot leaves is safe and should be accepted by BDK
 
-    //         let (wallet, _, _) = get_funded_wallet(get_test_tr_dup_keys());
-    //         let addr = wallet.get_address(New).unwrap();
+    //         let (mut wallet, _, _) = get_funded_wallet(get_test_tr_dup_keys());
+    //         let addr = wallet.get_address(New);
 
     //         assert_eq!(
     //             addr.to_string(),
