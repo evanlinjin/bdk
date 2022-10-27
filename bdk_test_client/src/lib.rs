@@ -4,7 +4,7 @@ use bitcoin::hashes::sha256d;
 use bitcoin::{Address, PackedLockTime, Script, Sequence, Transaction, Txid, Witness};
 pub use bitcoincore_rpc::bitcoincore_rpc_json::AddressType;
 use bitcoincore_rpc::jsonrpc::serde_json::{self, json};
-pub use bitcoincore_rpc::{Auth, Client as RpcClient, RpcApi};
+pub use bitcoincore_rpc::{Auth, Client as RpcClient, Error as RpcError, RpcApi};
 use core::str::FromStr;
 use electrsd::bitcoind::BitcoinD;
 use electrsd::{bitcoind, ElectrsD};
@@ -201,7 +201,6 @@ impl TestClient {
         self.wait_for_block(height);
 
         debug!("Generated blocks to new height {}", height);
-        dbg!(height, best_hash);
     }
 
     pub fn invalidate(&mut self, num_blocks: u64) {

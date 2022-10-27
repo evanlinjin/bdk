@@ -15,11 +15,14 @@
 use std::collections::HashMap;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::ops::Deref;
+use std::ops::{Deref, RangeBounds};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use bdk_core::{BlockId, SparseChain, SpkTracker, TxGraph, TxHeight, UnspentIndex, UpdateFailure};
+use bdk_core::{
+    BlockId, ChangeSet, SparseChain, SpkTracker, TxGraph, TxHeight, UnspentIndex, Update,
+    UpdateFailure,
+};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::Secp256k1;
 
@@ -334,17 +337,77 @@ impl Wallet {
     }
 
     /// Iterate over all checkpoints.
-    pub fn iter_checkpoints(&self) -> impl DoubleEndedIterator<Item = BlockId> + '_ {
-        self.sparse_chain.iter_checkpoints(..)
+    pub fn iter_checkpoints(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = BlockId> + ExactSizeIterator + '_ {
+        self.sparse_chain.iter_checkpoints()
+    }
+
+    /// Range checkpoints
+    pub fn range_checkpoints<'a>(
+        &'a self,
+        range: impl RangeBounds<u32> + 'a,
+    ) -> impl DoubleEndedIterator<Item = BlockId> + 'a {
+        self.sparse_chain.range_checkpoints(range)
+    }
+
+    /// Returns the latest checkpoint.
+    pub fn latest_checkpoint(&self) -> Option<BlockId> {
+        self.sparse_chain.latest_checkpoint()
+    }
+
+    /// Inserts a transaction into the graph if the transaction is deemed relevant.
+    /// Also enforces the stop_gap.
+    pub fn graph_insert_if_relevant(&mut self, tx: &Transaction, stop_gap: Option<u32>) -> bool {
+        let mut is_relevant = false;
+
+        for keychain in [KeychainKind::External, KeychainKind::Internal] {
+            let derivation = match self.spk_tracker.highest_spk_index(
+                &self.tx_graph,
+                tx,
+                (keychain, u32::MIN)..(keychain, u32::MAX),
+            ) {
+                Some((_, derivation)) => derivation,
+                None => continue,
+            };
+
+            if let Some(stop_gap) = stop_gap {
+                self.ensure_addresses_cached(derivation.saturating_add(stop_gap));
+            }
+
+            // skip if already in chain
+            // we check chain instead of graph, as graph may be updated without commiting to chain
+            if self.sparse_chain.transaction_height(tx.txid()).is_some() {
+                continue;
+            }
+
+            self.tx_graph.insert_tx(tx);
+            is_relevant = true;
+        }
+
+        is_relevant
+    }
+
+    /// Applies an update.
+    pub fn apply_update(&mut self, update: Update) -> Result<ChangeSet, UpdateFailure> {
+        let change_set = self.sparse_chain.apply_update(update)?;
+
+        self.spk_tracker.sync(&self.sparse_chain, &self.tx_graph);
+        self.unspent_index
+            .sync(&self.sparse_chain, &self.tx_graph, &self.spk_tracker);
+
+        Ok(change_set)
     }
 
     /// Applies a single block and relevant txs
     pub fn apply_block(&mut self, block: &Block, height: u32) -> Result<(), UpdateFailure> {
         let spk_tracker = &self.spk_tracker;
+        let tx_graph = &self.tx_graph;
+
         let change_set = self
             .sparse_chain
             .apply_block_with_height(block, height, |tx| {
-                let relevant = spk_tracker.is_relevant(tx);
+                let relevant = spk_tracker.is_relevant(tx_graph, tx);
                 if relevant {
                     println!("found relevant! txid={}", tx.txid());
                 }
