@@ -19,15 +19,15 @@ use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use bdk_core::{BlockId, SparseChain, SpkTracker, TxGraph, TxHeight, UnspentIndex};
+use bdk_core::{BlockId, SparseChain, SpkTracker, TxGraph, TxHeight, UnspentIndex, UpdateFailure};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::Secp256k1;
 
 use bitcoin::consensus::encode::serialize;
 use bitcoin::util::psbt;
 use bitcoin::{
-    Address, BlockHash, EcdsaSighashType, LockTime, Network, OutPoint, SchnorrSighashType, Script,
-    Sequence, Transaction, TxOut, Txid, Witness,
+    Address, Block, BlockHash, EcdsaSighashType, LockTime, Network, OutPoint, SchnorrSighashType,
+    Script, Sequence, Transaction, TxOut, Txid, Witness,
 };
 
 use miniscript::psbt::{PsbtExt, PsbtInputExt, PsbtInputSatisfier};
@@ -333,6 +333,37 @@ impl Wallet {
             .collect()
     }
 
+    /// Iterate over all checkpoints.
+    pub fn iter_checkpoints(&self) -> impl DoubleEndedIterator<Item = BlockId> + '_ {
+        self.sparse_chain.iter_checkpoints(..)
+    }
+
+    /// Applies a single block and relevant txs
+    pub fn apply_block(&mut self, block: &Block, height: u32) -> Result<(), UpdateFailure> {
+        let spk_tracker = &self.spk_tracker;
+        let change_set = self
+            .sparse_chain
+            .apply_block_with_height(block, height, |tx| {
+                let relevant = spk_tracker.is_relevant(tx);
+                if relevant {
+                    println!("found relevant! txid={}", tx.txid());
+                }
+                relevant
+            })?;
+        println!("change set: {:?}", change_set);
+
+        for tx in &block.txdata {
+            if change_set.txids.contains_key(&tx.txid()) {
+                self.tx_graph.insert_tx(tx);
+            }
+        }
+
+        self.spk_tracker.sync(&self.sparse_chain, &self.tx_graph);
+        self.unspent_index
+            .sync(&self.sparse_chain, &self.tx_graph, &self.spk_tracker);
+        Ok(())
+    }
+
     /// Returns the `UTXO` owned by this wallet corresponding to `outpoint` if it exists in the
     /// wallet's database.
     pub fn get_utxo(&self, outpoint: OutPoint) -> Option<LocalUtxo> {
@@ -418,7 +449,7 @@ impl Wallet {
 
     /// Add a new checkpoint to the wallet
     pub(crate) fn add_checkpoint(&mut self, block_id: BlockId) {
-        self.sparse_chain.insert_block(block_id);
+        self.sparse_chain.apply_checkpoint(block_id);
     }
 
     /// Add a transaction to the wallet. Will only work if height <= latest checkpoint
@@ -428,8 +459,9 @@ impl Wallet {
             .sparse_chain
             .insert_tx(tx.txid(), TxHeight::Confirmed(height))
             .unwrap();
-        self.spk_tracker.sync(&self.tx_graph, &changeset);
-        self.unspent_index.sync(&self.spk_tracker, &changeset);
+        self.spk_tracker.sync(&self.sparse_chain, &self.tx_graph);
+        self.unspent_index
+            .sync(&self.sparse_chain, &self.tx_graph, &self.spk_tracker);
     }
 
     pub(crate) fn last_sync_height(&self) -> Option<u32> {
@@ -2036,44 +2068,44 @@ pub(crate) mod test {
         assert_eq!(psbt.unsigned_tx.lock_time.0, 630_000);
     }
 
-    //     #[test]
-    //     #[should_panic(
-    //         expected = "TxBuilder requested timelock of `50000`, but at least `100000` is required to spend from this script"
-    //     )]
-    //     fn test_create_tx_custom_locktime_incompatible_with_cltv() {
-    //         let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
-    //         let addr = wallet.get_address(New);
-    //         let mut builder = wallet.build_tx();
-    //         builder
-    //             .add_recipient(addr.script_pubkey(), 25_000)
-    //             .nlocktime(50000);
-    //         builder.finish().unwrap();
-    //     }
+    #[test]
+    #[should_panic(
+        expected = "TxBuilder requested timelock of `Blocks(Height(50000))`, but at least `Blocks(Height(100000))` is required to spend from this script"
+    )]
+    fn test_create_tx_custom_locktime_incompatible_with_cltv() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(addr.script_pubkey(), 25_000)
+            .nlocktime(LockTime::from_height(50000).unwrap());
+        builder.finish().unwrap();
+    }
 
-    //     #[test]
-    //     fn test_create_tx_no_rbf_csv() {
-    //         let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
-    //         let addr = wallet.get_address(New);
-    //         let mut builder = wallet.build_tx();
-    //         builder.add_recipient(addr.script_pubkey(), 25_000);
-    //         let (psbt, _) = builder.finish().unwrap();
+    #[test]
+    fn test_create_tx_no_rbf_csv() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), 25_000);
+        let (psbt, _) = builder.finish().unwrap();
 
-    //         assert_eq!(psbt.unsigned_tx.input[0].sequence, 6);
-    //     }
+        assert_eq!(psbt.unsigned_tx.input[0].sequence, Sequence(6));
+    }
 
-    //     #[test]
-    //     fn test_create_tx_with_default_rbf_csv() {
-    //         let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
-    //         let addr = wallet.get_address(New);
-    //         let mut builder = wallet.build_tx();
-    //         builder
-    //             .add_recipient(addr.script_pubkey(), 25_000)
-    //             .enable_rbf();
-    //         let (psbt, _) = builder.finish().unwrap();
-    //         // When CSV is enabled it takes precedence over the rbf value (unless forced by the user).
-    //         // It will be set to the OP_CSV value, in this case 6
-    //         assert_eq!(psbt.unsigned_tx.input[0].sequence, 6);
-    //     }
+    #[test]
+    fn test_create_tx_with_default_rbf_csv() {
+        let (mut wallet, _, _) = get_funded_wallet(get_test_single_sig_csv());
+        let addr = wallet.get_address(New);
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(addr.script_pubkey(), 25_000)
+            .enable_rbf();
+        let (psbt, _) = builder.finish().unwrap();
+        // When CSV is enabled it takes precedence over the rbf value (unless forced by the user).
+        // It will be set to the OP_CSV value, in this case 6
+        assert_eq!(psbt.unsigned_tx.input[0].sequence, Sequence(6));
+    }
 
     //     #[test]
     //     #[should_panic(
