@@ -114,7 +114,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         Bip84(xprv.clone(), KeychainKind::External),
         Some(Bip84(xprv.clone(), KeychainKind::Internal)),
         Network::Regtest,
-        database,
     )?;
 
     // The `wallet` and the `blockchain` are independent structs.

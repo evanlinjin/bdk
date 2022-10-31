@@ -1,17 +1,22 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     sync::{Arc, Mutex},
 };
 
 use bdk::{wallet::AddressIndex, Wallet};
-use bdk_core::{BlockId, ChangeSet, Update, UpdateFailure};
-use bdk_test_client::{RpcApi, RpcError, TestClient};
-use bitcoin::{Amount, Network, Txid};
+use bdk_core::{ChangeSet, UpdateFailure};
+use bdk_test_client::{RpcApi, RpcClient, RpcError, TestClient};
+use bitcoin::{Amount, Block, BlockHash, Network, Transaction, Txid};
+
+use std::sync::mpsc;
 
 #[derive(Debug)]
-enum SyncError {
+pub enum SyncError {
     Rpc(RpcError),
     Update(UpdateFailure),
+    Send(mpsc::SendError<RpcUpdate>),
+    Reorg(usize),
 }
 
 impl From<RpcError> for SyncError {
@@ -23,6 +28,12 @@ impl From<RpcError> for SyncError {
 impl From<UpdateFailure> for SyncError {
     fn from(e: UpdateFailure) -> Self {
         Self::Update(e)
+    }
+}
+
+impl From<mpsc::SendError<RpcUpdate>> for SyncError {
+    fn from(err: mpsc::SendError<RpcUpdate>) -> Self {
+        Self::Send(err)
     }
 }
 
@@ -93,109 +104,105 @@ impl ClientSession {
         client.reorg(num_blocks)
     }
 
-    fn sync_wallet(
-        &self,
-        start_height: u64,
-        stop_gap: Option<u32>,
-    ) -> Result<Option<ChangeSet>, SyncError> {
-        let client = self.client.lock().unwrap();
-        let mut wallet = self.wallet.lock().unwrap();
+    fn start_sync(&self) -> mpsc::Receiver<RpcUpdate> {
+        let (send, recv) = mpsc::channel();
 
-        // find last valid result
-        let (last_valid_block, invalidate_block) = {
-            let mut last_valid = None;
-            let mut invalidate = None;
+        let checkpoints = self.wallet.lock().unwrap().iter_checkpoints().clone();
 
-            for block_id in wallet.iter_checkpoints().rev() {
-                let block_res = client.get_block_info(&block_id.hash)?;
-                if block_res.confirmations < 0 {
-                    // NOT in main chain
-                    invalidate = Some(block_res);
-                    continue;
-                } else {
-                    // in chain
-                    last_valid = Some(block_res);
-                    break;
-                }
-            }
+        let client_params = self.client.lock().unwrap().bitcoind.params.clone();
+        let client = RpcClient::new(
+            &client_params.rpc_socket.to_string(),
+            bdk_test_client::Auth::CookieFile(client_params.cookie_file),
+        )
+        .expect("failed to connect");
 
-            (last_valid, invalidate)
-        };
-
-        let last_valid = last_valid_block.as_ref().map(|r| BlockId {
-            height: r.height as _,
-            hash: r.hash,
-        });
-        let invalidate = invalidate_block.as_ref().map(|r| BlockId {
-            height: r.height as _,
-            hash: r.hash,
+        let send_handle = std::thread::spawn(move || {
+            let res = rpc_sync(&client, &send, checkpoints, 0);
+            drop(send);
+            res
         });
 
-        // find new blocks and new tip
-        let (new_blocks, new_tip) = {
-            let mut blocks = Vec::new();
-            let mut tip = match last_valid_block {
-                Some(res) => match res.nextblockhash {
-                    Some(hash) => BlockId {
-                        height: (res.height + 1) as _,
-                        hash,
-                    },
-                    None => return Ok(None), // no new blocks, nothing to update
-                },
-                None => BlockId {
-                    height: start_height as _,
-                    hash: client.get_block_hash(start_height)?,
-                },
-            };
-            loop {
-                blocks.push((tip, client.get_block(&tip.hash)?));
-
-                let res = client.get_block_info(&tip.hash)?;
-                match res.nextblockhash {
-                    Some(hash) => {
-                        tip = BlockId {
-                            height: (res.height + 1) as _,
-                            hash,
-                        }
-                    }
-                    None => break,
-                };
-            }
-
-            (blocks, tip)
-        };
-
-        // find txs in mempool
-        let unconfirmed_txs = client
-            .get_raw_mempool()?
-            .iter()
-            .map(|txid| {
-                client
-                    .get_raw_transaction(txid, None)
-                    .map(|tx| (tx, Option::<u32>::None))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // find txs in new blocks
-        let txids = new_blocks
-            .iter()
-            .flat_map(|(id, b)| b.txdata.iter().map(move |tx| (tx.clone(), Some(id.height))))
-            .chain(unconfirmed_txs)
-            // filter out irrelevant, enforce stop_gap of relevant (and also add to graph)
-            .filter(|(tx, _)| wallet.graph_insert_if_relevant(tx, stop_gap))
-            .map(|(tx, id)| (tx.txid(), id.into()))
-            .collect();
-
-        let update = Update {
-            txids,
-            last_valid,
-            invalidate,
-            new_tip,
-        };
-
-        let change_set = wallet.apply_update(update)?;
-        Ok(Some(change_set))
+        recv
     }
+}
+
+pub enum RpcUpdate {
+    Blocks(BTreeMap<usize, Block>),
+    Mempool(Vec<Transaction>),
+}
+
+pub fn rpc_sync(
+    client: &RpcClient,
+    chan: &mpsc::Sender<RpcUpdate>,
+    checkpoints: BTreeMap<u32, BlockHash>,
+    fallback_height: u64,
+) -> Result<(), SyncError> {
+    let mut last_valid = None;
+    let mut must_include = None;
+
+    for (_, cp_hash) in checkpoints.iter().rev() {
+        let res = client.get_block_info(cp_hash)?;
+        if res.confirmations < 0 {
+            must_include = Some(res.height); // NOT in main chain
+        } else {
+            last_valid = Some(res);
+            break;
+        }
+    }
+
+    // determine first new block
+    let mut block_info = match last_valid {
+        Some(res) => match res.nextblockhash {
+            Some(block_hash) => client.get_block_info(&block_hash)?,
+            None => return rpc_mempool_sync(client, &chan),
+        },
+        None => {
+            let block_hash = client.get_block_hash(fallback_height)?;
+            client.get_block_info(&block_hash)?
+        }
+    };
+
+    let mut blocks_cache = BTreeMap::<usize, Block>::new();
+
+    loop {
+        if block_info.confirmations < 0 {
+            // NOT in main chain, reorg happened during sync
+            return Err(SyncError::Reorg(block_info.height));
+        }
+
+        // add block to cache
+        let replaced_block =
+            blocks_cache.insert(block_info.height, client.get_block(&block_info.hash)?);
+        debug_assert!(replaced_block.is_none());
+
+        // try push into channel
+        if !blocks_cache.is_empty() && blocks_cache.keys().last().cloned() >= must_include {
+            chan.send(RpcUpdate::Blocks(blocks_cache.split_off(&0)))?;
+        }
+
+        // update block_info
+        match block_info.nextblockhash {
+            Some(new_hash) => block_info = client.get_block_info(&new_hash)?,
+            None => return rpc_mempool_sync(client, &chan),
+        }
+    }
+}
+
+pub fn rpc_mempool_sync(
+    client: &RpcClient,
+    chan: &mpsc::Sender<RpcUpdate>,
+) -> Result<(), SyncError> {
+    let chunk_size = 100; // TODO: Do not hardcode
+
+    for chunk in client.get_raw_mempool()?.chunks(chunk_size) {
+        let txs = chunk
+            .iter()
+            .map(|txid| client.get_raw_transaction(txid, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        chan.send(RpcUpdate::Mempool(txs))?;
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -212,9 +219,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .collect::<Vec<_>>();
 
-    session
-        .sync_wallet(0, Some(10))
-        .expect("sync should succeed");
+    // session
+    // .sync_wallet(0, Some(10))
+    // .expect("sync should succeed");
 
     // ensure everything looks okay
     session.inspect(|_client, wallet| {

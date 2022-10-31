@@ -20,8 +20,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bdk_core::{
-    BlockId, ChangeSet, SparseChain, SpkTracker, TxGraph, TxHeight, UnspentIndex, Update,
-    UpdateFailure,
+    BlockId, ChangeSet, SparseChain, SpkTracker, TxGraph, TxHeight, Update, UpdateFailure,
 };
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::Secp256k1;
@@ -94,7 +93,6 @@ pub struct Wallet {
     sparse_chain: SparseChain,
     tx_graph: TxGraph,
     spk_tracker: SpkTracker<(KeychainKind, u32)>,
-    unspent_index: UnspentIndex<(KeychainKind, u32)>,
 
     network: Network,
 
@@ -191,7 +189,6 @@ impl Wallet {
             sparse_chain: Default::default(),
             tx_graph: Default::default(),
             spk_tracker: Default::default(),
-            unspent_index: Default::default(),
         })
     }
 
@@ -325,22 +322,20 @@ impl Wallet {
     /// Note that this method only operates on the internal database, which first needs to be
     /// [`Wallet::sync`] manually.
     pub fn list_unspent(&self) -> Vec<LocalUtxo> {
-        self.unspent_index
-            .iter()
-            .map(|unspent| LocalUtxo {
-                outpoint: unspent.outpoint,
-                txout: unspent.txout,
-                keychain: unspent.spk_index.0,
+        self.spk_tracker
+            .iter_unspent(&self.sparse_chain, &self.tx_graph)
+            .map(|((keychain, _), txo)| LocalUtxo {
+                outpoint: txo.outpoint,
+                txout: txo.txout,
+                keychain,
                 is_spent: false,
             })
             .collect()
     }
 
     /// Iterate over all checkpoints.
-    pub fn iter_checkpoints(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = BlockId> + ExactSizeIterator + '_ {
-        self.sparse_chain.iter_checkpoints()
+    pub fn iter_checkpoints(&self) -> &BTreeMap<u32, BlockHash> {
+        self.sparse_chain.checkpoints()
     }
 
     /// Range checkpoints
@@ -362,17 +357,19 @@ impl Wallet {
         let mut is_relevant = false;
 
         for keychain in [KeychainKind::External, KeychainKind::Internal] {
-            let derivation = match self.spk_tracker.highest_spk_index(
-                &self.tx_graph,
-                tx,
-                (keychain, u32::MIN)..(keychain, u32::MAX),
-            ) {
-                Some((_, derivation)) => derivation,
-                None => continue,
-            };
+            let spk_range = (keychain, u32::MIN)..(keychain, u32::MAX);
 
-            if let Some(stop_gap) = stop_gap {
-                self.ensure_addresses_cached(derivation.saturating_add(stop_gap));
+            match self
+                .spk_tracker
+                .highest_spk_index(&self.tx_graph, tx, spk_range)
+            {
+                Some((_, derivation)) => {
+                    if let Some(stop_gap) = stop_gap {
+                        let max_addresses = derivation.saturating_add(stop_gap);
+                        self.ensure_addresses_cached(max_addresses);
+                    }
+                }
+                None => continue,
             }
 
             // skip if already in chain
@@ -390,13 +387,42 @@ impl Wallet {
 
     /// Applies an update.
     pub fn apply_update(&mut self, update: Update) -> Result<ChangeSet, UpdateFailure> {
-        let change_set = self.sparse_chain.apply_update(update)?;
-
-        self.spk_tracker.sync(&self.sparse_chain, &self.tx_graph);
-        self.unspent_index
-            .sync(&self.sparse_chain, &self.tx_graph, &self.spk_tracker);
-
+        let change_set = self.sparse_chain.apply_update(&update)?;
+        self.spk_tracker.scan(&self.tx_graph);
         Ok(change_set)
+    }
+
+    /// Applies a set of blocks
+    pub fn apply_blocks(
+        &mut self,
+        blocks: BTreeMap<u32, Block>,
+    ) -> Result<ChangeSet, UpdateFailure> {
+        let stop_gap = 100; // TODO: Do not hardcode this
+
+        let mut update = Update::default();
+
+        for (height, block) in blocks {
+            // ensure prev blockhash is included
+            if let Some(prev_height) = height.checked_sub(1) {
+                let exp_hash = *update
+                    .checkpoints
+                    .entry(prev_height)
+                    .or_insert(block.header.prev_blockhash);
+
+                if block.header.prev_blockhash != exp_hash {
+                    panic!("block hash does not match!");
+                }
+            }
+
+            update.checkpoints.insert(height, block.block_hash());
+            block
+                .txdata
+                .iter()
+                .filter(|tx| self.graph_insert_if_relevant(tx, Some(stop_gap)))
+                .for_each(|tx| update.insert_txid(tx.txid(), TxHeight::Confirmed(height)));
+        }
+
+        self.apply_update(update)
     }
 
     /// Applies a single block and relevant txs
@@ -421,22 +447,26 @@ impl Wallet {
             }
         }
 
-        self.spk_tracker.sync(&self.sparse_chain, &self.tx_graph);
-        self.unspent_index
-            .sync(&self.sparse_chain, &self.tx_graph, &self.spk_tracker);
+        self.spk_tracker.scan(&self.tx_graph);
         Ok(())
     }
 
     /// Returns the `UTXO` owned by this wallet corresponding to `outpoint` if it exists in the
     /// wallet's database.
-    pub fn get_utxo(&self, outpoint: OutPoint) -> Option<LocalUtxo> {
-        self.unspent_index
-            .unspent(outpoint)
-            .map(|unspent| LocalUtxo {
-                outpoint: unspent.outpoint,
-                txout: unspent.txout,
-                keychain: unspent.spk_index.0,
-                is_spent: false,
+    pub fn get_utxo(&self, op: OutPoint) -> Option<LocalUtxo> {
+        self.spk_tracker
+            .iter_unspent(&self.sparse_chain, &self.tx_graph)
+            .find_map(|((keychain, _), txo)| {
+                if op == txo.outpoint {
+                    Some(LocalUtxo {
+                        outpoint: txo.outpoint,
+                        txout: txo.txout,
+                        keychain,
+                        is_spent: false,
+                    })
+                } else {
+                    None
+                }
             })
     }
 
@@ -522,9 +552,7 @@ impl Wallet {
             .sparse_chain
             .insert_tx(tx.txid(), TxHeight::Confirmed(height))
             .unwrap();
-        self.spk_tracker.sync(&self.sparse_chain, &self.tx_graph);
-        self.unspent_index
-            .sync(&self.sparse_chain, &self.tx_graph, &self.spk_tracker);
+        self.spk_tracker.scan(&self.tx_graph);
     }
 
     pub(crate) fn last_sync_height(&self) -> Option<u32> {
@@ -573,23 +601,33 @@ impl Wallet {
             None => return Balance::default(),
         };
 
-        for u in self.unspent_index.iter() {
-            match u.height {
+        for ((keychain, _), txo) in self
+            .spk_tracker
+            .iter_unspent(&self.sparse_chain, &self.tx_graph)
+        {
+            let tx_height = self
+                .sparse_chain
+                .transaction_height(txo.outpoint.txid)
+                .expect("height should exist");
+
+            let is_coinbase = self
+                .tx_graph
+                .tx(txo.outpoint.txid)
+                .expect("tx should exist")
+                .is_coin_base();
+
+            match tx_height {
                 TxHeight::Confirmed(height) => {
-                    let tx = self.tx_graph.tx(u.outpoint.txid).expect("must exist");
-                    if tx.is_coin_base() && last_sync_height - height < COINBASE_MATURITY {
-                        immature += u.txout.value;
+                    if is_coinbase && last_sync_height - height < COINBASE_MATURITY {
+                        immature += txo.txout.value;
                     } else {
-                        confirmed += u.txout.value;
+                        confirmed += txo.txout.value;
                     }
                 }
-                TxHeight::Unconfirmed => {
-                    if u.spk_index.0 == KeychainKind::Internal {
-                        trusted_pending += u.txout.value;
-                    } else {
-                        untrusted_pending += u.txout.value;
-                    }
-                }
+                TxHeight::Unconfirmed => match keychain {
+                    KeychainKind::External => untrusted_pending += txo.txout.value,
+                    KeychainKind::Internal => trusted_pending += txo.txout.value,
+                },
             }
         }
 
