@@ -3,6 +3,7 @@ members = [
     "crates/bdk",
     "example-crates/esplora-wallet",
     "example-crates/electrum-wallet",
+    "example-crates/example-lib"
 ]
 
 [workspace.package]

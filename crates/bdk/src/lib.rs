@@ -102,6 +102,8 @@ extern crate std;
 #[macro_use]
 pub extern crate alloc;
 
+#[cfg(feature = "keys-bip39")]
+extern crate bip39;
 pub extern crate bitcoin;
 #[cfg(feature = "hardware-signer")]
 pub extern crate hwi;
@@ -109,9 +111,6 @@ extern crate log;
 pub extern crate miniscript;
 extern crate serde;
 extern crate serde_json;
-
-#[cfg(feature = "keys-bip39")]
-extern crate bip39;
 
 #[allow(unused_imports)]
 #[macro_use]
