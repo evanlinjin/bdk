@@ -3,7 +3,7 @@ use crate::{
     miniscript::{Descriptor, DescriptorPublicKey},
     ForEachTxOut, SpkTxOutIndex,
 };
-use alloc::{borrow::Cow, vec::Vec};
+use alloc::{borrow::Cow, string::ToString, vec::Vec};
 use bitcoin::{secp256k1::Secp256k1, OutPoint, Script, TxOut};
 use core::{fmt::Debug, ops::Deref};
 
@@ -587,4 +587,28 @@ where
         )
         .take_while(Result::is_ok)
         .map(Result::unwrap)
+}
+
+pub struct SpkIterator<'a> {
+    next_index: u32,
+    descriptor: Cow<'a, Descriptor<DescriptorPublicKey>>,
+    secp: Secp256k1<bitcoin::secp256k1::VerifyOnly>,
+}
+
+impl<'a> Iterator for SpkIterator<'a> {
+    type Item = (u32, Script);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // for non-wildcard descriptors:
+        // * we expect the first element to be Some((0, spk)), then will return None after.
+        // for wildcard descriptors:
+        // * we expect it to keep iterating until exhaused.
+        todo!()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        let n = self.next_index + n as u32;
+        self.descriptor.at_derivation_index(n);
+        todo!()
+    }
 }
