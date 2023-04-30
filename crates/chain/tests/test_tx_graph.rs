@@ -95,7 +95,7 @@ fn insert_txouts() {
             assert_eq!(
                 graph.insert_anchor(outpoint.txid, unconf_anchor),
                 Additions {
-                    tx: [].into(),
+                    txs: [].into(),
                     txout: [].into(),
                     anchors: [(unconf_anchor, outpoint.txid)].into(),
                     last_seen: [].into()
@@ -105,7 +105,7 @@ fn insert_txouts() {
             assert_eq!(
                 graph.insert_seen_at(outpoint.txid, 1000000),
                 Additions {
-                    tx: [].into(),
+                    txs: [].into(),
                     txout: [].into(),
                     anchors: [].into(),
                     last_seen: [(outpoint.txid, 1000000)].into()
@@ -116,7 +116,7 @@ fn insert_txouts() {
         assert_eq!(
             graph.insert_tx(update_txs.clone()),
             Additions {
-                tx: [update_txs.clone()].into(),
+                txs: [update_txs.clone()].into(),
                 ..Default::default()
             }
         );
@@ -125,7 +125,7 @@ fn insert_txouts() {
         assert_eq!(
             graph.insert_anchor(update_txs.txid(), conf_anchor),
             Additions {
-                tx: [].into(),
+                txs: [].into(),
                 txout: [].into(),
                 anchors: [(conf_anchor, update_txs.txid())].into(),
                 last_seen: [].into()
@@ -140,7 +140,7 @@ fn insert_txouts() {
     assert_eq!(
         additions,
         Additions {
-            tx: [update_txs.clone()].into(),
+            txs: [update_txs.clone()].into(),
             txout: update_ops.into(),
             anchors: [(conf_anchor, update_txs.txid()), (unconf_anchor, h!("tx2"))].into(),
             last_seen: [(h!("tx2"), 1000000)].into()

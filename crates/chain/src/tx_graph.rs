@@ -476,7 +476,7 @@ impl<A: Clone + Ord> TxGraph<A> {
 
     /// Applies [`Additions`] to [`TxGraph`].
     pub fn apply_additions(&mut self, additions: Additions<A>) {
-        for tx in additions.tx {
+        for tx in additions.txs {
             let txid = tx.txid();
 
             tx.input
@@ -547,7 +547,7 @@ impl<A: Clone + Ord> TxGraph<A> {
         for (&txid, (update_tx_node, _, update_last_seen)) in &update.txs {
             let prev_last_seen: u64 = match (self.txs.get(&txid), update_tx_node) {
                 (None, TxNodeInternal::Whole(update_tx)) => {
-                    additions.tx.insert(update_tx.clone());
+                    additions.txs.insert(update_tx.clone());
                     0
                 }
                 (None, TxNodeInternal::Partial(update_txos)) => {
@@ -563,7 +563,7 @@ impl<A: Clone + Ord> TxGraph<A> {
                     Some((TxNodeInternal::Partial(_), _, last_seen)),
                     TxNodeInternal::Whole(update_tx),
                 ) => {
-                    additions.tx.insert(update_tx.clone());
+                    additions.txs.insert(update_tx.clone());
                     *last_seen
                 }
                 (
@@ -900,7 +900,7 @@ impl<A: Anchor> TxGraph<A> {
 )]
 #[must_use]
 pub struct Additions<A = ()> {
-    pub tx: BTreeSet<Transaction>,
+    pub txs: BTreeSet<Transaction>,
     pub txout: BTreeMap<OutPoint, TxOut>,
     pub anchors: BTreeSet<(A, Txid)>,
     pub last_seen: BTreeMap<Txid, u64>,
@@ -909,7 +909,7 @@ pub struct Additions<A = ()> {
 impl<A> Default for Additions<A> {
     fn default() -> Self {
         Self {
-            tx: Default::default(),
+            txs: Default::default(),
             txout: Default::default(),
             anchors: Default::default(),
             last_seen: Default::default(),
@@ -920,12 +920,12 @@ impl<A> Default for Additions<A> {
 impl<A> Additions<A> {
     /// Returns true if the [`Additions`] is empty (no transactions or txouts).
     pub fn is_empty(&self) -> bool {
-        self.tx.is_empty() && self.txout.is_empty()
+        self.txs.is_empty() && self.txout.is_empty()
     }
 
     /// Iterates over all outpoints contained within [`Additions`].
     pub fn txouts(&self) -> impl Iterator<Item = (OutPoint, &TxOut)> {
-        self.tx
+        self.txs
             .iter()
             .flat_map(|tx| {
                 tx.output
@@ -939,7 +939,7 @@ impl<A> Additions<A> {
 
 impl<A: Ord> Append for Additions<A> {
     fn append(&mut self, mut other: Self) {
-        self.tx.append(&mut other.tx);
+        self.txs.append(&mut other.txs);
         self.txout.append(&mut other.txout);
         self.anchors.append(&mut other.anchors);
 

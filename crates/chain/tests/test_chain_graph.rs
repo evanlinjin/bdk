@@ -134,7 +134,7 @@ fn update_evicts_conflicting_tx() {
                 .into(),
             },
             graph: tx_graph::Additions {
-                tx: [tx_b2.clone()].into(),
+                txs: [tx_b2.clone()].into(),
                 txout: [].into(),
                 ..Default::default()
             },
@@ -214,7 +214,7 @@ fn update_evicts_conflicting_tx() {
                 .into(),
             },
             graph: tx_graph::Additions {
-                tx: [tx_b2].into(),
+                txs: [tx_b2].into(),
                 txout: [].into(),
                 ..Default::default()
             },
@@ -485,7 +485,7 @@ fn test_apply_changes_reintroduce_tx() {
                 txids: [(tx2a.txid(), None), (tx2b.txid(), Some(TxHeight::Confirmed(2)))]
             },
             graph: tx_graph::Additions {
-                tx: [tx2b.clone()].into(),
+                txs: [tx2b.clone()].into(),
                 ..Default::default()
             },
         }
@@ -642,7 +642,7 @@ fn test_evict_descendants() {
                 txids: [(txid_2, None), (txid_3, None), (txid_4, None), (txid_5, None), (txid_conflict, Some(TxHeight::Confirmed(2)))]
             },
             graph: tx_graph::Additions {
-                tx: [tx_conflict.clone()].into(),
+                txs: [tx_conflict.clone()].into(),
                 ..Default::default()
             }
         })

@@ -349,7 +349,7 @@ where
             let mut full_tx = self.graph.get_tx(txid);
 
             if full_tx.is_none() {
-                full_tx = changeset.graph.tx.iter().find(|tx| tx.txid() == txid)
+                full_tx = changeset.graph.txs.iter().find(|tx| tx.txid() == txid)
             }
 
             debug_assert!(full_tx.is_some(), "should have full tx at this point");

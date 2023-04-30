@@ -42,7 +42,7 @@ impl<A: Anchor, I: Indexer> IndexedTxGraph<A, I> {
 
         self.index.apply_additions(index_additions);
 
-        for tx in &graph_additions.tx {
+        for tx in &graph_additions.txs {
             self.index.index_tx(tx);
         }
         for (&outpoint, txout) in &graph_additions.txout {
@@ -64,7 +64,7 @@ where
         let graph_additions = self.graph.apply_update(update);
 
         let mut index_additions = I::Additions::default();
-        for added_tx in &graph_additions.tx {
+        for added_tx in &graph_additions.txs {
             index_additions.append(self.index.index_tx(added_tx));
         }
         for (&added_outpoint, added_txout) in &graph_additions.txout {
