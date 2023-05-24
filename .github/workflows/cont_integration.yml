@@ -12,7 +12,7 @@ jobs:
         rust:
           - version: stable
             clippy: true
-          - version: 1.57.0 # MSRV
+          - version: 1.60.0 # MSRV
         features:
           - --no-default-features
           - --all-features
