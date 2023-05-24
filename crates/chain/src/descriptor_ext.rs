@@ -9,6 +9,7 @@ pub trait DescriptorExt {
 impl DescriptorExt for Descriptor<DescriptorPublicKey> {
     fn dust_value(&self) -> u64 {
         self.at_derivation_index(0)
+            .expect("should derive")
             .script_pubkey()
             .dust_value()
             .to_sat()

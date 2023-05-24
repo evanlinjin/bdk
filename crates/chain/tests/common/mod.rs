@@ -61,8 +61,12 @@ macro_rules! changeset {
 pub fn new_tx(lt: u32) -> bitcoin::Transaction {
     bitcoin::Transaction {
         version: 0x00,
-        lock_time: bitcoin::PackedLockTime(lt),
+        lock_time: must_locktime_from_height(lt),
         input: vec![],
         output: vec![],
     }
+}
+
+pub fn must_locktime_from_height(h: u32) -> bitcoin::absolute::LockTime {
+    bitcoin::absolute::LockTime::from_height(h).expect("must be valid height")
 }

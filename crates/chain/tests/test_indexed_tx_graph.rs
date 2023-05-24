@@ -25,8 +25,8 @@ fn insert_relevant_txs() {
     const DESCRIPTOR: &str = "tr([73c5da0a/86'/0'/0']xprv9xgqHN7yz9MwCkxsBPN5qetuNdQSUttZNKw1dcYTV4mkaAFiBVGQziHs3NRSWMkCzvgjEe3n9xV8oYywvM8at9yRqyaZVz6TYYhX98VjsUk/0/*)";
     let (descriptor, _) = Descriptor::parse_descriptor(&Secp256k1::signing_only(), DESCRIPTOR)
         .expect("must be valid");
-    let spk_0 = descriptor.at_derivation_index(0).script_pubkey();
-    let spk_1 = descriptor.at_derivation_index(9).script_pubkey();
+    let spk_0 = descriptor.at_derivation_index(0).unwrap().script_pubkey();
+    let spk_1 = descriptor.at_derivation_index(9).unwrap().script_pubkey();
 
     let mut graph = IndexedTxGraph::<ConfirmationHeightAnchor, KeychainTxOutIndex<()>>::default();
     graph.index.add_keychain((), descriptor);
@@ -135,13 +135,13 @@ fn test_list_owned_txouts() {
         for _ in 0..10 {
             let ((_, script), _) = graph.index.reveal_next_spk(&"keychain_1".to_string());
             // TODO Assert indexes
-            trusted_spks.push(script.clone());
+            trusted_spks.push(script.to_owned());
         }
     }
     {
         for _ in 0..10 {
             let ((_, script), _) = graph.index.reveal_next_spk(&"keychain_2".to_string());
-            untrusted_spks.push(script.clone());
+            untrusted_spks.push(script.to_owned());
         }
     }
 
@@ -257,7 +257,7 @@ fn test_list_owned_txouts() {
                 &local_chain,
                 chain_tip,
                 graph.index.outpoints().iter().cloned(),
-                |_, spk: &Script| trusted_spks.contains(spk),
+                |_, spk: &Script| trusted_spks.contains(&spk.to_owned()),
             );
 
             assert_eq!(txouts.len(), 5);

@@ -90,7 +90,7 @@ impl Default for BlockId {
     fn default() -> Self {
         Self {
             height: Default::default(),
-            hash: BlockHash::from_inner([0u8; 32]),
+            hash: BlockHash::all_zeros(),
         }
     }
 }
