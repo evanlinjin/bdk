@@ -6,6 +6,7 @@ use bdk_chain::{
 };
 use bitcoin::{secp256k1::Secp256k1, BlockHash, OutPoint, Transaction, TxIn, TxOut};
 use miniscript::{Descriptor, DescriptorPublicKey};
+mod tx_template;
 
 #[allow(unused_macros)]
 macro_rules! h {
