@@ -1,4 +1,7 @@
-use std::collections::HashSet;
+//! This crate is used for updating [`bdk_chain`] structures with data from the `bitcoind` RPC
+//! interface.
+
+#![warn(missing_docs)]
 
 use bdk_chain::{
     bitcoin::{Block, Transaction, Txid},
@@ -8,20 +11,36 @@ use bdk_chain::{
 };
 pub use bitcoincore_rpc;
 use bitcoincore_rpc::{bitcoincore_rpc_json::GetBlockResult, Client, RpcApi};
+use std::collections::HashSet;
 
+/// An item emitted from [`BitcoindRpcIter`]. This can either be a block or a subset of mempool
+/// transactions.
 #[derive(Debug, Clone)]
 pub enum BitcoindRpcItem {
+    /// An emitted block.
     Block {
+        /// The checkpoint constructed from the block's height/hash and connected to the previous
+        /// block.
         cp: CheckPoint,
+        /// The result obtained from the `getblock` RPC call of this block's hash.
         info: Box<GetBlockResult>,
+        ///
         block: Box<Block>,
     },
+    /// An emitted subset of mempool transactions.
+    ///
+    /// [`BitcoindRpcIter`] attempts to avoid re-emitting transactions.
     Mempool {
+        /// The checkpoint of the last-seen tip.
         cp: CheckPoint,
+        /// Subset of mempool transactions.
         txs: Vec<(Transaction, u64)>,
     },
 }
 
+/// A closure that transforms a [`BitcoindRpcItem`] into a [`ConfirmationHeightAnchor`].
+///
+/// This is to be used as an input to [`BitcoindRpcItem::into_update`].
 pub fn confirmation_height_anchor(
     info: &GetBlockResult,
     _txid: Txid,
@@ -36,6 +55,9 @@ pub fn confirmation_height_anchor(
     }
 }
 
+/// A closure that transforms a [`BitcoindRpcItem`] into a [`ConfirmationTimeAnchor`].
+///
+/// This is to be used as an input to [`BitcoindRpcItem::into_update`].
 pub fn confirmation_time_anchor(
     info: &GetBlockResult,
     _txid: Txid,
@@ -52,10 +74,16 @@ pub fn confirmation_time_anchor(
 }
 
 impl BitcoindRpcItem {
+    /// Returns whether the item is a subset of the mempool.
     pub fn is_mempool(&self) -> bool {
         matches!(self, Self::Mempool { .. })
     }
 
+    /// Transforms the [`BitcoindRpcItem`] into a [`LocalUpdate`].
+    ///
+    /// [`confirmation_height_anchor`] and [`confirmation_time_anchor`] can be used as the `anchor`
+    /// intput to construct updates with [`ConfirmationHeightAnchor`]s and
+    /// [`ConfirmationTimeAnchor`]s respectively.
     pub fn into_update<K, A, F>(self, anchor: F) -> LocalUpdate<K, A>
     where
         A: Clone + Ord + PartialOrd,
@@ -90,6 +118,9 @@ impl BitcoindRpcItem {
     }
 }
 
+/// An [`Iterator`] which wraps a [`bitcoincore_rpc::Client`] and iterates through blocks, and
+/// eventually the mempool. The emitted items can be transformed into a [`LocalUpdate`], which can
+/// be used to update [`bdk_chain`] structures.
 pub struct BitcoindRpcIter<'a> {
     client: &'a Client,
     fallback_height: u32,
@@ -101,6 +132,7 @@ pub struct BitcoindRpcIter<'a> {
 }
 
 impl<'a> Iterator for BitcoindRpcIter<'a> {
+    /// Represents an emitted item.
     type Item = Result<BitcoindRpcItem, bitcoincore_rpc::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -109,6 +141,11 @@ impl<'a> Iterator for BitcoindRpcIter<'a> {
 }
 
 impl<'a> BitcoindRpcIter<'a> {
+    /// Constructs a new [`BitcoindRpcIter`] with the provided [`bitcoincore_rpc::Client`].
+    ///
+    /// * `fallback_height` is the block height to start from if `last_cp` is not provided, or a
+    ///     point of agreement is not found.
+    /// * `last_cp` is the last known checkpoint to build updates on (if any).
     pub fn new(client: &'a Client, fallback_height: u32, last_cp: Option<CheckPoint>) -> Self {
         Self {
             client,
@@ -124,8 +161,10 @@ impl<'a> BitcoindRpcIter<'a> {
 
         'main_loop: loop {
             match (&mut self.last_cp, &mut self.last_info) {
+                // If `last_cp` and `last_info` are both none, we need to emit from the
+                // `fallback_height`. `last_cp` and `last_info` will both be updated to the emitted
+                // block.
                 (last_cp @ None, last_info @ None) => {
-                    // get first item at fallback_height
                     let info = client
                         .get_block_info(&client.get_block_hash(self.fallback_height as _)?)?;
                     let block = self.client.get_block(&info.hash)?;
@@ -133,14 +172,21 @@ impl<'a> BitcoindRpcIter<'a> {
                         height: info.height as _,
                         hash: info.hash,
                     });
-                    *last_info = Some(info.clone());
                     *last_cp = Some(cp.clone());
+                    *last_info = Some(info.clone());
                     return Ok(Some(BitcoindRpcItem::Block {
                         cp,
                         info: Box::new(info),
                         block: Box::new(block),
                     }));
                 }
+                // If `last_cp` exists, but `last_info` does not, it means we have not fetched a
+                // block from the client yet, but we have a previous checkpoint which we can use to
+                // find the point of agreement with.
+                //
+                // We don't emit in this match case. Instead, we set the state to either:
+                // * { last_cp: Some, last_info: Some } : When we find a point of agreement.
+                // * { last_cp: None, last_indo: None } : When we cannot find a point of agreement.
                 (last_cp @ Some(_), last_info @ None) => {
                     'cp_loop: for cp in last_cp.clone().iter().flat_map(CheckPoint::iter) {
                         let cp_block = cp.block_id();
@@ -150,18 +196,18 @@ impl<'a> BitcoindRpcIter<'a> {
                             // block is not in the main chain
                             continue 'cp_loop;
                         }
-
-                        // agreement
+                        // agreement found
                         *last_cp = Some(cp);
                         *last_info = Some(info);
                         continue 'main_loop;
                     }
 
-                    // no point of agreement found
-                    // next loop will emit block @ fallback height
+                    // no point of agreement found, next loop will emit block @ fallback height
                     *last_cp = None;
                     *last_info = None;
                 }
+                // If `last_cp` and `last_info` is both `Some`, we either emit a block at
+                // `last_info.nextblockhash` (if it exists), or we emit a subset of the mempool.
                 (Some(last_cp), last_info @ Some(_)) => {
                     // find next block
                     match last_info.as_ref().unwrap().nextblockhash {
@@ -192,7 +238,6 @@ impl<'a> BitcoindRpcIter<'a> {
                             }));
                         }
                         None => {
-                            // emit from mempool!
                             let mempool_txs = client
                                 .get_raw_mempool()?
                                 .into_iter()
@@ -208,7 +253,8 @@ impl<'a> BitcoindRpcIter<'a> {
                                 )
                                 .collect::<Result<Vec<_>, _>>()?;
 
-                            // remove last info...
+                            // After a mempool emission, we want to find the point of agreement in
+                            // the next round.
                             *last_info = None;
 
                             return Ok(Some(BitcoindRpcItem::Mempool {
@@ -224,7 +270,12 @@ impl<'a> BitcoindRpcIter<'a> {
     }
 }
 
+/// Extends [`bitcoincore_rpc::Error`].
 pub trait BitcoindRpcErrorExt {
+    /// Returns whether the error is a "not found" error.
+    ///
+    /// This is useful since [`BitcoindRpcIter`] emits [`Result<_, bitcoincore_rpc::Error>`]s as
+    /// [`Iterator::Item`].
     fn is_not_found_error(&self) -> bool;
 }
 
