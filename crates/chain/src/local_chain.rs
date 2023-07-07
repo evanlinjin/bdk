@@ -439,8 +439,13 @@ fn merge_chains(orig: CheckPoint, update: CheckPoint) -> Result<ChangeSet, Canno
                 prev_update = curr_update.take();
             }
             // Original block that isn't in the update
-            (Some(o), u) if Some(o.height()) > u.map(|u| u.height()) => {
-                // this block might be gone if an earlier block gets invalidated
+            // (Some(o), u) if Some(o.height()) > u.map(|u| u.height()) => {
+            //     // this block might be gone if an earlier block gets invalidated
+            //     potentially_invalidated_heights.push(o.height());
+            //     prev_orig_was_invalidated = false;
+            //     prev_orig = curr_orig.take();
+            // }
+            (Some(o), Some(u)) if o.height() > u.height() => {
                 potentially_invalidated_heights.push(o.height());
                 prev_orig_was_invalidated = false;
                 prev_orig = curr_orig.take();
@@ -479,17 +484,44 @@ fn merge_chains(orig: CheckPoint, update: CheckPoint) -> Result<ChangeSet, Canno
                 prev_update = curr_update.take();
                 prev_orig = curr_orig.take();
             }
-            (None, None) => {
-                // When we don't have a point of agreement you can imagine it is implicitly the
-                // genesis block so we need to do the final connectivity check which in this case
-                // just means making sure the entire original chain was invalidated.
-                if !prev_orig_was_invalidated && !point_of_agreement_found {
-                    if let Some(prev_orig) = prev_orig {
-                        return Err(CannotConnectError {
-                            try_include_height: prev_orig.height(),
-                        });
-                    }
+            (o, None) => {
+                // If we have exhausted the updates and a point of agreement is found, the changeset
+                // is guaranteed to be valid.
+                if point_of_agreement_found {
+                    break;
                 }
+                // If no point of agreement is found, we need to ensure that we invalidate the first
+                // original checkpoint (hence, the curr_orig needs to be none).
+                if prev_orig_was_invalidated && o.is_none() {
+                    break;
+                }
+
+                if let Some(curr_orig) = o {
+                    return Err(CannotConnectError {
+                        try_include_height: curr_orig.height(),
+                    });
+                }
+                if let Some(prev_orig) = prev_orig {
+                    return Err(CannotConnectError {
+                        try_include_height: prev_orig.height(),
+                    });
+                }
+
+                // // When we don't have a point of agreement you can imagine it is implicitly the
+                // // genesis block so we need to do the final connectivity check which in this case
+                // // just means making sure the entire original chain was invalidated.
+                // if !dbg!(prev_orig_was_invalidated) || !dbg!(point_of_agreement_found) {
+                //     if let Some(prev_orig) = prev_orig {
+                //         return Err(CannotConnectError {
+                //             try_include_height: prev_orig.height(),
+                //         });
+                //     }
+                //     if let Some(curr_orig) = o {
+                //         return Err(CannotConnectError {
+                //             try_include_height: curr_orig.height(),
+                //         });
+                //     }
+                // }
                 break;
             }
             _ => {
