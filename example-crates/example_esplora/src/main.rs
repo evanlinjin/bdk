@@ -6,8 +6,8 @@ use std::{
 
 use bdk_chain::{
     bitcoin::{Address, Network, OutPoint, ScriptBuf, Txid},
-    indexed_tx_graph::{IndexedAdditions, IndexedTxGraph},
-    keychain::LocalChangeSet,
+    indexed_tx_graph::{self, IndexedTxGraph},
+    keychain::WalletChangeSet,
     local_chain::{CheckPoint, LocalChain},
     Append, ConfirmationTimeAnchor,
 };
@@ -62,7 +62,7 @@ pub struct ScanOptions {
 fn main() -> anyhow::Result<()> {
     let (args, keymap, index, db, init_changeset) = example_cli::init::<
         EsploraCommands,
-        LocalChangeSet<Keychain, ConfirmationTimeAnchor>,
+        WalletChangeSet<Keychain, ConfirmationTimeAnchor>,
     >(DB_MAGIC, DB_PATH)?;
 
     // Contruct `IndexedTxGraph` and `LocalChain` with our initial changeset. They are wrapped in
@@ -70,12 +70,12 @@ fn main() -> anyhow::Result<()> {
     // aren't strictly needed here.
     let graph = Mutex::new({
         let mut graph = IndexedTxGraph::new(index);
-        graph.apply_additions(init_changeset.indexed_additions);
+        graph.apply_changeset(init_changeset.index_tx_graph);
         graph
     });
     let chain = Mutex::new({
         let mut chain = LocalChain::default();
-        chain.apply_changeset(&init_changeset.chain_changeset);
+        chain.apply_changeset(&init_changeset.chain);
         chain
     });
 
@@ -84,7 +84,7 @@ fn main() -> anyhow::Result<()> {
         Network::Testnet => "https://blockstream.info/testnet/api",
         Network::Regtest => "http://localhost:3002",
         Network::Signet => "https://mempool.space/signet/api",
-        _ => panic!("unsuported network"),
+        _ => panic!("unsupported network"),
     };
 
     let client = esplora_client::Builder::new(esplora_url).build_blocking()?;
@@ -116,7 +116,7 @@ fn main() -> anyhow::Result<()> {
 
     // This is where we will accumulate changes of `IndexedTxGraph` and `LocalChain` and persist
     // these changes as a batch at the end.
-    let mut changeset = LocalChangeSet::<Keychain, ConfirmationTimeAnchor>::default();
+    let mut changeset = WalletChangeSet::<Keychain, ConfirmationTimeAnchor>::default();
 
     // Prepare the `IndexedTxGraph` update based on whether we are scanning or syncing.
     // Scanning: We are iterating through spks of all keychains and scanning for transactions for
@@ -135,7 +135,7 @@ fn main() -> anyhow::Result<()> {
                 .index
                 .spks_of_all_keychains()
                 .into_iter()
-                // This `map` is purely for printing to stdout.
+                // This `map` is purely for logging.
                 .map(|(keychain, iter)| {
                     let mut first = true;
                     let spk_iter = iter.inspect(move |(i, _)| {
@@ -145,7 +145,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         eprint!("{} ", i);
                         // Flush early to ensure we print at every iteration.
-                        let _ = io::stdout().flush();
+                        let _ = io::stderr().flush();
                     });
                     (keychain, spk_iter)
                 })
@@ -173,7 +173,7 @@ fn main() -> anyhow::Result<()> {
                     .expect("mutex must not be poisoned")
                     .index
                     .reveal_to_target_multi(&keychain_indices_update);
-                LocalChangeSet::from(IndexedAdditions::from(index_additions))
+                WalletChangeSet::from(indexed_tx_graph::ChangeSet::from(index_additions))
             });
 
             graph_update
@@ -217,6 +217,8 @@ fn main() -> anyhow::Result<()> {
                         .collect::<Vec<_>>();
                     spks = Box::new(spks.chain(all_spks.into_iter().map(|(index, script)| {
                         eprintln!("scanning {:?}", index);
+                        // Flush early to ensure we print at every iteration.
+                        let _ = io::stderr().flush();
                         script
                     })));
                 }
@@ -232,6 +234,8 @@ fn main() -> anyhow::Result<()> {
                             Address::from_script(&script, args.network).unwrap(),
                             index
                         );
+                        // Flush early to ensure we print at every iteration.
+                        let _ = io::stderr().flush();
                         script
                     })));
                 }
@@ -253,6 +257,8 @@ fn main() -> anyhow::Result<()> {
                                     "Checking if outpoint {} (value: {}) has been spent",
                                     utxo.outpoint, utxo.txout.value
                                 );
+                                // Flush early to ensure we print at every iteration.
+                                let _ = io::stderr().flush();
                             })
                             .map(|utxo| utxo.outpoint),
                     );
@@ -264,11 +270,13 @@ fn main() -> anyhow::Result<()> {
                     let unconfirmed_txids = graph
                         .graph()
                         .list_chain_txs(&*chain, chain_tip)
-                        .filter(|canonical_tx| !canonical_tx.observed_as.is_confirmed())
-                        .map(|canonical_tx| canonical_tx.node.txid)
+                        .filter(|canonical_tx| !canonical_tx.chain_position.is_confirmed())
+                        .map(|canonical_tx| canonical_tx.tx_node.txid)
                         .collect::<Vec<Txid>>();
                     txids = Box::new(unconfirmed_txids.into_iter().inspect(|txid| {
                         eprintln!("Checking if {} is confirmed yet", txid);
+                        // Flush early to ensure we print at every iteration.
+                        let _ = io::stderr().flush();
                     }));
                 }
             }
@@ -284,15 +292,29 @@ fn main() -> anyhow::Result<()> {
 
     println!();
 
-    // Up to this point, we have only created a `TxGraph` update, but not an update for our
-    // `ChainOracle` implementation (`LocalChain`). The `TxGraph` update may contain chain anchors,
-    // so we need the corresponding blocks to exist in our `LocalChain`. Here, we find the heights
-    // of missing blocks in `LocalChain`.
-    //
-    // Getting the local chain tip is only for printing to stdout.
+    // We apply the `TxGraph` update, and append the resultant changes to `changeset`
+    // (for persistance)
+    changeset.append({
+        let indexed_graph_additions = graph.lock().unwrap().apply_update(graph_update);
+        WalletChangeSet::from(indexed_graph_additions)
+    });
+
+    // Now that we're done updating the `TxGraph`, it's time to update the `LocalChain`!
+    // We want the `LocalChain` to have data about all the anchors in the `TxGraph` - for this
+    // reason, we want retrieve the heights of the newly added anchors, and fetch the corresponding
+    // blocks.
+
+    // We get the heights of all the anchors introduced by the changeset, and the local chain tip.
+    // Note that the latter is only used for logging.
     let (missing_block_heights, tip) = {
         let chain = &*chain.lock().unwrap();
-        let heights_to_fetch = graph_update.missing_heights(chain).collect::<Vec<_>>();
+        let heights_to_fetch = changeset
+            .index_tx_graph
+            .graph
+            .anchors
+            .iter()
+            .map(|(a, _)| a.confirmation_height)
+            .collect::<Vec<_>>();
         let tip = chain.tip();
         (heights_to_fetch, tip)
     };
@@ -307,15 +329,11 @@ fn main() -> anyhow::Result<()> {
 
     println!("new tip: {}", chain_update.tip.height());
 
-    // We apply the `LocalChain` and `TxGraph` updates, and append the resultant changes to
-    // `changeset` (for persistance).
+    // We apply the `LocalChain` update, and append the resultant changes to `changeset`
+    // (for persistance).
     changeset.append({
         let chain_additions = chain.lock().unwrap().apply_update(chain_update)?;
-        LocalChangeSet::from(chain_additions)
-    });
-    changeset.append({
-        let indexed_graph_additions = graph.lock().unwrap().apply_update(graph_update);
-        LocalChangeSet::from(indexed_graph_additions)
+        WalletChangeSet::from(chain_additions)
     });
 
     // We persist `changeset`.
