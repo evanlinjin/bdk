@@ -270,12 +270,7 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     ) -> BTreeMap<K, SpkIterator<Descriptor<DescriptorPublicKey>>> {
         self.keychains
             .iter()
-            .map(|(keychain, descriptor)| {
-                (
-                    keychain.clone(),
-                    SpkIterator::new_with_range(descriptor.clone(), 0..),
-                )
-            })
+            .map(|(keychain, descriptor)| (keychain.clone(), SpkIterator::new(descriptor.clone())))
             .collect()
     }
 
@@ -291,7 +286,7 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
             .get(keychain)
             .expect("keychain must exist")
             .clone();
-        SpkIterator::new_with_range(descriptor, 0..)
+        SpkIterator::new(descriptor)
     }
 
     /// Convenience method to get [`revealed_spks_of_keychain`] of all keychains.
