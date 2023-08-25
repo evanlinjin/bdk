@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
     // aren't strictly needed here.
     let graph = Mutex::new({
         let mut graph = IndexedTxGraph::new(index);
-        graph.apply_changeset(init_changeset.index_tx_graph);
+        graph.apply_changeset(init_changeset.indexed_tx_graph);
         graph
     });
     let chain = Mutex::new({
@@ -309,7 +309,7 @@ fn main() -> anyhow::Result<()> {
     let (missing_block_heights, tip) = {
         let chain = &*chain.lock().unwrap();
         let heights_to_fetch = changeset
-            .index_tx_graph
+            .indexed_tx_graph
             .graph
             .anchors
             .iter()
