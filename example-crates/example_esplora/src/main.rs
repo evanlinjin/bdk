@@ -1,12 +1,12 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, Write},
     sync::Mutex,
 };
 
 use bdk_chain::{
     bitcoin::{Address, Network, OutPoint, ScriptBuf, Txid},
-    indexed_tx_graph::{self, IndexedTxGraph},
+    indexed_tx_graph::IndexedTxGraph,
     keychain::WalletChangeSet,
     local_chain::{CheckPoint, LocalChain},
     Append, ConfirmationTimeAnchor,
@@ -114,17 +114,15 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // This is where we will accumulate changes of `IndexedTxGraph` and `LocalChain` and persist
-    // these changes as a batch at the end.
-    let mut changeset = WalletChangeSet::<Keychain, ConfirmationTimeAnchor>::default();
-
     // Prepare the `IndexedTxGraph` update based on whether we are scanning or syncing.
     // Scanning: We are iterating through spks of all keychains and scanning for transactions for
     //   each spk. We start with the lowest derivation index spk and stop scanning after `stop_gap`
-    //   number of consecutive spks have no transaction history.
+    //   number of consecutive spks have no transaction history. A Scan is done in situations of
+    //   wallet restoration. It is a special case. Applications should use "sync" style updates
+    //   after an initial scan.
     // Syncing: We only check for specified spks, utxos and txids to update their confirmation
     //   status or fetch missing transactions.
-    let graph_update = match &esplora_cmd {
+    let indexed_tx_graph_changeset = match &esplora_cmd {
         EsploraCommands::Scan {
             stop_gap,
             scan_options,
@@ -155,7 +153,7 @@ fn main() -> anyhow::Result<()> {
             // is reached. It returns a `TxGraph` update (`graph_update`) and a structure that
             // represents the last active spk derivation indices of keychains
             // (`keychain_indices_update`).
-            let (graph_update, keychain_indices_update) = client
+            let (graph_update, last_active_indices) = client
                 .update_tx_graph(
                     keychain_spks,
                     core::iter::empty(),
@@ -165,18 +163,15 @@ fn main() -> anyhow::Result<()> {
                 )
                 .context("scanning for transactions")?;
 
-            // Update the index in `IndexedTxGraph` with `keychain_indices_update`. The resultant
-            // changes are appended to `changeset`.
-            changeset.append({
-                let (_, index_additions) = graph
-                    .lock()
-                    .expect("mutex must not be poisoned")
-                    .index
-                    .reveal_to_target_multi(&keychain_indices_update);
-                WalletChangeSet::from(indexed_tx_graph::ChangeSet::from(index_additions))
-            });
-
-            graph_update
+            let mut graph = graph.lock().expect("mutex must not be poisoned");
+            // Because we did a stop gap based scan we are likely to have some updates to our
+            // deriviation indices. Usually before a scan you are on a fresh wallet with no
+            // addresses derived so we need to derive up to last active addresses the scan found
+            // before adding the transactions.
+            let (_, index_changeset) = graph.index.reveal_to_target_multi(&last_active_indices);
+            let mut indexed_tx_graph_changeset = graph.apply_update(graph_update);
+            indexed_tx_graph_changeset.append(index_changeset.into());
+            indexed_tx_graph_changeset
         }
         EsploraCommands::Sync {
             mut unused_spks,
@@ -281,42 +276,31 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            client.update_tx_graph_without_keychain(
+            let graph_update = client.update_tx_graph_without_keychain(
                 spks,
                 txids,
                 outpoints,
                 scan_options.parallel_requests,
-            )?
+            )?;
+
+            graph.lock().unwrap().apply_update(graph_update)
         }
     };
 
     println!();
 
-    // We apply the `TxGraph` update, and append the resultant changes to `changeset`
-    // (for persistance)
-    changeset.append({
-        let indexed_graph_additions = graph.lock().unwrap().apply_update(graph_update);
-        WalletChangeSet::from(indexed_graph_additions)
-    });
-
-    // Now that we're done updating the `TxGraph`, it's time to update the `LocalChain`!
-    // We want the `LocalChain` to have data about all the anchors in the `TxGraph` - for this
-    // reason, we want retrieve the heights of the newly added anchors, and fetch the corresponding
-    // blocks.
-
-    // We get the heights of all the anchors introduced by the changeset, and the local chain tip.
-    // Note that the latter is only used for logging.
+    // Now that we're done updating the `IndexedTxGraph`, it's time to update the `LocalChain`! We
+    // want the `LocalChain` to have data about all the anchors in the `TxGraph` - for this reason,
+    // we want retrieve the blocks at the heights of the newly added anchors that are missing from
+    // our view of the chain.
     let (missing_block_heights, tip) = {
         let chain = &*chain.lock().unwrap();
-        let heights_to_fetch = changeset
-            .indexed_tx_graph
+        let missing_block_heights = indexed_tx_graph_changeset
             .graph
-            .anchors
-            .iter()
-            .map(|(a, _)| a.confirmation_height)
-            .collect::<Vec<_>>();
+            .missing_heights_from(chain)
+            .collect::<BTreeSet<_>>();
         let tip = chain.tip();
-        (heights_to_fetch, tip)
+        (missing_block_heights, tip)
     };
 
     println!("prev tip: {}", tip.as_ref().map_or(0, CheckPoint::height));
@@ -329,16 +313,12 @@ fn main() -> anyhow::Result<()> {
 
     println!("new tip: {}", chain_update.tip.height());
 
-    // We apply the `LocalChain` update, and append the resultant changes to `changeset`
-    // (for persistance).
-    changeset.append({
-        let chain_additions = chain.lock().unwrap().apply_update(chain_update)?;
-        WalletChangeSet::from(chain_additions)
-    });
-
-    // We persist `changeset`.
+    // We persist the changes
     let mut db = db.lock().unwrap();
-    db.stage(changeset);
+    db.stage(WalletChangeSet {
+        chain: chain.lock().unwrap().apply_update(chain_update)?,
+        indexed_tx_graph: indexed_tx_graph_changeset,
+    });
     db.commit()?;
     Ok(())
 }
