@@ -64,9 +64,9 @@ impl From<RpcArgs> for Auth {
 
 #[derive(Subcommand, Debug, Clone)]
 enum RpcCommands {
-    /// Scans blocks via RPC (starting from last point of agreement) and stores/indexes relevant
-    /// transactions
-    Scan {
+    /// Syncs local state with remote state via RPC (starting from last point of agreement) and
+    /// stores/indexes relevant transactions
+    Sync {
         /// Starting block height to fallback to if no point of agreement if found
         #[clap(env = "FALLBACK_HEIGHT", long, default_value = "0")]
         fallback_height: u32,
@@ -93,7 +93,7 @@ enum RpcCommands {
 impl RpcCommands {
     fn rpc_args(&self) -> &RpcArgs {
         match self {
-            RpcCommands::Scan { rpc_args, .. } => rpc_args,
+            RpcCommands::Sync { rpc_args, .. } => rpc_args,
             RpcCommands::Tx { rpc_args, .. } => rpc_args,
         }
     }
@@ -145,7 +145,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     match rpc_cmd {
-        RpcCommands::Scan {
+        RpcCommands::Sync {
             fallback_height,
             lookahead,
             live,

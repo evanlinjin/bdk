@@ -1,8 +1,7 @@
 //! This crate is used for updating [`bdk_chain`] structures with data from the `bitcoind` RPC
-//! interface.
+//! interface (excluding the RPC wallet API).
 //!
-//! The main structure is [`Emitter`], which sources blockchain data from
-//! [`bitcoincore_rpc::Client`].
+//! [`Emitter`] is the main structure which sources blockchain data from [`bitcoincore_rpc::Client`].
 //!
 //! To only get block updates (exlude mempool transactions), the caller can use
 //! [`Emitter::emit_block`] until it returns `Ok(None)` (which means the chain tip is reached). A
@@ -168,7 +167,9 @@ impl EmittedBlock {
 /// An emitted subset of mempool transactions.
 #[derive(Debug, Clone)]
 pub struct EmittedMempool {
-    /// Subset of mempool transactions.
+    /// Subset of mempool transactions as tuples of `(tx, seen_at)`.
+    ///
+    /// `seen_at` is the unix timestamp of when the transaction was first seen in the mempool.
     pub txs: Vec<(Transaction, u64)>,
 }
 
