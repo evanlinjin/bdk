@@ -200,15 +200,9 @@ fn main() -> anyhow::Result<()> {
                     let mut chain = chain.lock().unwrap();
                     let mut graph = graph.lock().unwrap();
 
-                    let graph_update = {
-                        let tx_filter = bdk_bitcoind_rpc::indexer_filter(
-                            &mut graph.index,
-                            &mut indexed_changeset.indexer,
-                        );
-                        let anchor_map = bdk_bitcoind_rpc::confirmation_time_anchor;
-                        item.into_tx_graph_update(tx_filter, anchor_map)
-                    };
-                    indexed_changeset.append(graph.apply_update(graph_update));
+                    let graph_update =
+                        item.indexed_tx_graph_update(bdk_bitcoind_rpc::confirmation_time_anchor);
+                    indexed_changeset.append(graph.insert_relevant_txs(graph_update));
 
                     let chain_changeset = match chain_update {
                         Some(update) => chain.apply_update(update)?,

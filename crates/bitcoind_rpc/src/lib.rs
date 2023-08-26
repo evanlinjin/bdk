@@ -43,9 +43,9 @@
 
 use bdk_chain::{
     bitcoin::{Block, Transaction},
-    indexed_tx_graph::Indexer,
+    indexed_tx_graph::TxItem,
     local_chain::{self, CheckPoint},
-    Append, BlockId, ConfirmationHeightAnchor, ConfirmationTimeAnchor, TxGraph,
+    BlockId, ConfirmationHeightAnchor, ConfirmationTimeAnchor, TxGraph,
 };
 pub use bitcoincore_rpc;
 use bitcoincore_rpc::{json::GetBlockResult, RpcApi};
@@ -92,24 +92,29 @@ impl EmittedUpdate {
         })
     }
 
-    /// Transforms the emitted update into a [`TxGraph`] update.
-    ///
-    /// The `tx_filter` parameter takes in a closure that filters out irrelevant transactions so
-    /// they do not get included in the [`TxGraph`] update. We have provided two closures;
-    /// [`empty_filter`] and [`indexer_filter`] for this purpose.
+    /// Return transaction items to be consumed by [`IndexedTxGraph::insert_relevant_txs`].
     ///
     /// The `anchor_map` parameter takes in a closure that creates anchors of a specific type.
     /// [`confirmation_height_anchor`] and [`confirmation_time_anchor`] are avaliable to create
     /// updates with [`ConfirmationHeightAnchor`] and [`ConfirmationTimeAnchor`] respectively.
-    pub fn into_tx_graph_update<F, M, A>(self, tx_filter: F, anchor_map: M) -> TxGraph<A>
+    ///
+    /// [`IndexedTxGraph::insert_relevant_txs`]: bdk_chain::IndexedTxGraph::insert_relevant_txs
+    pub fn indexed_tx_graph_update<M, A>(&self, anchor_map: M) -> Vec<TxItem<'_, Option<A>>>
     where
-        F: FnMut(&Transaction) -> bool,
         M: Fn(&CheckPoint, &Block, usize) -> A,
-        A: Clone + Ord + PartialOrd,
+        A: Clone + Ord + PartialEq,
     {
         match self {
-            EmittedUpdate::Block(e) => e.into_tx_graph_update(tx_filter, anchor_map),
-            EmittedUpdate::Mempool(e) => e.into_tx_graph_update(tx_filter),
+            EmittedUpdate::Block(EmittedBlock { block, cp }) => block
+                .txdata
+                .iter()
+                .enumerate()
+                .map(move |(i, tx)| (tx, Some(anchor_map(cp, block, i)), None))
+                .collect(),
+            EmittedUpdate::Mempool(EmittedMempool { txs }) => txs
+                .iter()
+                .map(|(tx, seen_at)| (tx, None, Some(*seen_at)))
+                .collect(),
         }
     }
 }
@@ -186,25 +191,6 @@ impl EmittedMempool {
         }
         tx_graph
     }
-}
-
-/// Creates a closure that filters transactions based on an [`Indexer`] implementation.
-pub fn indexer_filter<'i, I: Indexer>(
-    indexer: &'i mut I,
-    changeset: &'i mut I::ChangeSet,
-) -> impl FnMut(&Transaction) -> bool + 'i
-where
-    I::ChangeSet: bdk_chain::Append,
-{
-    |tx| {
-        changeset.append(indexer.index_tx(tx));
-        indexer.is_tx_relevant(tx)
-    }
-}
-
-/// Returns an empty filter-closure.
-pub fn empty_filter() -> impl FnMut(&Transaction) -> bool {
-    |_| true
 }
 
 /// A closure that transforms a [`EmittedUpdate`] into a [`ConfirmationHeightAnchor`].
