@@ -1,7 +1,7 @@
 use rand::distributions::{Alphanumeric, DistString};
 use std::collections::HashMap;
 
-use bdk_chain::{tx_graph::TxGraph, ConfirmationHeightAnchor, SpkTxOutIndex};
+use bdk_chain::{tx_graph::TxGraph, BlockId, SpkTxOutIndex};
 use bitcoin::{
     locktime::absolute::LockTime, secp256k1::Secp256k1, OutPoint, ScriptBuf, Sequence, Transaction,
     TxIn, TxOut, Txid, Witness,
@@ -9,6 +9,7 @@ use bitcoin::{
 use miniscript::Descriptor;
 
 /// Transaction template.
+#[derive(Clone, Copy, Default)]
 pub struct TxTemplate<'a, A> {
     /// Uniquely identifies the transaction, before it can have a txid.
     pub tx_name: &'a str,
@@ -16,26 +17,6 @@ pub struct TxTemplate<'a, A> {
     pub outputs: &'a [TxOutTemplate],
     pub anchors: &'a [A],
     pub last_seen: Option<u64>,
-}
-
-impl<'a, A> Default for TxTemplate<'a, A> {
-    fn default() -> Self {
-        Self {
-            tx_name: Default::default(),
-            inputs: Default::default(),
-            outputs: Default::default(),
-            anchors: Default::default(),
-            last_seen: Default::default(),
-        }
-    }
-}
-
-impl<'a, A> Copy for TxTemplate<'a, A> {}
-
-impl<'a, A> Clone for TxTemplate<'a, A> {
-    fn clone(&self) -> Self {
-        *self
-    }
 }
 
 #[allow(dead_code)]
@@ -47,7 +28,7 @@ pub enum TxInTemplate<'a> {
     Coinbase,
 
     /// Contains the `tx_name` and `vout` that we are spending. The rule is that we must only spend
-    /// a previous transaction.
+    /// from tx of a previous `TxTemplate`.
     PrevTx(&'a str, usize),
 }
 
@@ -56,16 +37,19 @@ pub struct TxOutTemplate {
     pub spk_index: Option<u32>, // some = get spk from SpkTxOutIndex, none = random spk
 }
 
+#[allow(unused)]
+impl TxOutTemplate {
+    pub fn new(value: u64, spk_index: Option<u32>) -> Self {
+        TxOutTemplate { value, spk_index }
+    }
+}
+
 #[allow(dead_code)]
 pub fn init_graph<'a>(
-    tx_templates: impl IntoIterator<Item = &'a TxTemplate<'a, ConfirmationHeightAnchor>>,
-) -> (
-    TxGraph<ConfirmationHeightAnchor>,
-    SpkTxOutIndex<u32>,
-    HashMap<&'a str, Txid>,
-) {
+    tx_templates: impl IntoIterator<Item = &'a TxTemplate<'a, BlockId>>,
+) -> (TxGraph<BlockId>, SpkTxOutIndex<u32>, HashMap<&'a str, Txid>) {
     let (descriptor, _) = Descriptor::parse_descriptor(&Secp256k1::signing_only(), "tr(tprv8ZgxMBicQKsPd3krDUsBAmtnRsK3rb8u5yi1zhQgMhF1tR8MW7xfE4rnrbbsrbPR52e7rKapu6ztw1jXveJSCGHEriUGZV7mCe88duLp5pj/86'/1'/0'/0/*)").unwrap();
-    let mut graph = TxGraph::<ConfirmationHeightAnchor>::default();
+    let mut graph = TxGraph::<BlockId>::default();
     let mut spk_index = SpkTxOutIndex::default();
     (0..10).for_each(|index| {
         spk_index.insert_spk(
