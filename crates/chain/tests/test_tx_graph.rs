@@ -509,8 +509,15 @@ fn test_calculate_fee_on_coinbase() {
 //              e0
 //
 // where b0 and b1 spend a0, c0 and c1 spend b0, d0 spends c1, etc.
+// a0 and b1 are confirmed txs
 #[test]
 fn test_walk_ancestors() {
+    let local_chain: LocalChain = (0..=20)
+        .map(|ht| (ht, BlockHash::hash(format!("Block Hash {}", ht).as_bytes())))
+        .collect::<BTreeMap<u32, BlockHash>>()
+        .into();
+    let tip = local_chain.tip().expect("must have tip");
+
     let tx_a0 = Transaction {
         input: vec![TxIn {
             previous_output: OutPoint::new(h!("op0"), 0),
@@ -630,7 +637,7 @@ fn test_walk_ancestors() {
         ..common::new_tx(0)
     };
 
-    let graph = TxGraph::<()>::new(vec![
+    let mut graph = TxGraph::<BlockId>::new(vec![
         tx_a0.clone(),
         tx_b0.clone(),
         tx_b1.clone(),
@@ -644,43 +651,35 @@ fn test_walk_ancestors() {
         tx_e0.clone(),
     ]);
 
+    [&tx_a0, &tx_b1].iter().for_each(|tx| {
+        let _ = graph.insert_anchor(tx.txid(), tip.block_id());
+    });
+
     let ancestors = [
         graph
-            .walk_ancestors(&tx_e0, 25)
-            .map(|(depth, tx)| (depth, tx.txid()))
+            .walk_ancestors(&tx_c0, |_, tx| {
+                graph
+                    .get_unconfirmed_tx(tx.txid(), &local_chain, tip.block_id())
+                    .expect("error is infallible")
+            })
             .collect::<BTreeSet<_>>(),
         graph
-            .walk_ancestors(&tx_e0, 3)
-            .map(|(depth, tx)| (depth, tx.txid()))
+            .walk_ancestors(&tx_e0, |_, tx| {
+                graph
+                    .get_unconfirmed_tx(tx.txid(), &local_chain, tip.block_id())
+                    .expect("error is infallible")
+            })
             .collect::<BTreeSet<_>>(),
+        // Walk all ancestors of tx_d0
         graph
-            .walk_ancestors(&tx_d0, 5)
-            .map(|(depth, tx)| (depth, tx.txid()))
-            .collect::<BTreeSet<_>>(),
-        graph
-            .walk_ancestors(&tx_c0, 1)
-            .map(|(depth, tx)| (depth, tx.txid()))
+            .walk_ancestors(&tx_d0, |_, tx| Some(tx))
             .collect::<BTreeSet<_>>(),
     ];
 
     let expected_ancestors = [
-        BTreeSet::from([
-            (4, tx_a0.txid()),
-            (3, tx_b1.txid()),
-            (3, tx_b2.txid()),
-            (2, tx_c2.txid()),
-            (2, tx_c3.txid()),
-            (1, tx_d1.txid()),
-        ]),
-        BTreeSet::from([
-            (3, tx_b1.txid()),
-            (3, tx_b2.txid()),
-            (2, tx_c2.txid()),
-            (2, tx_c3.txid()),
-            (1, tx_d1.txid()),
-        ]),
-        BTreeSet::from([(3, tx_a0.txid()), (2, tx_b0.txid()), (1, tx_c1.txid())]),
-        BTreeSet::from([(1, tx_b0.txid())]),
+        BTreeSet::from([&tx_b0]),
+        BTreeSet::from([&tx_b2, &tx_c2, &tx_c3, &tx_d1]),
+        BTreeSet::from([&tx_a0, &tx_b0, &tx_c1]),
     ];
 
     for (txids, expected_txids) in ancestors.iter().zip(expected_ancestors.iter()) {
@@ -731,7 +730,7 @@ fn test_conflicting_descendants() {
 
     assert_eq!(
         graph
-            .walk_conflicts(&tx_a2, 25, |depth, txid| Some((depth, txid)))
+            .walk_conflicts(&tx_a2, |depth, txid| Some((depth, txid)))
             .collect::<Vec<_>>(),
         vec![(0_usize, txid_a), (1_usize, txid_b),],
     );

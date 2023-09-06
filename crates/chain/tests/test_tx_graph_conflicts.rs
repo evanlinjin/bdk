@@ -493,8 +493,6 @@ fn test_tx_conflict_handling() {
                 chain_tip,
                 spk_index.outpoints().iter().cloned(),
             )
-            .collect::<Vec<_>>()
-            .iter()
             .map(|(_, full_txout)| full_txout.outpoint)
             .collect::<BTreeSet<_>>();
         let utxos = tx_graph
@@ -503,8 +501,6 @@ fn test_tx_conflict_handling() {
                 chain_tip,
                 spk_index.outpoints().iter().cloned(),
             )
-            .collect::<Vec<_>>()
-            .iter()
             .map(|(_, full_txout)| full_txout.outpoint)
             .collect::<BTreeSet<_>>();
         let balance = tx_graph.balance(

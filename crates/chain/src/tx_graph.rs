@@ -205,6 +205,26 @@ impl<A> TxGraph<A> {
         self.get_tx_node(txid).map(|n| n.tx)
     }
 
+    /// Get a transaction by txid. This only returns `Some` for full, unconfirmed transactions.
+    pub fn get_unconfirmed_tx<'g, C>(
+        &'g self,
+        txid: Txid,
+        chain: &'g C,
+        chain_tip: BlockId,
+    ) -> Result<Option<&'g Transaction>, C::Error>
+    where
+        A: Anchor,
+        C: ChainOracle,
+    {
+        let tx_node = self.get_tx_node(txid).expect("tx must exist");
+        for block in tx_node.anchors.iter().map(Anchor::anchor_block) {
+            if chain.is_block_in_chain(block, chain_tip)? == Some(true) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(tx_node.tx))
+    }
+
     /// Get a transaction node by txid. This only returns `Some` for full transactions.
     pub fn get_tx_node(&self, txid: Txid) -> Option<TxNode<'_, Transaction, A>> {
         match &self.txs.get(&txid)? {
@@ -319,14 +339,26 @@ impl<A> TxGraph<A> {
             .map(|(outpoint, spends)| (outpoint.vout, spends))
     }
 
-    /// Creates an iterator of ancestor transactions from the starting `Transaction` up to a
-    /// specified depth limit, not including the original `Transaction`.
-    pub fn walk_ancestors<'g>(
+    /// Creates an iterator of ancestor transactions from the starting `Transaction`, not including
+    /// the original `Transaction`.
+    ///
+    /// The supplied closure takes in two inputs `(depth, ancestor_tx)`:
+    ///
+    /// * `depth` is the distance between the starting `Transaction` and the `ancestor_tx`. I.e., if
+    ///    the `Transaction` is spending an output of the `ancestor_tx`; the `depth` will be 1.
+    /// * `ancestor_tx` is the `Transaction`'s ancestor which we are considering to walk.
+    ///
+    /// The supplied closure returns an `Option<T>`, allowing the caller to map each `Transaction`
+    /// it visitsand decide whether to visit ancestors.
+    pub fn walk_ancestors<'g, F, O>(
         &'g self,
         tx: &'g Transaction,
-        depth_limit: usize,
-    ) -> TxAncestors<'g, A> {
-        TxAncestors::new_exclude_root(self, tx, depth_limit)
+        walk_map: F,
+    ) -> TxAncestors<'g, A, F>
+    where
+        F: FnMut(usize, &'g Transaction) -> Option<O> + 'g,
+    {
+        TxAncestors::new_exclude_root(self, tx, walk_map)
     }
 
     /// Creates an iterator that filters and maps descendants from the starting `txid`.
@@ -354,19 +386,13 @@ impl<A> TxGraph<A> {
     pub fn walk_conflicts<'g, F, O>(
         &'g self,
         tx: &'g Transaction,
-        depth_limit: usize,
         walk_map: F,
     ) -> TxDescendants<A, F>
     where
         F: FnMut(usize, Txid) -> Option<O> + 'g,
     {
-        TxDescendants::from_multiple_include_root(
-            self,
-            TxAncestors::new_include_root(self, tx, depth_limit)
-                .flat_map(|(_, tx)| self.direct_conflicts_of_tx(tx).map(|(_, txid)| txid))
-                .collect::<HashSet<_>>(),
-            walk_map,
-        )
+        let txids = self.direct_conflicts_of_tx(tx).map(|(_, txid)| txid);
+        TxDescendants::from_multiple_include_root(self, txids, walk_map)
     }
 
     /// Given a transaction, return an iterator of txids that directly conflict with the given
@@ -699,17 +725,23 @@ impl<A: Anchor> TxGraph<A> {
             }
         };
 
-        // If a conflicting tx is in the best chain, or has `last_seen` higher than this tx, then
-        // this tx cannot exist in the best chain
-        for conflicting_tx in self.walk_conflicts(tx, 25, |_, txid| self.get_tx_node(txid)) {
-            for block in conflicting_tx.anchors.iter().map(A::anchor_block) {
-                if chain.is_block_in_chain(block, chain_tip)? == Some(true) {
-                    // conflicting tx is in best chain, so the current tx cannot be in best chain!
+        // Populate a list of unconfirmed ancestor txs to check for conflicts
+        for tx in TxAncestors::new_include_root(self, tx, |_, tx: &Transaction| {
+            self.get_unconfirmed_tx(tx.txid(), chain, chain_tip)
+                .expect("error is infallible")
+        }) {
+            // If a conflicting tx is in the best chain, or has `last_seen` higher than this tx, then
+            // this tx cannot exist in the best chain
+            for conflicting_tx in self.walk_conflicts(tx, |_, txid| self.get_tx_node(txid)) {
+                for block in conflicting_tx.anchors.iter().map(A::anchor_block) {
+                    if chain.is_block_in_chain(block, chain_tip)? == Some(true) {
+                        // conflicting tx is in best chain, so the current tx cannot be in best chain!
+                        return Ok(None);
+                    }
+                }
+                if conflicting_tx.last_seen_unconfirmed > *last_seen {
                     return Ok(None);
                 }
-            }
-            if conflicting_tx.last_seen_unconfirmed > *last_seen {
-                return Ok(None);
             }
         }
 
@@ -1167,34 +1199,30 @@ impl<A> ForEachTxOut for TxGraph<A> {
     }
 }
 
-/// An iterator that traverses ancestors that are whole `Transaction`s, to a specified depth.
-///
-/// The `stack` takes in two inputs `(depth, ancestor_transaction)`, where `depth` is the distance
-/// between the starting `Transaction` and the `ancestor_transaction`. I.e., if the `Transaction` is
-/// spending an output of the `ancestor_transaction`; the `depth` will be 1.
+/// An iterator that traverses unconfirmed ancestors that are whole `Transaction`s.
 ///
 /// This `struct` is created by the [`walk_ancestors`] method of [`TxGraph`].
 ///
 /// [`walk_ancestors`]: TxGraph::walk_ancestors
-pub struct TxAncestors<'g, A> {
+pub struct TxAncestors<'g, A, F> {
     graph: &'g TxGraph<A>,
     visited: HashSet<Txid>,
     stack: Vec<(usize, &'g Transaction)>,
-    depth_limit: usize,
+    filter_map: F,
 }
 
-impl<'g, A> TxAncestors<'g, A> {
+impl<'g, A, F> TxAncestors<'g, A, F> {
     /// Creates a `TxAncestors` that includes the starting `Transaction` when iterating.
     pub(crate) fn new_include_root(
         graph: &'g TxGraph<A>,
         tx: &'g Transaction,
-        depth_limit: usize,
+        filter_map: F,
     ) -> Self {
         Self {
             graph,
             visited: Default::default(),
             stack: [(0, tx)].into(),
-            depth_limit,
+            filter_map,
         }
     }
 
@@ -1202,13 +1230,13 @@ impl<'g, A> TxAncestors<'g, A> {
     pub(crate) fn new_exclude_root(
         graph: &'g TxGraph<A>,
         tx: &'g Transaction,
-        depth_limit: usize,
+        filter_map: F,
     ) -> Self {
         let mut ancestors = Self {
             graph,
             visited: Default::default(),
             stack: Default::default(),
-            depth_limit,
+            filter_map,
         };
         ancestors.populate_stack(1, tx);
         ancestors
@@ -1220,7 +1248,7 @@ impl<'g, A> TxAncestors<'g, A> {
     pub(crate) fn from_multiple_include_root<I>(
         graph: &'g TxGraph<A>,
         txs: I,
-        depth_limit: usize,
+        filter_map: F,
     ) -> Self
     where
         I: IntoIterator<Item = &'g Transaction>,
@@ -1229,7 +1257,7 @@ impl<'g, A> TxAncestors<'g, A> {
             graph,
             visited: Default::default(),
             stack: txs.into_iter().map(|tx| (0, tx)).collect(),
-            depth_limit,
+            filter_map,
         }
     }
 
@@ -1239,7 +1267,7 @@ impl<'g, A> TxAncestors<'g, A> {
     pub(crate) fn from_multiple_exclude_root<I>(
         graph: &'g TxGraph<A>,
         txs: I,
-        depth_limit: usize,
+        filter_map: F,
     ) -> Self
     where
         I: IntoIterator<Item = &'g Transaction>,
@@ -1248,7 +1276,7 @@ impl<'g, A> TxAncestors<'g, A> {
             graph,
             visited: Default::default(),
             stack: Default::default(),
-            depth_limit,
+            filter_map,
         };
         for tx in txs {
             ancestors.populate_stack(1, tx);
@@ -1257,29 +1285,36 @@ impl<'g, A> TxAncestors<'g, A> {
     }
 }
 
-impl<'g, A> TxAncestors<'g, A> {
+impl<'g, A, F> TxAncestors<'g, A, F> {
     fn populate_stack(&mut self, depth: usize, tx: &'g Transaction) {
-        if depth <= self.depth_limit && self.visited.insert(tx.txid()) {
-            tx.input
-                .iter()
-                .map(|txin| txin.previous_output.txid)
-                .for_each(|prev_txid| {
-                    if let Some((TxNodeInternal::Whole(tx), _, _)) = self.graph.txs.get(&prev_txid)
-                    {
-                        self.stack.push((depth, tx));
-                    };
-                });
-        }
+        let ancestors = tx
+            .input
+            .iter()
+            .map(|txin| txin.previous_output.txid)
+            .filter(|&prev_txid| self.visited.insert(prev_txid))
+            .filter_map(|prev_txid| self.graph.get_tx(prev_txid))
+            .map(|tx| (depth, tx));
+        self.stack.extend(ancestors);
     }
 }
 
-impl<'g, A> Iterator for TxAncestors<'g, A> {
-    type Item = (usize, &'g Transaction);
+impl<'g, A, F, O> Iterator for TxAncestors<'g, A, F>
+where
+    F: FnMut(usize, &'g Transaction) -> Option<O>,
+{
+    type Item = O;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (ancestor_depth, tx) = self.stack.pop()?;
+        let (ancestor_depth, tx, item) = loop {
+            // we have exhausted all paths when stack is empty
+            let (ancestor_depth, tx) = self.stack.pop()?;
+            // ignore paths when user filters them out
+            if let Some(item) = (self.filter_map)(ancestor_depth, tx) {
+                break (ancestor_depth, tx, item);
+            }
+        };
         self.populate_stack(ancestor_depth + 1, tx);
-        Some((ancestor_depth, tx))
+        Some(item)
     }
 }
 
