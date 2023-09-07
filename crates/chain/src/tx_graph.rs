@@ -205,25 +205,25 @@ impl<A> TxGraph<A> {
         self.get_tx_node(txid).map(|n| n.tx)
     }
 
-    /// Get a transaction by txid. This only returns `Some` for full, unconfirmed transactions.
-    pub fn get_unconfirmed_tx<'g, C>(
-        &'g self,
-        txid: Txid,
-        chain: &'g C,
-        chain_tip: BlockId,
-    ) -> Result<Option<&'g Transaction>, C::Error>
-    where
-        A: Anchor,
-        C: ChainOracle,
-    {
-        let tx_node = self.get_tx_node(txid).expect("tx must exist");
-        for block in tx_node.anchors.iter().map(Anchor::anchor_block) {
-            if chain.is_block_in_chain(block, chain_tip)? == Some(true) {
-                return Ok(None);
-            }
-        }
-        Ok(Some(tx_node.tx))
-    }
+    // /// Get a transaction by txid. This only returns `Some` for full, unconfirmed transactions.
+    // pub fn get_unconfirmed_tx<'g, C>(
+    //     &'g self,
+    //     txid: Txid,
+    //     chain: &'g C,
+    //     chain_tip: BlockId,
+    // ) -> Result<Option<&'g Transaction>, C::Error>
+    // where
+    //     A: Anchor,
+    //     C: ChainOracle,
+    // {
+    //     let tx_node = self.get_tx_node(txid).expect("tx must exist");
+    //     for block in tx_node.anchors.iter().map(Anchor::anchor_block) {
+    //         if chain.is_block_in_chain(block, chain_tip)? == Some(true) {
+    //             return Ok(None);
+    //         }
+    //     }
+    //     Ok(Some(tx_node.tx))
+    // }
 
     /// Get a transaction node by txid. This only returns `Some` for full transactions.
     pub fn get_tx_node(&self, txid: Txid) -> Option<TxNode<'_, Transaction, A>> {
@@ -697,8 +697,8 @@ impl<A: Anchor> TxGraph<A> {
     /// [`ChainOracle`] is infallible, [`get_chain_position`] can be used instead.
     ///
     /// [`get_chain_position`]: Self::get_chain_position
-    pub fn try_get_chain_position<C: ChainOracle>(
-        &self,
+    pub fn try_get_chain_position<'g, C: ChainOracle>(
+        &'g self,
         chain: &C,
         chain_tip: BlockId,
         txid: Txid,
@@ -725,25 +725,60 @@ impl<A: Anchor> TxGraph<A> {
             }
         };
 
-        // Populate a list of unconfirmed ancestor txs to check for conflicts
-        for tx in TxAncestors::new_include_root(self, tx, |_, tx: &Transaction| {
-            self.get_unconfirmed_tx(tx.txid(), chain, chain_tip)
-                .expect("error is infallible")
-        }) {
-            // If a conflicting tx is in the best chain, or has `last_seen` higher than this tx, then
-            // this tx cannot exist in the best chain
-            for conflicting_tx in self.walk_conflicts(tx, |_, txid| self.get_tx_node(txid)) {
-                for block in conflicting_tx.anchors.iter().map(A::anchor_block) {
-                    if chain.is_block_in_chain(block, chain_tip)? == Some(true) {
-                        // conflicting tx is in best chain, so the current tx cannot be in best chain!
-                        return Ok(None);
-                    }
+        let ancestor_txs = TxAncestors::new_include_root(
+            self,
+            tx,
+            |_, tx: &'g Transaction| -> Option<Result<&'g Transaction, C::Error>> {
+                // We want to only check unconfirmed transactions
+                // Exclude txs that are anchored in best chain
+                for anchor in self.get_tx_node(tx.txid())?.anchors {
+                    match chain.is_block_in_chain(anchor.anchor_block(), chain_tip) {
+                        Ok(Some(true)) => return None,
+                        Ok(_) => continue,
+                        Err(err) => return Some(Err(err)),
+                    };
                 }
-                if conflicting_tx.last_seen_unconfirmed > *last_seen {
+                Some(Ok(tx))
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+
+        let conflicting_txs = ancestor_txs
+            .into_iter()
+            .flat_map(|tx| self.walk_conflicts(tx, |_, txid| self.get_tx_node(txid)));
+
+        for conflicting_tx in conflicting_txs {
+            if conflicting_tx.last_seen_unconfirmed > *last_seen {
+                return Ok(None);
+            }
+            for conflicting_anchor in conflicting_tx.anchors {
+                if chain.is_block_in_chain(conflicting_anchor.anchor_block(), chain_tip)?
+                    == Some(true)
+                {
                     return Ok(None);
                 }
             }
         }
+
+        // // Populate a list of unconfirmed ancestor txs to check for conflicts
+        // for tx in TxAncestors::new_include_root(self, tx, |_, tx: &Transaction| {
+        //     self.get_unconfirmed_tx(tx.txid(), chain, chain_tip)
+        //         .expect("error is infallible")
+        // }) {
+        //     // If a conflicting tx is in the best chain, or has `last_seen` higher than this tx, then
+        //     // this tx cannot exist in the best chain
+        //     for conflicting_tx in self.walk_conflicts(tx, |_, txid| self.get_tx_node(txid)) {
+        //         for block in conflicting_tx.anchors.iter().map(A::anchor_block) {
+        //             if chain.is_block_in_chain(block, chain_tip)? == Some(true) {
+        //                 // conflicting tx is in best chain, so the current tx cannot be in best chain!
+        //                 return Ok(None);
+        //             }
+        //         }
+        //         if conflicting_tx.last_seen_unconfirmed > *last_seen {
+        //             return Ok(None);
+        //         }
+        //     }
+        // }
 
         Ok(Some(ChainPosition::Unconfirmed(*last_seen)))
     }

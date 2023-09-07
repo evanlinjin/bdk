@@ -1,6 +1,7 @@
 #[macro_use]
 mod common;
 use bdk_chain::tx_graph::CalculateFeeError;
+use bdk_chain::ChainOracle;
 use bdk_chain::{
     collections::*,
     local_chain::LocalChain,
@@ -655,20 +656,34 @@ fn test_walk_ancestors() {
         let _ = graph.insert_anchor(tx.txid(), tip.block_id());
     });
 
+    fn make_ancestor_filter_map<'g>(
+        graph: &'g TxGraph<BlockId>,
+        chain: &'g LocalChain,
+    ) -> impl Fn(usize, &'g Transaction) -> Option<&'g Transaction> {
+        let chain_tip = chain
+            .get_chain_tip()
+            .expect("error is infallible")
+            .expect("must exist");
+        move |_, tx: &'g Transaction| -> Option<&'g Transaction> {
+            for anchor in graph.get_tx_node(tx.txid())?.anchors {
+                match chain
+                    .is_block_in_chain(anchor.anchor_block(), chain_tip)
+                    .expect("error is infallible")
+                {
+                    Some(true) => return None,
+                    _ => continue,
+                };
+            }
+            Some(tx)
+        }
+    }
+
     let ancestors = [
         graph
-            .walk_ancestors(&tx_c0, |_, tx| {
-                graph
-                    .get_unconfirmed_tx(tx.txid(), &local_chain, tip.block_id())
-                    .expect("error is infallible")
-            })
+            .walk_ancestors(&tx_c0, make_ancestor_filter_map(&graph, &local_chain))
             .collect::<BTreeSet<_>>(),
         graph
-            .walk_ancestors(&tx_e0, |_, tx| {
-                graph
-                    .get_unconfirmed_tx(tx.txid(), &local_chain, tip.block_id())
-                    .expect("error is infallible")
-            })
+            .walk_ancestors(&tx_e0, make_ancestor_filter_map(&graph, &local_chain))
             .collect::<BTreeSet<_>>(),
         // Walk all ancestors of tx_d0
         graph
