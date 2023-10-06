@@ -56,12 +56,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (update_graph, last_active_indices) = client
         .scan_txs_with_keychains(keychain_spks, None, None, STOP_GAP, PARALLEL_REQUESTS)
         .await?;
+    let update = Update {
+        graph: update_graph,
+        ..Default::default()
+    };
+    wallet.apply_update(update)?;
+
     let missing_heights = wallet.tx_graph().missing_heights(wallet.local_chain());
     let chain_update = client.update_local_chain(prev_tip, missing_heights).await?;
     let update = Update {
         last_active_indices,
-        graph: update_graph,
         chain: Some(chain_update),
+        ..Default::default()
     };
     wallet.apply_update(update)?;
     wallet.commit()?;
