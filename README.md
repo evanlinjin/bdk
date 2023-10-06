@@ -93,6 +93,8 @@ cargo update -p zip:0.6.6 --precise "0.6.2"
 cargo update -p time --precise "0.3.13"
 # cc 1.0.82 has MSRV 1.61.0+
 cargo update -p cc --precise "1.0.81"
+# byteorder 1.5.0 has MSRV 1.60+
+cargo update -p byteorder --precise "1.4.3"
 ```
 
 ## License
