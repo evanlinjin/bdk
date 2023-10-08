@@ -113,6 +113,33 @@ pub struct Update {
     pub chain: Option<local_chain::Update>,
 }
 
+impl From<TxGraph<ConfirmationTimeAnchor>> for Update {
+    fn from(graph: TxGraph<ConfirmationTimeAnchor>) -> Self {
+        Self {
+            graph,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<BTreeMap<KeychainKind, u32>> for Update {
+    fn from(last_active_indices: BTreeMap<KeychainKind, u32>) -> Self {
+        Self {
+            last_active_indices,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<local_chain::Update> for Update {
+    fn from(chain: local_chain::Update) -> Self {
+        Self {
+            chain: Some(chain),
+            ..Default::default()
+        }
+    }
+}
+
 /// The changes made to a wallet by applying an [`Update`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct ChangeSet {
@@ -1916,10 +1943,13 @@ impl<D> Wallet<D> {
     /// transactions related to your wallet into it.
     ///
     /// [`commit`]: Self::commit
-    pub fn apply_update(&mut self, update: Update) -> Result<(), CannotConnectError>
+    pub fn apply_update<U>(&mut self, update: U) -> Result<(), CannotConnectError>
     where
+        U: Into<Update>,
         D: PersistBackend<ChangeSet>,
     {
+        let update = update.into();
+
         let mut changeset = match update.chain {
             Some(chain_update) => ChangeSet::from(self.chain.apply_update(chain_update)?),
             None => ChangeSet::default(),
@@ -1938,6 +1968,11 @@ impl<D> Wallet<D> {
 
         self.persist.stage(changeset);
         Ok(())
+    }
+
+    /// Get heights of missing checkpoints.
+    pub fn missing_checkpoints(&self) -> impl Iterator<Item = u32> + '_ {
+        self.tx_graph().missing_heights(self.local_chain())
     }
 
     /// Commits all currently [`staged`] changed to the persistence backend returning and error when
