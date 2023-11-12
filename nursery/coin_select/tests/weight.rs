@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use bdk_coin_select::{Candidate, CoinSelector, Drain};
+use bdk_coin_select::{Candidate, CoinSelector};
 use bitcoin::{absolute::Height, consensus::Decodable, Address, ScriptBuf, Transaction, TxOut};
 
 fn hex_val(c: u8) -> u8 {
@@ -43,16 +43,18 @@ fn segwit_one_input_one_output() {
         })
         .collect::<Vec<_>>();
 
-    let mut coin_selector = CoinSelector::new(&candidates, tx.weight().to_wu() as u32);
+    let target = bdk_coin_select::Target::new(
+        bdk_coin_select::FeeRate::default_min_relay_fee(),
+        tx.output.iter().map(|txo| (txo.weight() as u32, txo.value)),
+        core::iter::empty(),
+    );
+
+    let mut coin_selector = CoinSelector::new(&candidates, &target);
     coin_selector.select_all();
 
-    assert_eq!(coin_selector.weight(0), 449);
+    assert_eq!(coin_selector.weight(false), 449);
     assert_eq!(
-        (coin_selector
-            .implied_feerate(tx.output[0].value, Drain::none())
-            .as_sat_vb()
-            * 10.0)
-            .round(),
+        (coin_selector.implied_feerate(None).as_sat_vb() * 10.0).round(),
         60.2 * 10.0
     );
 }
@@ -77,16 +79,18 @@ fn segwit_two_inputs_one_output() {
         })
         .collect::<Vec<_>>();
 
-    let mut coin_selector = CoinSelector::new(&candidates, tx.weight().to_wu() as u32);
+    let target = bdk_coin_select::Target::new(
+        bdk_coin_select::FeeRate::default_min_relay_fee(),
+        tx.output.iter().map(|txo| (txo.weight() as u32, txo.value)),
+        core::iter::empty(),
+    );
+
+    let mut coin_selector = CoinSelector::new(&candidates, &target);
     coin_selector.select_all();
 
-    assert_eq!(coin_selector.weight(0), 721);
+    assert_eq!(coin_selector.weight(false), 721);
     assert_eq!(
-        (coin_selector
-            .implied_feerate(tx.output[0].value, Drain::none())
-            .as_sat_vb()
-            * 10.0)
-            .round(),
+        (coin_selector.implied_feerate(None).as_sat_vb() * 10.0).round(),
         58.1 * 10.0
     );
 }
@@ -111,16 +115,18 @@ fn legacy_three_inputs() {
         })
         .collect::<Vec<_>>();
 
-    let mut coin_selector = CoinSelector::new(&candidates, tx.weight().to_wu() as u32);
+    let target = bdk_coin_select::Target::new(
+        bdk_coin_select::FeeRate::default_min_relay_fee(),
+        tx.output.iter().map(|txo| (txo.weight() as u32, txo.value)),
+        core::iter::empty(),
+    );
+
+    let mut coin_selector = CoinSelector::new(&candidates, &target);
     coin_selector.select_all();
 
-    assert_eq!(coin_selector.weight(0), orig_weight.to_wu() as u32);
+    assert_eq!(coin_selector.weight(false), orig_weight.to_wu() as u32);
     assert_eq!(
-        (coin_selector
-            .implied_feerate(tx.output.iter().map(|o| o.value).sum(), Drain::none())
-            .as_sat_vb()
-            * 10.0)
-            .round(),
+        (coin_selector.implied_feerate(None).as_sat_vb() * 10.0).round(),
         99.2 * 10.0
     );
 }
@@ -160,10 +166,15 @@ fn legacy_three_inputs_one_segwit() {
         })
         .collect::<Vec<_>>();
 
-    let mut coin_selector = CoinSelector::new(&candidates, tx.weight().to_wu() as u32);
+    let target = bdk_coin_select::Target::new(
+        bdk_coin_select::FeeRate::default_min_relay_fee(),
+        tx.output.iter().map(|txo| (txo.weight() as u32, txo.value)),
+        core::iter::empty(),
+    );
+    let mut coin_selector = CoinSelector::new(&candidates, &target);
     coin_selector.select_all();
 
-    assert_eq!(coin_selector.weight(0), orig_weight.to_wu() as u32);
+    assert_eq!(coin_selector.weight(false), orig_weight.to_wu() as u32);
 }
 
 /// Ensure that `fund_outputs` caculates the same `base_weight` as `rust-bitcoin`.
@@ -183,8 +194,13 @@ fn fund_outputs() {
     let output_counts: &[usize] = &[0x01, 0xfd, 0x01_0000];
 
     for &output_count in output_counts {
-        let weight_from_fund_outputs =
-            CoinSelector::fund_outputs(&[], (0..=output_count).map(|_| txo_weight)).weight(0);
+        let target = bdk_coin_select::Target::new(
+            bdk_coin_select::FeeRate::default_min_relay_fee(),
+            (0..=output_count).map(|_| (txo_weight, txo.value)),
+            core::iter::empty(),
+        );
+
+        let weight_from_fund_outputs = CoinSelector::new(&[], &target).weight(false);
 
         let exp_weight = Transaction {
             version: 0,

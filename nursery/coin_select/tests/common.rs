@@ -3,8 +3,7 @@
 use std::any::type_name;
 
 use bdk_coin_select::{
-    float::Ordf32, BnbMetric, Candidate, CoinSelector, Drain, DrainWeights, FeeRate, NoBnbSolution,
-    Target,
+    float::Ordf32, BnbMetric, Candidate, CoinSelector, DrainWeights, FeeRate, NoBnbSolution, Target,
 };
 use proptest::{
     prelude::*,
@@ -25,7 +24,7 @@ pub fn can_eventually_find_best_solution<P, M>(
 ) -> Result<(), proptest::test_runner::TestCaseError>
 where
     M: BnbMetric,
-    P: Fn(&CoinSelector, Target) -> Drain,
+    P: Fn(&CoinSelector) -> Option<u64>,
 {
     println!("== TEST ==");
     println!("{}", type_name::<M>());
@@ -33,7 +32,7 @@ where
 
     let target = params.target();
 
-    let mut selection = CoinSelector::new(&candidates, params.base_weight);
+    let mut selection = CoinSelector::new(&candidates, &target);
     let mut exp_selection = selection.clone();
 
     if metric.requires_ordering_by_descending_value_pwu() {
@@ -44,7 +43,7 @@ where
     println!("\texhaustive search:");
     let now = std::time::Instant::now();
     let exp_result = exhaustive_search(&mut exp_selection, &mut metric);
-    let exp_change = change_policy(&exp_selection, target);
+    let exp_change = change_policy(&exp_selection);
     let exp_result_str = result_string(&exp_result.ok_or("no possible solution"), exp_change);
     println!(
         "\t\telapsed={:8}s result={}",
@@ -54,7 +53,7 @@ where
     // bonus check: ensure min_fee is respected
     if exp_result.is_some() {
         let selected_value = exp_selection.selected_value();
-        let drain_value = change_policy(&exp_selection, target).value;
+        let drain_value = change_policy(&exp_selection).unwrap_or(0);
         let target_value = target.value;
         assert!(selected_value - target_value - drain_value >= params.min_fee);
     }
@@ -62,7 +61,7 @@ where
     println!("\tbranch and bound:");
     let now = std::time::Instant::now();
     let result = bnb_search(&mut selection, metric, usize::MAX);
-    let change = change_policy(&selection, target);
+    let change = change_policy(&selection);
     let result_str = result_string(&result, change);
     println!(
         "\t\telapsed={:8}s result={}",
@@ -86,7 +85,7 @@ where
 
             // bonus check: ensure min_fee is respected
             let selected_value = selection.selected_value();
-            let drain_value = change_policy(&selection, target).value;
+            let drain_value = change_policy(&selection).unwrap_or(0);
             let target_value = target.value;
             assert!(selected_value - target_value - drain_value >= params.min_fee);
         }
@@ -108,7 +107,7 @@ pub fn ensure_bound_is_not_too_tight<P, M>(
 ) -> Result<(), proptest::test_runner::TestCaseError>
 where
     M: BnbMetric,
-    P: Fn(&CoinSelector, Target) -> Drain,
+    P: Fn(&CoinSelector) -> Option<u64>,
 {
     println!("== TEST ==");
     println!("{}", type_name::<M>());
@@ -117,7 +116,7 @@ where
     let target = params.target();
 
     let init_cs = {
-        let mut cs = CoinSelector::new(&candidates, params.base_weight);
+        let mut cs = CoinSelector::new(&candidates, &target);
         if metric.requires_ordering_by_descending_value_pwu() {
             cs.sort_candidates_by_descending_value_pwu();
         }
@@ -136,7 +135,7 @@ where
                     "checking branch: selection={} score={} change={} lb={}",
                     cs,
                     score,
-                    change_policy(&cs, target).is_some(),
+                    change_policy(&cs).is_some(),
                     lb_score
                 );
             }
@@ -154,11 +153,11 @@ where
                         descendant={:8} change={} score={}
                         ",
                         cs,
-                        change_policy(&cs, target).is_some(),
+                        change_policy(&cs).is_some(),
                         lb_score,
-                        cs.is_target_met(target, Drain::none()),
+                        cs.is_target_met(None),
                         descendant_cs,
-                        change_policy(&descendant_cs, target).is_some(),
+                        change_policy(&descendant_cs).is_some(),
                         descendant_score,
                     );
                 }
@@ -187,6 +186,11 @@ impl StrategyParams {
             feerate: self.feerate(),
             min_fee: self.min_fee,
             value: self.target_value,
+            base_weight: self.base_weight,
+            drain_weights: DrainWeights {
+                output_weight: self.drain_weight,
+                spend_weight: self.drain_spend_weight,
+            },
         }
     }
 
@@ -341,7 +345,7 @@ where
     Ok((score, rounds))
 }
 
-pub fn result_string<E>(res: &Result<(Ordf32, usize), E>, change: Drain) -> String
+pub fn result_string<E>(res: &Result<(Ordf32, usize), E>, change: Option<u64>) -> String
 where
     E: std::fmt::Debug,
 {

@@ -1,5 +1,5 @@
 use super::change_lower_bound;
-use crate::{bnb::BnbMetric, float::Ordf32, Candidate, CoinSelector, Drain, FeeRate, Target};
+use crate::{bnb::BnbMetric, float::Ordf32, Candidate, CoinSelector, FeeRate};
 
 /// The "waste" metric used by bitcoin core.
 ///
@@ -19,8 +19,6 @@ use crate::{bnb::BnbMetric, float::Ordf32, Candidate, CoinSelector, Drain, FeeRa
 /// If the `long_term_feerate` is even slightly higher than the current feerate (specified in
 /// `target`) it will select all your coins!
 pub struct Waste<'c, C> {
-    /// The target parameters of the resultant selection.
-    pub target: Target,
     /// The longterm feerate as part of the waste metric.
     pub long_term_feerate: FeeRate,
     /// Policy to determine the change output (if any) of a given selection.
@@ -37,14 +35,14 @@ impl<'c, C> Copy for Waste<'c, C> {}
 
 impl<'c, C> BnbMetric for Waste<'c, C>
 where
-    for<'a, 'b> C: Fn(&'b CoinSelector<'a>, Target) -> Drain,
+    for<'a, 'b> C: Fn(&'b CoinSelector<'a>) -> Option<u64>,
 {
     fn score(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32> {
-        let drain = (self.change_policy)(cs, self.target);
-        if !cs.is_target_met(self.target, drain) {
+        let drain_value = (self.change_policy)(cs);
+        if !cs.is_target_met(drain_value) {
             return None;
         }
-        let score = cs.waste(self.target, self.long_term_feerate, drain, 1.0);
+        let score = cs.waste(self.long_term_feerate, drain_value, 1.0);
         Some(Ordf32(score))
     }
 
@@ -57,24 +55,20 @@ where
         //
         // Don't be afraid. This function is a "heuristic" lower bound. It doesn't need to be super
         // duper correct. In testing it seems to come up with pretty good results pretty fast.
-        let rate_diff = self.target.feerate.spwu() - self.long_term_feerate.spwu();
+        let rate_diff = cs.target.feerate.spwu() - self.long_term_feerate.spwu();
         // whether from this coin selection it's possible to avoid change
-        let change_lower_bound = change_lower_bound(cs, self.target, &self.change_policy);
+        let change_lower_bound = change_lower_bound(cs, &self.change_policy);
         const IGNORE_EXCESS: f32 = 0.0;
         const INCLUDE_EXCESS: f32 = 1.0;
 
         if rate_diff >= 0.0 {
             // Our lower bound algorithms differ depending on whether we have already met the target or not.
-            if cs.is_target_met(self.target, change_lower_bound) {
-                let current_change = (self.change_policy)(cs, self.target);
+            if cs.is_target_met(change_lower_bound) {
+                let current_change = (self.change_policy)(cs);
 
                 // first lower bound candidate is just the selection itself
-                let mut lower_bound = cs.waste(
-                    self.target,
-                    self.long_term_feerate,
-                    current_change,
-                    INCLUDE_EXCESS,
-                );
+                let mut lower_bound =
+                    cs.waste(self.long_term_feerate, current_change, INCLUDE_EXCESS);
 
                 // But don't stop there we might be able to select negative value inputs which might
                 // lower excess and reduce waste either by:
@@ -88,15 +82,14 @@ where
                         .select_iter()
                         .rev()
                         .take_while(|(cs, _, wv)| {
-                            wv.effective_value(self.target.feerate).0 < 0.0
-                                && cs.is_target_met(self.target, Drain::none())
+                            wv.effective_value(cs.target.feerate).0 < 0.0 && cs.is_target_met(None)
                         })
                         .last();
 
                     if let Some((cs, _, _)) = selection_with_as_much_negative_ev_as_possible {
                         let can_do_better_by_slurping =
                             cs.unselected().next_back().and_then(|(_, wv)| {
-                                if wv.effective_value(self.target.feerate).0 < 0.0 {
+                                if wv.effective_value(cs.target.feerate).0 < 0.0 {
                                     Some(wv)
                                 } else {
                                     None
@@ -106,25 +99,16 @@ where
                             Some(finishing_input) => {
                                 // NOTE we are slurping negative value here to try and reduce excess in
                                 // the hopes of getting rid of the change output
-                                let value_to_slurp = -cs.rate_excess(self.target, Drain::none());
+                                let value_to_slurp = -cs.rate_excess(None);
                                 let weight_to_extinguish_excess =
-                                    slurp_wv(finishing_input, value_to_slurp, self.target.feerate);
+                                    slurp_wv(finishing_input, value_to_slurp, cs.target.feerate);
                                 let waste_to_extinguish_excess =
                                     weight_to_extinguish_excess * rate_diff;
                                 // return: waste after excess reduction
-                                cs.waste(
-                                    self.target,
-                                    self.long_term_feerate,
-                                    Drain::none(),
-                                    IGNORE_EXCESS,
-                                ) + waste_to_extinguish_excess
+                                cs.waste(self.long_term_feerate, None, IGNORE_EXCESS)
+                                    + waste_to_extinguish_excess
                             }
-                            None => cs.waste(
-                                self.target,
-                                self.long_term_feerate,
-                                Drain::none(),
-                                INCLUDE_EXCESS,
-                            ),
+                            None => cs.waste(self.long_term_feerate, None, INCLUDE_EXCESS),
                         };
 
                         lower_bound = lower_bound.min(lower_bound_without_change);
@@ -144,7 +128,7 @@ where
                 let (mut cs, slurp_index, to_slurp) = cs
                     .clone()
                     .select_iter()
-                    .find(|(cs, _, _)| cs.is_target_met(self.target, change_lower_bound))?;
+                    .find(|(cs, _, _)| cs.is_target_met(change_lower_bound))?;
 
                 cs.deselect(slurp_index);
 
@@ -154,14 +138,14 @@ where
                 let ideal_next_weight = {
                     // satisfying absolute and feerate constraints requires different calculations so we do them
                     // both independently and find which requires the most weight of the next input.
-                    let remaining_rate = cs.rate_excess(self.target, change_lower_bound);
-                    let remaining_abs = cs.absolute_excess(self.target, change_lower_bound);
+                    let remaining_rate = cs.rate_excess(change_lower_bound);
+                    let remaining_abs = cs.absolute_excess(change_lower_bound.unwrap_or(0));
 
                     let weight_to_satisfy_abs =
                         remaining_abs.min(0) as f32 / to_slurp.value_pwu().0;
 
                     let weight_to_satisfy_rate =
-                        slurp_wv(to_slurp, remaining_rate.min(0), self.target.feerate);
+                        slurp_wv(to_slurp, remaining_rate.min(0), cs.target.feerate);
 
                     let weight_to_satisfy = weight_to_satisfy_abs.max(weight_to_satisfy_rate);
                     debug_assert!(weight_to_satisfy <= to_slurp.weight as f32);
@@ -169,7 +153,10 @@ where
                 };
                 let weight_lower_bound = cs.input_weight() as f32 + ideal_next_weight;
                 let mut waste = weight_lower_bound * rate_diff;
-                waste += change_lower_bound.waste(self.target.feerate, self.long_term_feerate);
+                waste += cs
+                    .target
+                    .drain_weights
+                    .waste(cs.target.feerate, self.long_term_feerate);
 
                 Some(Ordf32(waste))
             }
@@ -184,16 +171,15 @@ where
             let mut lower_bound = {
                 let mut cs = cs.clone();
                 // ... but first check that by selecting all effective we can actually reach target
-                cs.select_all_effective(self.target.feerate);
-                if !cs.is_target_met(self.target, Drain::none()) {
+                cs.select_all_effective();
+                if !cs.is_target_met(None) {
                     return None;
                 }
-                let change_at_value_optimum = (self.change_policy)(&cs, self.target);
+                let change_at_value_optimum = (self.change_policy)(&cs);
                 cs.select_all();
                 // NOTE: we use the change from our "all effective" selection for min waste since
                 // selecting all might not have change but in that case we'll catch it below.
                 cs.waste(
-                    self.target,
                     self.long_term_feerate,
                     change_at_value_optimum,
                     IGNORE_EXCESS,
@@ -209,18 +195,13 @@ where
                     .select_iter()
                     .rev()
                     .take_while(|(cs, _, wv)| {
-                        wv.effective_value(self.target.feerate).0 < 0.0
-                            || (self.change_policy)(cs, self.target).is_none()
+                        wv.effective_value(cs.target.feerate).0 < 0.0
+                            || (self.change_policy)(cs).is_none()
                     })
                     .last();
 
                 if let Some((cs, _, _)) = highest_weight_selection_without_change {
-                    let no_change_waste = cs.waste(
-                        self.target,
-                        self.long_term_feerate,
-                        Drain::none(),
-                        IGNORE_EXCESS,
-                    );
+                    let no_change_waste = cs.waste(self.long_term_feerate, None, IGNORE_EXCESS);
 
                     lower_bound = lower_bound.min(no_change_waste)
                 }

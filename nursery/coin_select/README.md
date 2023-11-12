@@ -6,13 +6,24 @@
 ## Synopsis
 
 ```rust
-use bdk_coin_select::{CoinSelector, Candidate, TXIN_BASE_WEIGHT};
-use bitcoin::{ Transaction, TxIn };
+use std::str::FromStr;
+use bdk_coin_select::{
+    CoinSelector,
+    Candidate,
+    DrainWeights,
+    FeeRate,
+    Target,
+    TR_SPK_WEIGHT,
+    TXIN_BASE_WEIGHT,
+    TXOUT_BASE_WEIGHT,
+};
+use bitcoin::{ address::NetworkUnchecked, Address, Network, Transaction, TxIn, TxOut };
 
 // You should use miniscript to figure out the satisfaction weight for your coins!
 const TR_SATISFACTION_WEIGHT: u32 = 66;
 const TR_INPUT_WEIGHT: u32 = TXIN_BASE_WEIGHT + TR_SATISFACTION_WEIGHT;
-
+const RECIPIENT_ADDRESS_STR: &'static str = "32iVBEu4dxkUQk9dJbZUiBiQdmypcEyJRf";
+const CHANGE_ADDRESS_STR: &'static str = "132F25rTsvBdp9JzLLBHP5mvGY66i1xdiM";
 
 let candidates = vec![
     Candidate {
@@ -43,14 +54,23 @@ let candidates = vec![
     }
 ];
 
-let base_weight = Transaction {
-    input: vec![],
-    output: vec![],
-    lock_time: bitcoin::absolute::LockTime::from_height(0).unwrap(),
-    version: 1,
-}.weight().to_wu() as u32;
+let recipient = TxOut {
+    script_pubkey: Address::from_str(RECIPIENT_ADDRESS_STR)
+        .unwrap()
+        .require_network(Network::Bitcoin)
+        .unwrap()
+        .script_pubkey(),
+    value: 2_000_000,
+};
 
-println!("base weight: {}", base_weight);
+let target = Target::new(
+    FeeRate::default_min_relay_fee(),
+    core::iter::once((recipient.weight() as u32, recipient.value)),
+    core::iter::once(DrainWeights {
+        output_weight: TXOUT_BASE_WEIGHT + TR_SPK_WEIGHT,
+        spend_weight: TXIN_BASE_WEIGHT + TR_SATISFACTION_WEIGHT,
+    }),
+);
 
-let mut coin_selector = CoinSelector::new(&candidates,base_weight);
+let mut coin_selector = CoinSelector::new(&candidates, &target);
 ```

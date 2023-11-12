@@ -1,6 +1,6 @@
 //! Branch and bound metrics that can be passed to [`CoinSelector::bnb_solutions`] or
 //! [`CoinSelector::run_bnb`].
-use crate::{bnb::BnbMetric, float::Ordf32, CoinSelector, Drain, Target};
+use crate::{bnb::BnbMetric, float::Ordf32, CoinSelector};
 mod waste;
 pub use waste::*;
 mod lowest_fee;
@@ -18,23 +18,21 @@ pub use changeless::*;
 // effective value candidates are next to each other.
 fn change_lower_bound<'a>(
     cs: &CoinSelector<'a>,
-    target: Target,
-    change_policy: &impl Fn(&CoinSelector<'a>, Target) -> Drain,
-) -> Drain {
-    let has_change_now = change_policy(cs, target).is_some();
+    change_policy: &impl Fn(&CoinSelector<'a>) -> Option<u64>,
+) -> Option<u64> {
+    let has_change_now = change_policy(cs).is_some();
 
     if has_change_now {
         let mut least_excess = cs.clone();
         cs.unselected()
             .rev()
-            .take_while(|(_, wv)| wv.effective_value(target.feerate) < Ordf32(0.0))
+            .take_while(|(_, wv)| wv.effective_value(cs.target.feerate) < Ordf32(0.0))
             .for_each(|(index, _)| {
                 least_excess.select(index);
             });
-
-        change_policy(&least_excess, target)
+        change_policy(&least_excess)
     } else {
-        Drain::none()
+        None
     }
 }
 

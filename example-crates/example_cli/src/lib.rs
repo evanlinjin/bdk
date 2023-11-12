@@ -261,41 +261,64 @@ where
         }],
     };
 
-    let target = bdk_coin_select::Target {
-        feerate: bdk_coin_select::FeeRate::from_sat_per_vb(2.0),
-        min_fee: 0,
-        value: transaction.output.iter().map(|txo| txo.value).sum(),
-    };
+    let target = bdk_coin_select::Target::new(
+        bdk_coin_select::FeeRate::from_sat_per_vb(2.0),
+        transaction
+            .output
+            .iter()
+            .map(|txo| (txo.weight() as u32, txo.value)),
+        core::iter::once(bdk_coin_select::DrainWeights {
+            output_weight: {
+                // we calculate the weight difference of including the drain output in the base tx
+                // this method will detect varint size changes of txout count
+                let tx_weight = transaction.weight();
+                let tx_weight_with_drain = {
+                    let mut tx = transaction.clone();
+                    tx.output.push(TxOut {
+                        script_pubkey: change_script.clone(),
+                        ..Default::default()
+                    });
+                    tx.weight()
+                };
+                (tx_weight_with_drain - tx_weight).to_wu() as u32 - 1
+            },
+            spend_weight: change_plan.expected_weight() as u32,
+        }),
+    );
+    // let target = bdk_coin_select::Target {
+    //     feerate: bdk_coin_select::FeeRate::from_sat_per_vb(2.0),
+    //     min_fee: 0,
+    //     value: transaction.output.iter().map(|txo| txo.value).sum(),
+    // };
 
-    let drain_weights = bdk_coin_select::DrainWeights {
-        output_weight: {
-            // we calculate the weight difference of including the drain output in the base tx
-            // this method will detect varint size changes of txout count
-            let tx_weight = transaction.weight();
-            let tx_weight_with_drain = {
-                let mut tx = transaction.clone();
-                tx.output.push(TxOut {
-                    script_pubkey: change_script.clone(),
-                    ..Default::default()
-                });
-                tx.weight()
-            };
-            (tx_weight_with_drain - tx_weight).to_wu() as u32 - 1
-        },
-        spend_weight: change_plan.expected_weight() as u32,
-    };
+    // let drain_weights = bdk_coin_select::DrainWeights {
+    //     output_weight: {
+    //         // we calculate the weight difference of including the drain output in the base tx
+    //         // this method will detect varint size changes of txout count
+    //         let tx_weight = transaction.weight();
+    //         let tx_weight_with_drain = {
+    //             let mut tx = transaction.clone();
+    //             tx.output.push(TxOut {
+    //                 script_pubkey: change_script.clone(),
+    //                 ..Default::default()
+    //             });
+    //             tx.weight()
+    //         };
+    //         (tx_weight_with_drain - tx_weight).to_wu() as u32 - 1
+    //     },
+    //     spend_weight: change_plan.expected_weight() as u32,
+    // };
+
     let long_term_feerate = bdk_coin_select::FeeRate::from_sat_per_vb(5.0);
     let drain_policy = bdk_coin_select::change_policy::min_value_and_waste(
-        drain_weights,
         change_script.dust_value().to_sat(),
         long_term_feerate,
     );
 
-    let mut selector = CoinSelector::new(&candidates, transaction.weight().to_wu() as u32);
+    let mut selector = CoinSelector::new(&candidates, &target);
     match cs_algorithm {
         CoinSelectionAlgo::BranchAndBound => {
             let metric = bdk_coin_select::metrics::Waste {
-                target,
                 long_term_feerate,
                 change_policy: &drain_policy,
             };
@@ -319,20 +342,26 @@ where
     };
 
     // ensure target is met
-    selector.select_until_target_met(target, drain_policy(&selector, target))?;
+    selector.select_until_target_met(drain_policy(&selector))?;
 
     // get the selected utxos
     let selected_txos = selector
         .apply_selection(&raw_candidates)
         .collect::<Vec<_>>();
 
-    let drain = drain_policy(&selector, target);
-    if drain.is_some() {
+    let drain = drain_policy(&selector);
+    if let Some(value) = drain {
         transaction.output.push(TxOut {
-            value: drain.value,
+            value,
             script_pubkey: change_script,
         });
     }
+    // if drain.is_some() {
+    //     transaction.output.push(TxOut {
+    //         value: drain.value,
+    //         script_pubkey: change_script,
+    //     });
+    // }
 
     // fill transaction inputs
     transaction.input = selected_txos

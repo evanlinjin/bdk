@@ -1,6 +1,5 @@
 use crate::{
-    float::Ordf32, metrics::change_lower_bound, BnbMetric, Candidate, CoinSelector, Drain,
-    DrainWeights, FeeRate, Target,
+    float::Ordf32, metrics::change_lower_bound, BnbMetric, Candidate, CoinSelector, FeeRate, Target,
 };
 
 /// Metric that aims to minimize transaction fees. The future fee for spending the change output is
@@ -30,73 +29,65 @@ impl<'c, C> Copy for LowestFee<'c, C> {}
 
 impl<'c, C> LowestFee<'c, C>
 where
-    for<'a, 'b> C: Fn(&'b CoinSelector<'a>, Target) -> Drain,
+    for<'a, 'b> C: Fn(&'b CoinSelector<'a>) -> Option<u64>,
 {
-    fn calc_metric(&self, cs: &CoinSelector<'_>, drain_weights: Option<DrainWeights>) -> f32 {
-        self.calc_metric_lb(cs, drain_weights)
-            + match drain_weights {
-                Some(_) => {
-                    let selected_value = cs.selected_value();
-                    assert!(selected_value >= self.target.value);
-                    (cs.selected_value() - self.target.value) as f32
-                }
-                None => 0.0,
+    fn calc_metric(&self, cs: &CoinSelector<'_>, include_drain: bool) -> f32 {
+        self.calc_metric_lb(cs, include_drain)
+            + if include_drain {
+                let selected_value = cs.selected_value();
+                assert!(selected_value >= self.target.value);
+                (cs.selected_value() - self.target.value) as f32
+            } else {
+                0.0
             }
     }
 
-    fn calc_metric_lb(&self, cs: &CoinSelector<'_>, drain_weights: Option<DrainWeights>) -> f32 {
-        match drain_weights {
+    fn calc_metric_lb(&self, cs: &CoinSelector<'_>, include_drain: bool) -> f32 {
+        let drain_weights = &cs.target.drain_weights;
+        if include_drain {
             // with change
-            Some(drain_weights) => {
-                (cs.input_weight() + drain_weights.output_weight) as f32
-                    * self.target.feerate.spwu()
-                    + drain_weights.spend_weight as f32 * self.long_term_feerate.spwu()
-            }
+            (cs.input_weight() + drain_weights.output_weight) as f32 * self.target.feerate.spwu()
+                + drain_weights.spend_weight as f32 * self.long_term_feerate.spwu()
+        } else {
             // changeless
-            None => cs.input_weight() as f32 * self.target.feerate.spwu(),
+            cs.input_weight() as f32 * self.target.feerate.spwu()
         }
     }
 }
 
 impl<'c, C> BnbMetric for LowestFee<'c, C>
 where
-    for<'a, 'b> C: Fn(&'b CoinSelector<'a>, Target) -> Drain,
+    for<'a, 'b> C: Fn(&'b CoinSelector<'a>) -> Option<u64>,
 {
     fn score(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32> {
-        let drain = (self.change_policy)(cs, self.target);
-        if !cs.is_target_met(self.target, drain) {
+        let drain_value = (self.change_policy)(cs);
+        if !cs.is_target_met(drain_value) {
             return None;
         }
 
-        let drain_weights = if drain.is_some() {
-            Some(drain.weights)
-        } else {
-            None
-        };
-
-        Some(Ordf32(self.calc_metric(cs, drain_weights)))
+        Some(Ordf32(self.calc_metric(cs, drain_value.is_some())))
     }
 
     fn bound(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32> {
         // this either returns:
         // * None: change output may or may not exist
         // * Some: change output must exist from this branch onwards
-        let change_lb = change_lower_bound(cs, self.target, &self.change_policy);
-        let change_lb_weights = if change_lb.is_some() {
-            Some(change_lb.weights)
-        } else {
-            None
-        };
+        let change_lb = change_lower_bound(cs, &self.change_policy);
+        // let change_lb_weights = if change_lb.is_some() {
+        //     Some(change_lb.weights)
+        // } else {
+        //     None
+        // };
         // println!("\tchange lb: {:?}", change_lb_weights);
 
-        if cs.is_target_met(self.target, change_lb) {
+        if cs.is_target_met(change_lb) {
             // Target is met, is it possible to add further inputs to remove drain output?
             // If we do, can we get a better score?
 
             // First lower bound candidate is just the selection itself (include excess).
-            let mut lower_bound = self.calc_metric(cs, change_lb_weights);
+            let mut lower_bound = self.calc_metric(cs, change_lb.is_some());
 
-            if change_lb_weights.is_none() {
+            if change_lb.is_none() {
                 // Since a changeless solution may exist, we should try minimize the excess with by
                 // adding as much -ev candidates as possible
                 let selection_with_as_much_negative_ev_as_possible = cs
@@ -105,7 +96,7 @@ where
                     .rev()
                     .take_while(|(cs, _, candidate)| {
                         candidate.effective_value(self.target.feerate).0 < 0.0
-                            && cs.is_target_met(self.target, Drain::none())
+                            && cs.is_target_met(None)
                     })
                     .last()
                     .map(|(cs, _, _)| cs);
@@ -123,7 +114,7 @@ where
                         });
                     let lower_bound_changeless = match can_do_better_by_slurping {
                         Some(finishing_input) => {
-                            let excess = cs.rate_excess(self.target, Drain::none());
+                            let excess = cs.rate_excess(None);
 
                             // change the input's weight to make it's effective value match the excess
                             let perfect_input_weight = slurp(self.target, excess, finishing_input);
@@ -131,7 +122,7 @@ where
                             (cs.input_weight() as f32 + perfect_input_weight)
                                 * self.target.feerate.spwu()
                         }
-                        None => self.calc_metric(&cs, None),
+                        None => self.calc_metric(&cs, false),
                     };
 
                     lower_bound = lower_bound.min(lower_bound_changeless)
@@ -146,15 +137,15 @@ where
         let (mut cs, slurp_index, candidate_to_slurp) = cs
             .clone()
             .select_iter()
-            .find(|(cs, _, _)| cs.is_target_met(self.target, change_lb))?;
+            .find(|(cs, _, _)| cs.is_target_met(change_lb))?;
         cs.deselect(slurp_index);
 
-        let mut lower_bound = self.calc_metric_lb(&cs, change_lb_weights);
+        let mut lower_bound = self.calc_metric_lb(&cs, change_lb.is_some());
 
         // find the max excess we need to rid of
         let perfect_excess = i64::max(
-            cs.rate_excess(self.target, Drain::none()),
-            cs.absolute_excess(self.target, Drain::none()),
+            cs.rate_excess(None),
+            cs.absolute_excess(change_lb.unwrap_or(0)),
         );
         // use the highest excess to find "perfect candidate weight"
         let perfect_input_weight = slurp(self.target, perfect_excess, candidate_to_slurp);

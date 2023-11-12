@@ -46,18 +46,20 @@ proptest! {
             spend_weight: change_spend_weight,
         };
 
-        let change_policy = bdk_coin_select::change_policy::min_waste(drain, long_term_feerate);
+        let change_policy = bdk_coin_select::change_policy::min_waste(long_term_feerate);
         let wv = test_wv(&mut rng);
         let candidates = wv.take(num_inputs).collect::<Vec<_>>();
         println!("candidates: {:#?}", candidates);
 
-        let cs = CoinSelector::new(&candidates, base_weight);
-
         let target = Target {
             value: target,
             feerate,
-            min_fee
+            min_fee,
+            base_weight,
+            drain_weights: drain,
         };
+
+        let cs = CoinSelector::new(&candidates, &target);
 
         let solutions = cs.bnb_solutions(metrics::Changeless {
             target,
@@ -78,16 +80,16 @@ proptest! {
                         let mut naive_select = cs.clone();
                         naive_select.sort_candidates_by_key(|(_, wv)| core::cmp::Reverse(wv.effective_value(target.feerate)));
                         // we filter out failing onces below
-                        let _ = naive_select.select_until_target_met(target, Drain { weights: drain, value: 0 });
+                        let _ = naive_select.select_until_target_met(Some(0));
                         naive_select
                     },
                 ];
 
                 cmp_benchmarks.extend((0..10).map(|_|random_minimal_selection(&cs, target, long_term_feerate, &change_policy, &mut rng)));
 
-                let cmp_benchmarks = cmp_benchmarks.into_iter().filter(|cs| cs.is_target_met(target, change_policy(&cs, target)));
+                let cmp_benchmarks = cmp_benchmarks.into_iter().filter(|cs| cs.is_target_met(change_policy(&cs)));
                 for (_bench_id, bench) in cmp_benchmarks.enumerate() {
-                    prop_assert!(change_policy(&bench, target).is_some() >=  change_policy(&sol, target).is_some());
+                    prop_assert!(change_policy(&bench).is_some() >=  change_policy(&sol).is_some());
                 }
             }
             None => {
@@ -107,14 +109,14 @@ fn random_minimal_selection<'a>(
     cs: &CoinSelector<'a>,
     target: Target,
     long_term_feerate: FeeRate,
-    change_policy: &impl Fn(&CoinSelector, Target) -> Drain,
+    change_policy: &impl Fn(&CoinSelector) -> Option<u64>,
     rng: &mut impl RngCore,
 ) -> CoinSelector<'a> {
     let mut cs = cs.clone();
     let mut last_waste: Option<f32> = None;
     while let Some(next) = cs.unselected_indices().choose(rng) {
         cs.select(next);
-        if cs.is_target_met(target, change_policy(&cs, target)) {
+        if cs.is_target_met(change_policy(&cs)) {
             break;
         }
     }
