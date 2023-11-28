@@ -156,6 +156,8 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     /// # Panics
     ///
     /// This will panic if a different `descriptor` is introduced to the same `keychain`.
+    ///
+    /// [`add_keychain_with_lookahead`]: Self::add_keychain_with_lookahead
     pub fn add_keychain(&mut self, keychain: K, descriptor: Descriptor<DescriptorPublicKey>) {
         let old_descriptor = &*self
             .keychains
