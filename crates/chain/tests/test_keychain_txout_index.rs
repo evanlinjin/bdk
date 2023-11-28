@@ -18,7 +18,10 @@ enum TestKeychain {
     Internal,
 }
 
-fn init_txout_index() -> (
+fn init_txout_index(
+    internal_lookahead: u32,
+    external_lookahead: u32,
+) -> (
     bdk_chain::keychain::KeychainTxOutIndex<TestKeychain>,
     Descriptor<DescriptorPublicKey>,
     Descriptor<DescriptorPublicKey>,
@@ -29,8 +32,16 @@ fn init_txout_index() -> (
     let (external_descriptor,_) = Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, "tr([73c5da0a/86'/0'/0']xprv9xgqHN7yz9MwCkxsBPN5qetuNdQSUttZNKw1dcYTV4mkaAFiBVGQziHs3NRSWMkCzvgjEe3n9xV8oYywvM8at9yRqyaZVz6TYYhX98VjsUk/0/*)").unwrap();
     let (internal_descriptor,_) = Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, "tr([73c5da0a/86'/0'/0']xprv9xgqHN7yz9MwCkxsBPN5qetuNdQSUttZNKw1dcYTV4mkaAFiBVGQziHs3NRSWMkCzvgjEe3n9xV8oYywvM8at9yRqyaZVz6TYYhX98VjsUk/1/*)").unwrap();
 
-    txout_index.add_keychain(TestKeychain::External, external_descriptor.clone());
-    txout_index.add_keychain(TestKeychain::Internal, internal_descriptor.clone());
+    txout_index.add_keychain_with_lookahead(
+        TestKeychain::External,
+        external_descriptor.clone(),
+        internal_lookahead,
+    );
+    txout_index.add_keychain_with_lookahead(
+        TestKeychain::Internal,
+        internal_descriptor.clone(),
+        external_lookahead,
+    );
 
     (txout_index, external_descriptor, internal_descriptor)
 }
@@ -46,7 +57,7 @@ fn spk_at_index(descriptor: &Descriptor<DescriptorPublicKey>, index: u32) -> Scr
 fn test_set_all_derivation_indices() {
     use bdk_chain::indexed_tx_graph::Indexer;
 
-    let (mut txout_index, _, _) = init_txout_index();
+    let (mut txout_index, _, _) = init_txout_index(0, 0);
     let derive_to: BTreeMap<_, _> =
         [(TestKeychain::External, 12), (TestKeychain::Internal, 24)].into();
     assert_eq!(
@@ -64,15 +75,7 @@ fn test_set_all_derivation_indices() {
 
 #[test]
 fn test_lookahead() {
-    let (mut txout_index, external_desc, internal_desc) = init_txout_index();
-
-    // ensure it does not break anything if lookahead is set multiple times
-    (0..=10).for_each(|lookahead| txout_index.set_lookahead(&TestKeychain::External, lookahead));
-    (0..=20)
-        .filter(|v| v % 2 == 0)
-        .for_each(|lookahead| txout_index.set_lookahead(&TestKeychain::Internal, lookahead));
-
-    assert_eq!(txout_index.inner().all_spks().len(), 30);
+    let (mut txout_index, external_desc, internal_desc) = init_txout_index(10, 20);
 
     // given:
     // - external lookahead set to 10
@@ -226,8 +229,7 @@ fn test_lookahead() {
 // - last used index should change as expected
 #[test]
 fn test_scan_with_lookahead() {
-    let (mut txout_index, external_desc, _) = init_txout_index();
-    txout_index.set_lookahead_for_all(10);
+    let (mut txout_index, external_desc, _) = init_txout_index(10, 10);
 
     let spks: BTreeMap<u32, ScriptBuf> = [0, 10, 20, 30]
         .into_iter()
@@ -281,7 +283,7 @@ fn test_scan_with_lookahead() {
 #[test]
 #[rustfmt::skip]
 fn test_wildcard_derivations() {
-    let (mut txout_index, external_desc, _) = init_txout_index();
+    let (mut txout_index, external_desc, _) = init_txout_index(0, 0);
     let external_spk_0 = external_desc.at_derivation_index(0).unwrap().script_pubkey();
     let external_spk_16 = external_desc.at_derivation_index(16).unwrap().script_pubkey();
     let external_spk_26 = external_desc.at_derivation_index(26).unwrap().script_pubkey();
@@ -348,7 +350,7 @@ fn test_non_wildcard_derivations() {
         .unwrap()
         .script_pubkey();
 
-    txout_index.add_keychain(TestKeychain::External, no_wildcard_descriptor);
+    txout_index.add_keychain_with_lookahead(TestKeychain::External, no_wildcard_descriptor, 0);
 
     // given:
     // - `txout_index` with no stored scripts

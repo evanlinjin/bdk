@@ -11,6 +11,8 @@ use core::{fmt::Debug, ops::Deref};
 
 use crate::Append;
 
+const DEFAULT_LOOKAHEAD: u32 = 1_000;
+
 /// A convenient wrapper around [`SpkTxOutIndex`] that relates script pubkeys to miniscript public
 /// [`Descriptor`]s.
 ///
@@ -46,7 +48,7 @@ use crate::Append;
 /// # let secp = bdk_chain::bitcoin::secp256k1::Secp256k1::signing_only();
 /// # let (external_descriptor,_) = Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, "tr([73c5da0a/86'/0'/0']xprv9xgqHN7yz9MwCkxsBPN5qetuNdQSUttZNKw1dcYTV4mkaAFiBVGQziHs3NRSWMkCzvgjEe3n9xV8oYywvM8at9yRqyaZVz6TYYhX98VjsUk/0/*)").unwrap();
 /// # let (internal_descriptor,_) = Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, "tr([73c5da0a/86'/0'/0']xprv9xgqHN7yz9MwCkxsBPN5qetuNdQSUttZNKw1dcYTV4mkaAFiBVGQziHs3NRSWMkCzvgjEe3n9xV8oYywvM8at9yRqyaZVz6TYYhX98VjsUk/1/*)").unwrap();
-/// # let descriptor_for_user_42 = external_descriptor.clone();
+/// # let (descriptor_for_user_42, _) = Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, "tr([73c5da0a/86'/0'/0']xprv9xgqHN7yz9MwCkxsBPN5qetuNdQSUttZNKw1dcYTV4mkaAFiBVGQziHs3NRSWMkCzvgjEe3n9xV8oYywvM8at9yRqyaZVz6TYYhX98VjsUk/2/*)").unwrap();
 /// txout_index.add_keychain(MyKeychain::External, external_descriptor);
 /// txout_index.add_keychain(MyKeychain::Internal, internal_descriptor);
 /// txout_index.add_keychain(MyKeychain::MyAppUser { user_id: 42 }, descriptor_for_user_42);
@@ -134,23 +136,48 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
         &self.keychains
     }
 
+    /// Add a keychain to the tracker's `txout_index` with a descriptor to derive addresses and a
+    /// default lookahead of `1_000`.
+    ///
+    /// See [`add_keychain_with_lookahead`] for details.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if a different `descriptor` is introduced to the same `keychain`.
+    ///
+    /// [`add_keychain_with_lookahead`]: Self::add_keychain_with_lookahead
+    pub fn add_keychain(&mut self, keychain: K, descriptor: Descriptor<DescriptorPublicKey>) {
+        self.add_keychain_with_lookahead(keychain, descriptor, DEFAULT_LOOKAHEAD)
+    }
+
     /// Add a keychain to the tracker's `txout_index` with a descriptor to derive addresses.
     ///
     /// Adding a keychain means you will be able to derive new script pubkeys under that keychain
     /// and the txout index will discover transaction outputs with those script pubkeys.
     ///
+    /// Refer to [`set_lookahead`] for an explanation of the `lookahead` parameter.
+    ///
     /// # Panics
     ///
     /// This will panic if a different `descriptor` is introduced to the same `keychain`.
-    pub fn add_keychain(&mut self, keychain: K, descriptor: Descriptor<DescriptorPublicKey>) {
+    ///
+    /// [`set_lookahead`]: Self::set_lookahead
+    pub fn add_keychain_with_lookahead(
+        &mut self,
+        keychain: K,
+        descriptor: Descriptor<DescriptorPublicKey>,
+        lookahead: u32,
+    ) {
         let old_descriptor = &*self
             .keychains
-            .entry(keychain)
+            .entry(keychain.clone())
             .or_insert_with(|| descriptor.clone());
         assert_eq!(
             &descriptor, old_descriptor,
             "keychain already contains a different descriptor"
         );
+        self.lookahead.insert(keychain.clone(), lookahead);
+        self.replenish_lookahead(&keychain);
     }
 
     /// Return the lookahead setting for each keychain.
@@ -390,10 +417,7 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
         let next_reveal_index = self.last_revealed.get(keychain).map_or(0, |v| *v + 1);
         let lookahead = self.lookahead.get(keychain).map_or(0, |v| *v);
 
-        debug_assert_eq!(
-            next_reveal_index + lookahead,
-            self.next_store_index(keychain)
-        );
+        debug_assert!(next_reveal_index + lookahead >= self.next_store_index(keychain));
 
         // if we need to reveal new indices, the latest revealed index goes here
         let mut reveal_to_index = None;

@@ -28,8 +28,7 @@ fn insert_relevant_txs() {
     let spk_1 = descriptor.at_derivation_index(9).unwrap().script_pubkey();
 
     let mut graph = IndexedTxGraph::<ConfirmationHeightAnchor, KeychainTxOutIndex<()>>::default();
-    graph.index.add_keychain((), descriptor);
-    graph.index.set_lookahead(&(), 10);
+    graph.index.add_keychain_with_lookahead((), descriptor, 10);
 
     let tx_a = Transaction {
         output: vec![
@@ -121,9 +120,12 @@ fn test_list_owned_txouts() {
     let mut graph =
         IndexedTxGraph::<ConfirmationHeightAnchor, KeychainTxOutIndex<String>>::default();
 
-    graph.index.add_keychain("keychain_1".into(), desc_1);
-    graph.index.add_keychain("keychain_2".into(), desc_2);
-    graph.index.set_lookahead_for_all(10);
+    graph
+        .index
+        .add_keychain_with_lookahead("keychain_1".into(), desc_1, 10);
+    graph
+        .index
+        .add_keychain_with_lookahead("keychain_2".into(), desc_2, 10);
 
     // Get trusted and untrusted addresses
 
