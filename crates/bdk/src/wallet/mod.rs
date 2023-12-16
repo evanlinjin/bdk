@@ -2245,6 +2245,74 @@ impl<D> Wallet<D> {
             .to_string()
     }
 
+    /// Introduce transactions fo the given block to the wallet.
+    ///
+    /// Only relevant transactions are inserted. Transactions are inserted alongside their anchors.
+    pub fn introduce_block_txs(&mut self, block: bitcoin::Block, height: u32)
+    where
+        D: PersistBackend<ChangeSet>,
+    {
+        let changeset = self.indexed_graph.apply_block_relevant(block, height);
+        self.persist.stage(ChangeSet::from(changeset));
+    }
+
+    /// Introduce a chain `tip` to the wallet as a [`CheckPoint`].
+    ///
+    /// This updates the `last_synced_to_height` parameter to the height of `tip` if `tip` can
+    /// connect with the internal [`LocalChain`].
+    ///
+    /// This method attempts to insert the `tip`, but only if it contains relevant transactions.
+    pub fn introduce_tip(&mut self, tip: CheckPoint) -> Result<(), CannotConnectError>
+    where
+        D: PersistBackend<ChangeSet>,
+    {
+        let mut update = tip.iter();
+        let mut wallet = self.chain.tip().iter();
+        let mut pos_update = update.next();
+        let mut pos_wallet = wallet.next();
+
+        let mut trimmed_update = BTreeMap::<u32, BlockHash>::new();
+        trimmed_update.insert(tip.height(), tip.hash());
+
+        while let (Some(pu), Some(pw)) = (pos_update.clone(), pos_wallet.clone()) {
+            let id_u = pu.block_id();
+            let id_w = pw.block_id();
+
+            if id_u.height == id_w.height {
+                trimmed_update.insert(id_u.height, id_u.hash);
+                if id_u.hash == id_w.hash {
+                    break;
+                }
+                pos_update = update.next();
+                pos_wallet = wallet.next();
+                continue;
+            }
+            if id_u.height > id_w.height {
+                pos_update = update.next();
+                continue;
+            }
+            if id_u.height < id_w.height {
+                pos_wallet = wallet.next();
+                continue;
+            }
+        }
+
+        let mut new_tip = Option::<CheckPoint>::None;
+        for (height, hash) in trimmed_update {
+            let block_id = BlockId { height, hash };
+            match &mut new_tip {
+                Some(new_tip) => *new_tip = new_tip.clone().push(block_id).expect("must push"),
+                new_tip => *new_tip = Some(CheckPoint::new(block_id)),
+            }
+        }
+        let changeset = self.chain.apply_update(local_chain::Update {
+            tip: new_tip.expect("must have atleast one checkpoint"),
+            introduce_older_blocks: false,
+        })?;
+        self.persist.stage(ChangeSet::from(changeset));
+        Ok(())
+    }
+
     /// Applies an update to the wallet and stages the changes (but does not [`commit`] them).
     ///
     /// Usually you create an `update` by interacting with some blockchain data source and inserting
