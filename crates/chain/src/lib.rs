@@ -33,6 +33,7 @@ mod tx_data_traits;
 pub mod tx_graph;
 pub use tx_data_traits::*;
 pub use tx_graph::TxGraph;
+pub mod cached_chain;
 mod chain_oracle;
 pub use chain_oracle::*;
 mod persist;
