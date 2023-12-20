@@ -176,8 +176,7 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
             &descriptor, old_descriptor,
             "keychain already contains a different descriptor"
         );
-        self.lookahead.insert(keychain.clone(), lookahead);
-        self.replenish_lookahead(&keychain);
+        self.set_lookahead(&keychain, lookahead)
     }
 
     /// Return the lookahead setting for each keychain.
@@ -207,9 +206,14 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     ///
     /// # Panics
     ///
-    /// This will panic if the `keychain` does not exist.
+    /// This will panic if the new `lookahead` value is smaller than the previous value.
+    /// This will also panic if the `keychain` does not exist.
     pub fn set_lookahead(&mut self, keychain: &K, lookahead: u32) {
-        self.lookahead.insert(keychain.clone(), lookahead);
+        let old_lookahead = self
+            .lookahead
+            .insert(keychain.clone(), lookahead)
+            .unwrap_or(0);
+        assert!(old_lookahead <= lookahead, "lookahead must always increase");
         self.replenish_lookahead(keychain);
     }
 
@@ -228,9 +232,10 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     pub fn lookahead_to_target(&mut self, keychain: &K, target_index: u32) {
         let next_index = self.next_store_index(keychain);
         if let Some(temp_lookahead) = target_index.checked_sub(next_index).filter(|&v| v > 0) {
+            // We temporarily change the lookahead settings (so we can reuse the
+            // `replenish_lookahead` logic).
             let old_lookahead = self.lookahead.insert(keychain.clone(), temp_lookahead);
             self.replenish_lookahead(keychain);
-
             // revert
             match old_lookahead {
                 Some(lookahead) => self.lookahead.insert(keychain.clone(), lookahead),
