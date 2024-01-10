@@ -1,5 +1,8 @@
-use bdk_chain::local_chain::{
-    AlterCheckPointError, CannotConnectError, ChangeSet, LocalChain, Update,
+use bdk_chain::{
+    local_chain::{
+        AlterCheckPointError, CannotConnectError, ChangeSet, CheckPoint, LocalChain, Update,
+    },
+    BlockId,
 };
 use bitcoin::BlockHash;
 
@@ -348,5 +351,84 @@ fn local_chain_insert_block() {
             i,
         );
         assert_eq!(chain, t.expected_final, "[{}] unexpected final chain", i,);
+    }
+}
+
+#[test]
+fn checkpoint_from_block_ids() {
+    struct TestCase<'a> {
+        name: &'a str,
+        blocks: &'a [(u32, BlockHash)],
+        exp_result: Result<(), Option<(u32, BlockHash)>>,
+    }
+
+    let test_cases = [
+        TestCase {
+            name: "in_order",
+            blocks: &[(0, h!("A")), (1, h!("B")), (3, h!("D"))],
+            exp_result: Ok(()),
+        },
+        TestCase {
+            name: "with_duplicates",
+            blocks: &[(1, h!("B")), (2, h!("C")), (2, h!("C'"))],
+            exp_result: Err(Some((2, h!("C")))),
+        },
+        TestCase {
+            name: "not_in_order",
+            blocks: &[(1, h!("B")), (3, h!("D")), (2, h!("C"))],
+            exp_result: Err(Some((3, h!("D")))),
+        },
+        TestCase {
+            name: "empty",
+            blocks: &[],
+            exp_result: Err(None),
+        },
+        TestCase {
+            name: "single",
+            blocks: &[(21, h!("million"))],
+            exp_result: Ok(()),
+        },
+    ];
+
+    for (i, t) in test_cases.into_iter().enumerate() {
+        println!("running test case {}: '{}'", i, t.name);
+        let result = CheckPoint::from_block_ids(
+            t.blocks
+                .iter()
+                .map(|&(height, hash)| BlockId { height, hash }),
+        );
+        match t.exp_result {
+            Ok(_) => {
+                assert!(result.is_ok(), "[{}:{}] should be Ok", i, t.name);
+                let result_vec = {
+                    let mut v = result
+                        .unwrap()
+                        .into_iter()
+                        .map(|cp| (cp.height(), cp.hash()))
+                        .collect::<Vec<_>>();
+                    v.reverse();
+                    v
+                };
+                assert_eq!(
+                    &result_vec, t.blocks,
+                    "[{}:{}] not equal to original block ids",
+                    i, t.name
+                );
+            }
+            Err(exp_last) => {
+                assert!(result.is_err(), "[{}:{}] should be Err", i, t.name);
+                let err = result.unwrap_err();
+                assert_eq!(
+                    err.as_ref()
+                        .map(|last_cp| (last_cp.height(), last_cp.hash())),
+                    exp_last,
+                    "[{}:{}] error's last cp height should be {:?}, got {:?}",
+                    i,
+                    t.name,
+                    exp_last,
+                    err
+                );
+            }
+        }
     }
 }
