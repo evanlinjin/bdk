@@ -1714,17 +1714,10 @@ impl<D> Wallet<D> {
 
                 let weighted_utxo = match txout_index.index_of_spk(&txout.script_pubkey) {
                     Some((keychain, derivation_index)) => {
-                        let is_segwit = self.get_descriptor_for_keychain(keychain).is_witness()
-                            || self.get_descriptor_for_keychain(keychain).is_taproot();
-                        let segwit_add = match is_segwit {
-                            true => 4,
-                            false => 0,
-                        };
                         let satisfaction_weight = self
                             .get_descriptor_for_keychain(keychain)
                             .max_weight_to_satisfy()
-                            .unwrap()
-                            + segwit_add;
+                            .unwrap();
                         WeightedUtxo {
                             utxo: Utxo::Local(LocalOutput {
                                 outpoint: txin.previous_output,
@@ -2051,16 +2044,9 @@ impl<D> Wallet<D> {
             .map(|utxo| {
                 let keychain = utxo.keychain;
                 (utxo, {
-                    let is_segwit = self.get_descriptor_for_keychain(keychain).is_witness()
-                        || self.get_descriptor_for_keychain(keychain).is_taproot();
-                    let segwit_add = match is_segwit {
-                        true => 4,
-                        false => 0,
-                    };
                     self.get_descriptor_for_keychain(keychain)
                         .max_weight_to_satisfy()
                         .unwrap()
-                        + segwit_add
                 })
             })
             .collect()

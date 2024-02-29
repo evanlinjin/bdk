@@ -53,7 +53,6 @@ use bitcoin::{absolute, script::PushBytes, OutPoint, ScriptBuf, Sequence, Transa
 
 use super::coin_selection::{CoinSelectionAlgorithm, DefaultCoinSelectionAlgorithm};
 use super::ChangeSet;
-use crate::descriptor::DescriptorMeta;
 use crate::types::{FeeRate, KeychainKind, LocalOutput, WeightedUtxo};
 use crate::wallet::CreateTxError;
 use crate::{Utxo, Wallet};
@@ -319,19 +318,7 @@ impl<'a, D, Cs: CoinSelectionAlgorithm, Ctx: TxBuilderContext> TxBuilder<'a, D, 
 
             for utxo in utxos {
                 let descriptor = wallet.get_descriptor_for_keychain(utxo.keychain);
-                let satisfaction_weight = {
-                    let is_segwit = wallet
-                        .get_descriptor_for_keychain(utxo.keychain)
-                        .is_witness()
-                        || wallet
-                            .get_descriptor_for_keychain(utxo.keychain)
-                            .is_taproot();
-                    let segwit_add = match is_segwit {
-                        true => 4,
-                        false => 0,
-                    };
-                    descriptor.max_weight_to_satisfy().unwrap() + segwit_add
-                };
+                let satisfaction_weight = descriptor.max_weight_to_satisfy().unwrap();
                 self.params.utxos.push(WeightedUtxo {
                     satisfaction_weight,
                     utxo: Utxo::Local(utxo),

@@ -120,8 +120,9 @@ use rand::seq::SliceRandom;
 pub type DefaultCoinSelectionAlgorithm = BranchAndBoundCoinSelection;
 
 // Base weight of a Txin, not counting the weight needed for satisfying it.
-// prev_txid (32 bytes) + prev_vout (4 bytes) + sequence (4 bytes)
-pub(crate) const TXIN_BASE_WEIGHT: usize = (32 + 4 + 4) * 4;
+// prev_txid (32 bytes) + prev_vout (4 bytes) + sequence (4 bytes) + empty_scriptSigLen (1 byte) +
+// empty_witnessLen (1 byte)
+pub(crate) const TXIN_BASE_WEIGHT: usize = (32 + 4 + 4 + 1) * 4 + 1;
 
 /// Errors that can be thrown by the [`coin_selection`](crate::wallet::coin_selection) module
 #[derive(Debug)]
@@ -738,7 +739,7 @@ mod test {
     use core::str::FromStr;
 
     use bdk_chain::ConfirmationTime;
-    use bitcoin::{OutPoint, ScriptBuf, TxOut};
+    use bitcoin::{OutPoint, ScriptBuf, TxIn, TxOut};
 
     use super::*;
     use crate::types::*;
@@ -749,9 +750,9 @@ mod test {
     use rand::seq::SliceRandom;
     use rand::{Rng, RngCore, SeedableRng};
 
-    // n. of items on witness (1WU) + signature len (1WU) + signature and sighash (72WU)
-    // + pubkey len (1WU) + pubkey (33WU) + script sig len (1 byte, 4WU)
-    const P2WPKH_SATISFACTION_SIZE: usize = 1 + 1 + 72 + 1 + 33 + 4;
+    // signature len (1WU) + signature and sighash (72WU)
+    // + pubkey len (1WU) + pubkey (33WU)
+    const P2WPKH_SATISFACTION_SIZE: usize = 1 + 72 + 1 + 33;
 
     const FEE_AMOUNT: u64 = 50;
 
@@ -1593,5 +1594,10 @@ mod test {
                 t.name
             );
         }
+    }
+
+    #[test]
+    fn check_tx_empty_weight_is_correct() {
+        assert_eq!(TXIN_BASE_WEIGHT, TxIn::default().segwit_weight());
     }
 }
