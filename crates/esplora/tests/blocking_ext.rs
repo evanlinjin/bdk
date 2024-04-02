@@ -89,7 +89,6 @@ pub fn test_finalize_chain_update() -> anyhow::Result<()> {
         let local_chain = {
             let (mut chain, _) = LocalChain::from_genesis_hash(env.genesis_hash()?);
             let chain_tip = chain.tip();
-            let update_blocks = bdk_esplora::init_chain_update_blocking(&client, &chain_tip)?;
             let update_anchors = t
                 .initial_cps
                 .iter()
@@ -103,12 +102,8 @@ pub fn test_finalize_chain_update() -> anyhow::Result<()> {
                     ))
                 })
                 .collect::<anyhow::Result<BTreeSet<_>>>()?;
-            let chain_update = bdk_esplora::finalize_chain_update_blocking(
-                &client,
-                &chain_tip,
-                &update_anchors,
-                update_blocks,
-            )?;
+            let chain_update =
+                bdk_esplora::chain_update_blocking(&client, &chain_tip, &update_anchors)?;
             chain.apply_update(chain_update)?;
             chain
         };
@@ -128,7 +123,6 @@ pub fn test_finalize_chain_update() -> anyhow::Result<()> {
         // craft update
         let update = {
             let local_tip = local_chain.tip();
-            let update_blocks = bdk_esplora::init_chain_update_blocking(&client, &local_tip)?;
             let update_anchors = t
                 .anchors
                 .iter()
@@ -142,12 +136,7 @@ pub fn test_finalize_chain_update() -> anyhow::Result<()> {
                     ))
                 })
                 .collect::<anyhow::Result<_>>()?;
-            bdk_esplora::finalize_chain_update_blocking(
-                &client,
-                &local_tip,
-                &update_anchors,
-                update_blocks,
-            )?
+            bdk_esplora::chain_update_blocking(&client, &local_tip, &update_anchors)?
         };
 
         // apply update
@@ -523,11 +512,6 @@ fn update_local_chain() -> anyhow::Result<()> {
         let mut chain = t.chain;
         let cp_tip = chain.tip();
 
-        let new_blocks =
-            bdk_esplora::init_chain_update_blocking(&client, &cp_tip).map_err(|err| {
-                anyhow::format_err!("[{}:{}] `init_chain_update` failed: {}", i, t.name, err)
-            })?;
-
         let mock_anchors = t
             .request_heights
             .iter()
@@ -546,12 +530,7 @@ fn update_local_chain() -> anyhow::Result<()> {
             })
             .collect::<BTreeSet<_>>();
 
-        let chain_update = bdk_esplora::finalize_chain_update_blocking(
-            &client,
-            &cp_tip,
-            &mock_anchors,
-            new_blocks,
-        )?;
+        let chain_update = bdk_esplora::chain_update_blocking(&client, &cp_tip, &mock_anchors)?;
         let update_blocks = chain_update
             .tip
             .iter()
@@ -574,6 +553,7 @@ fn update_local_chain() -> anyhow::Result<()> {
             )
             .collect::<BTreeSet<_>>();
 
+        dbg!(&update_blocks, &exp_update_blocks);
         assert!(
             update_blocks.is_superset(&exp_update_blocks),
             "[{}:{}] unexpected update",

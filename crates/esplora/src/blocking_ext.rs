@@ -2,11 +2,10 @@ use std::collections::BTreeSet;
 use std::thread::JoinHandle;
 use std::usize;
 
-use bdk_chain::collections::btree_map;
 use bdk_chain::collections::BTreeMap;
 use bdk_chain::Anchor;
 use bdk_chain::{
-    bitcoin::{BlockHash, OutPoint, ScriptBuf, TxOut, Txid},
+    bitcoin::{OutPoint, ScriptBuf, TxOut, Txid},
     local_chain::{self, CheckPoint},
     BlockId, ConfirmationTimeHeightAnchor, TxGraph,
 };
@@ -89,19 +88,13 @@ impl EsploraExt for esplora_client::BlockingClient {
         stop_gap: usize,
         parallel_requests: usize,
     ) -> Result<FullScanUpdate<K>, Error> {
-        let update_blocks = init_chain_update_blocking(self, &local_tip)?;
         let (tx_graph, last_active_indices) = full_scan_for_index_and_graph_blocking(
             self,
             keychain_spks,
             stop_gap,
             parallel_requests,
         )?;
-        let local_chain = finalize_chain_update_blocking(
-            self,
-            &local_tip,
-            tx_graph.all_anchors(),
-            update_blocks,
-        )?;
+        let local_chain = chain_update_blocking(self, &local_tip, tx_graph.all_anchors())?;
         Ok(FullScanUpdate {
             local_chain,
             tx_graph,
@@ -117,7 +110,6 @@ impl EsploraExt for esplora_client::BlockingClient {
         outpoints: impl IntoIterator<Item = OutPoint>,
         parallel_requests: usize,
     ) -> Result<SyncUpdate, Error> {
-        let update_blocks = init_chain_update_blocking(self, &local_tip)?;
         let tx_graph = sync_for_index_and_graph_blocking(
             self,
             misc_spks,
@@ -125,12 +117,7 @@ impl EsploraExt for esplora_client::BlockingClient {
             outpoints,
             parallel_requests,
         )?;
-        let local_chain = finalize_chain_update_blocking(
-            self,
-            &local_tip,
-            tx_graph.all_anchors(),
-            update_blocks,
-        )?;
+        let local_chain = chain_update_blocking(self, &local_tip, tx_graph.all_anchors())?;
         Ok(SyncUpdate {
             local_chain,
             tx_graph,
@@ -138,113 +125,57 @@ impl EsploraExt for esplora_client::BlockingClient {
     }
 }
 
-/// Create the initial chain update.
-///
-/// This atomically fetches the latest blocks from Esplora and additional blocks to ensure the
-/// update can connect to the `start_tip`.
-///
-/// We want to do this before fetching transactions and anchors as we cannot fetch latest blocks and
-/// transactions atomically, and the checkpoint tip is used to determine last-scanned block (for
-/// block-based chain-sources). Therefore it's better to be conservative when setting the tip (use
-/// an earlier tip rather than a later tip) otherwise the caller may accidentally skip blocks when
-/// alternating between chain-sources.
+/// Updates the chain making sure to include heights for the anchors
 #[doc(hidden)]
-pub fn init_chain_update_blocking(
-    client: &esplora_client::BlockingClient,
-    local_tip: &CheckPoint,
-) -> Result<BTreeMap<u32, BlockHash>, Error> {
-    // Fetch latest N (server dependent) blocks from Esplora. The server guarantees these are
-    // consistent.
-    let mut fetched_blocks = client
-        .get_blocks(None)?
-        .into_iter()
-        .map(|b| (b.time.height, b.id))
-        .collect::<BTreeMap<u32, BlockHash>>();
-    let new_tip_height = fetched_blocks
-        .keys()
-        .last()
-        .copied()
-        .expect("must atleast have one block");
-
-    // Ensure `fetched_blocks` can create an update that connects with the original chain by
-    // finding a "Point of Agreement".
-    for (height, local_hash) in local_tip.iter().map(|cp| (cp.height(), cp.hash())) {
-        if height > new_tip_height {
-            continue;
-        }
-
-        let fetched_hash = match fetched_blocks.entry(height) {
-            btree_map::Entry::Occupied(entry) => *entry.get(),
-            btree_map::Entry::Vacant(entry) => *entry.insert(client.get_block_hash(height)?),
-        };
-
-        // We have found point of agreement so the update will connect!
-        if fetched_hash == local_hash {
-            break;
-        }
-    }
-
-    Ok(fetched_blocks)
-}
-
-/// Fetches missing checkpoints and finalizes the [`local_chain::Update`].
-///
-/// A checkpoint is considered "missing" if an anchor (of `anchors`) points to a height without an
-/// existing checkpoint/block under `local_tip` or `update_blocks`.
-#[doc(hidden)]
-pub fn finalize_chain_update_blocking<A: Anchor>(
+pub fn chain_update_blocking<A: Anchor>(
     client: &esplora_client::BlockingClient,
     local_tip: &CheckPoint,
     anchors: &BTreeSet<(A, Txid)>,
-    mut update_blocks: BTreeMap<u32, BlockHash>,
 ) -> Result<local_chain::Update, Error> {
-    let update_tip_height = update_blocks
-        .keys()
-        .last()
-        .copied()
-        .expect("must atleast have one block");
+    let mut point_of_agreement = None;
+    let mut conflicts = vec![];
+    for local_cp in local_tip.iter() {
+        let remote_hash = client.get_block_hash(local_cp.height())?;
 
-    // We want to have a corresponding checkpoint per height. We iterate the heights of anchors
-    // backwards, comparing it against our `local_tip`'s chain and our current set of
-    // `update_blocks` to see if a corresponding checkpoint already exists.
-    let anchor_heights = anchors
-        .iter()
-        .rev()
-        .map(|(a, _)| a.anchor_block().height)
-        // filter out heights that surpass the update tip
-        .filter(|h| *h <= update_tip_height)
-        // filter out duplicate heights
-        .filter({
-            let mut prev_height = Option::<u32>::None;
-            move |h| match prev_height.replace(*h) {
-                None => true,
-                Some(prev_h) => prev_h != *h,
-            }
-        });
-
-    // We keep track of a checkpoint node of `local_tip` to make traversing the linked-list of
-    // checkpoints more efficient.
-    let mut curr_cp = local_tip.clone();
-
-    for h in anchor_heights {
-        if let Some(cp) = curr_cp.query_from(h) {
-            curr_cp = cp.clone();
-            if cp.height() == h {
-                continue;
-            }
-        }
-        if let btree_map::Entry::Vacant(entry) = update_blocks.entry(h) {
-            entry.insert(client.get_block_hash(h)?);
+        if remote_hash == local_cp.hash() {
+            point_of_agreement = Some(local_cp.clone());
+            break;
+        } else {
+            // it is not strictly necessary to include all the conflicted heights (we do need the
+            // first one) but it seems prudent to make sure the updated chain's heights are a
+            // superset of the existing chain after update.
+            conflicts.push(BlockId {
+                height: local_cp.height(),
+                hash: remote_hash,
+            });
         }
     }
 
+    let mut tip = point_of_agreement.expect("remote esplora should have same genesis block");
+
+    tip = tip
+        .extend(conflicts.into_iter().rev())
+        .expect("evicted are in order");
+
+    for anchor in anchors {
+        let height = anchor.0.anchor_block().height;
+        if tip.query(height).is_none() {
+            let hash = client.get_block_hash(height)?;
+            tip = tip.insert(BlockId { height, hash });
+        }
+    }
+
+    // insert the most recent blocks at the tip to make sure we update the tip and make the update
+    // robust.
+    for block in client.get_blocks(None)? {
+        tip = tip.insert(BlockId {
+            height: block.time.height,
+            hash: block.id,
+        });
+    }
+
     Ok(local_chain::Update {
-        tip: CheckPoint::from_block_ids(
-            update_blocks
-                .into_iter()
-                .map(|(height, hash)| BlockId { height, hash }),
-        )
-        .expect("must be in order"),
+        tip,
         introduce_older_blocks: true,
     })
 }
