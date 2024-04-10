@@ -120,10 +120,18 @@ impl<K: Clone + Ord + Debug> Indexer for KeychainTxOutIndex<K> {
     type ChangeSet = super::ChangeSet<K>;
 
     fn index_txout(&mut self, outpoint: OutPoint, txout: &TxOut) -> Self::ChangeSet {
-        match self.inner.scan_txout(outpoint, txout).cloned() {
-            Some((keychain, index)) => self.reveal_to_target(&keychain, index).1,
-            None => super::ChangeSet::default(),
-        }
+        self.inner
+            .scan_txout(outpoint, txout)
+            .clone()
+            .into_iter()
+            .fold(
+                Self::ChangeSet::default(),
+                |mut changeset, (keychain, index)| {
+                    let (_, revealed_changeset) = self.reveal_to_target(&keychain, index);
+                    changeset.append(revealed_changeset);
+                    changeset
+                },
+            )
     }
 
     fn index_tx(&mut self, tx: &bitcoin::Transaction) -> Self::ChangeSet {
@@ -186,20 +194,16 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     /// Iterate over known txouts that spend to tracked script pubkeys.
     pub fn txouts(
         &self,
-    ) -> impl DoubleEndedIterator<Item = (K, u32, OutPoint, &TxOut)> + ExactSizeIterator {
-        self.inner
-            .txouts()
-            .map(|((k, i), op, txo)| (k.clone(), *i, op, txo))
+    ) -> impl DoubleEndedIterator<Item = (OutPoint, &TxOut, &BTreeSet<(K, u32)>)> {
+        self.inner.txouts()
     }
 
     /// Finds all txouts on a transaction that has previously been scanned and indexed.
     pub fn txouts_in_tx(
         &self,
         txid: Txid,
-    ) -> impl DoubleEndedIterator<Item = (K, u32, OutPoint, &TxOut)> {
-        self.inner
-            .txouts_in_tx(txid)
-            .map(|((k, i), op, txo)| (k.clone(), *i, op, txo))
+    ) -> impl DoubleEndedIterator<Item = (OutPoint, &TxOut, &BTreeSet<(K, u32)>)> {
+        self.inner.txouts_in_tx(txid)
     }
 
     /// Return the [`TxOut`] of `outpoint` if it has been indexed.
@@ -207,10 +211,8 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     /// The associated keychain and keychain index of the txout's spk is also returned.
     ///
     /// This calls [`SpkTxOutIndex::txout`] internally.
-    pub fn txout(&self, outpoint: OutPoint) -> Option<(K, u32, &TxOut)> {
-        self.inner
-            .txout(outpoint)
-            .map(|((k, i), txo)| (k.clone(), *i, txo))
+    pub fn txout(&self, outpoint: OutPoint) -> Option<(&BTreeSet<(K, u32)>, &TxOut)> {
+        self.inner.txout(outpoint)
     }
 
     /// Return the script that exists under the given `keychain`'s `index`.
@@ -220,11 +222,11 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
         self.inner.spk_at_index(&(keychain, index))
     }
 
-    /// Returns the keychain and keychain index associated with the spk.
+    /// Returns the keychain and keychain indices associated with the spk.
     ///
-    /// This calls [`SpkTxOutIndex::index_of_spk`] internally.
-    pub fn index_of_spk(&self, script: &Script) -> Option<(K, u32)> {
-        self.inner.index_of_spk(script).cloned()
+    /// This calls [`SpkTxOutIndex::indices_of_spk`] internally.
+    pub fn indices_of_spk(&self, script: &Script) -> &BTreeSet<(K, u32)> {
+        self.inner.indices_of_spk(script)
     }
 
     /// Returns whether the spk under the `keychain`'s `index` has been used.

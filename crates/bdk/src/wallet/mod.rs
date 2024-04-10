@@ -21,7 +21,7 @@ use alloc::{
 };
 pub use bdk_chain::keychain::Balance;
 use bdk_chain::{
-    indexed_tx_graph,
+    indexed_tx_graph::{self},
     keychain::{self, KeychainTxOutIndex},
     local_chain::{
         self, ApplyHeaderError, CannotConnectError, CheckPoint, CheckPointIter, LocalChain,
@@ -782,14 +782,15 @@ impl Wallet {
 
     /// Return whether or not a `script` is part of this wallet (either internal or external)
     pub fn is_mine(&self, script: &Script) -> bool {
-        self.indexed_graph.index.index_of_spk(script).is_some()
+        !self.indexed_graph.index.indices_of_spk(script).is_empty()
     }
 
     /// Finds how the wallet derived the script pubkey `spk`.
     ///
     /// Will only return `Some(_)` if the wallet has given out the spk.
-    pub fn derivation_of_spk(&self, spk: &Script) -> Option<(KeychainKind, u32)> {
-        self.indexed_graph.index.index_of_spk(spk)
+    pub fn derivation_of_spk(&self, spk: &Script) -> Option<KeychainDerivation> {
+        let indices = self.indexed_graph.index.indices_of_spk(spk).iter().cloned();
+        KeychainDerivation::from_keychain_kinds(indices)
     }
 
     /// Return the list of unspent outputs of this wallet
@@ -799,9 +800,18 @@ impl Wallet {
             .filter_chain_unspents(
                 &self.chain,
                 self.chain.tip().block_id(),
-                self.indexed_graph.index.outpoints().iter().cloned(),
+                self.indexed_graph
+                    .index
+                    .txouts()
+                    .map(|(op, _, indices)| (indices, op)),
             )
-            .map(|((k, i), full_txo)| new_local_utxo(k, i, full_txo))
+            .map(|(indices, full_txo)| {
+                new_local_utxo(
+                    KeychainDerivation::from_keychain_kinds(indices.iter().cloned())
+                        .expect("indexed txouts must have index"),
+                    full_txo,
+                )
+            })
     }
 
     /// List all relevant outputs (includes both spent and unspent, confirmed and unconfirmed).
@@ -813,9 +823,18 @@ impl Wallet {
             .filter_chain_txouts(
                 &self.chain,
                 self.chain.tip().block_id(),
-                self.indexed_graph.index.outpoints().iter().cloned(),
+                self.indexed_graph
+                    .index
+                    .txouts()
+                    .map(|(op, _, indices)| (indices, op)),
             )
-            .map(|((k, i), full_txo)| new_local_utxo(k, i, full_txo))
+            .map(|(indices, full_txo)| {
+                new_local_utxo(
+                    KeychainDerivation::from_keychain_kinds(indices.iter().cloned())
+                        .expect("indexed txouts must have index"),
+                    full_txo,
+                )
+            })
     }
 
     /// Get all the checkpoints the wallet is currently storing indexed by height.
@@ -857,7 +876,8 @@ impl Wallet {
     /// Returns the utxo owned by this wallet corresponding to `outpoint` if it exists in the
     /// wallet's database.
     pub fn get_utxo(&self, op: OutPoint) -> Option<LocalOutput> {
-        let (keychain, index, _) = self.indexed_graph.index.txout(op)?;
+        let (indices, _) = self.indexed_graph.index.txout(op)?;
+        let derivations = KeychainDerivation::from_keychain_kinds(indices.iter().cloned())?;
         self.indexed_graph
             .graph()
             .filter_chain_unspents(
@@ -865,7 +885,7 @@ impl Wallet {
                 self.chain.tip().block_id(),
                 core::iter::once(((), op)),
             )
-            .map(|(_, full_txo)| new_local_utxo(keychain, index, full_txo))
+            .map(|(_, full_txo)| new_local_utxo(derivations.clone(), full_txo))
             .next()
     }
 
@@ -1651,39 +1671,45 @@ impl Wallet {
                     .cloned()
                     .into();
 
-                let weighted_utxo = match txout_index.index_of_spk(&txout.script_pubkey) {
-                    Some((keychain, derivation_index)) => {
-                        let satisfaction_weight = self
-                            .get_descriptor_for_keychain(keychain)
-                            .max_weight_to_satisfy()
-                            .unwrap();
-                        WeightedUtxo {
-                            utxo: Utxo::Local(LocalOutput {
-                                outpoint: txin.previous_output,
-                                txout: txout.clone(),
-                                keychain,
-                                is_spent: true,
-                                derivation_index,
-                                confirmation_time,
+                let indices = txout_index.indices_of_spk(&txout.script_pubkey);
+                let weighted_utxo = if indices.is_empty() {
+                    let satisfaction_weight =
+                        serialize(&txin.script_sig).len() * 4 + serialize(&txin.witness).len();
+                    WeightedUtxo {
+                        utxo: Utxo::Foreign {
+                            outpoint: txin.previous_output,
+                            sequence: Some(txin.sequence),
+                            psbt_input: Box::new(psbt::Input {
+                                witness_utxo: Some(txout.clone()),
+                                non_witness_utxo: Some(prev_tx.as_ref().clone()),
+                                ..Default::default()
                             }),
-                            satisfaction_weight,
-                        }
+                        },
+                        satisfaction_weight,
                     }
-                    None => {
-                        let satisfaction_weight =
-                            serialize(&txin.script_sig).len() * 4 + serialize(&txin.witness).len();
-                        WeightedUtxo {
-                            utxo: Utxo::Foreign {
-                                outpoint: txin.previous_output,
-                                sequence: Some(txin.sequence),
-                                psbt_input: Box::new(psbt::Input {
-                                    witness_utxo: Some(txout.clone()),
-                                    non_witness_utxo: Some(prev_tx.as_ref().clone()),
-                                    ..Default::default()
-                                }),
-                            },
-                            satisfaction_weight,
-                        }
+                } else {
+                    let keychain_derivation =
+                        KeychainDerivation::from_keychain_kinds(indices.iter().cloned())
+                            .expect("already checked that `indices` is not empty");
+                    let satisfaction_weight = self
+                        .get_descriptor_for_keychain(match keychain_derivation {
+                            KeychainDerivation::External(_) => KeychainKind::External,
+                            KeychainDerivation::Internal(_)
+                            | KeychainDerivation::ExternalAndInternal { .. } => {
+                                KeychainKind::Internal
+                            }
+                        })
+                        .max_weight_to_satisfy()
+                        .unwrap();
+                    WeightedUtxo {
+                        utxo: Utxo::Local(LocalOutput {
+                            outpoint: txin.previous_output,
+                            txout: txout.clone(),
+                            is_spent: true,
+                            keychain_derivation,
+                            confirmation_time,
+                        }),
+                        satisfaction_weight,
                     }
                 };
 
@@ -1694,10 +1720,15 @@ impl Wallet {
         if tx.output.len() > 1 {
             let mut change_index = None;
             for (index, txout) in tx.output.iter().enumerate() {
-                let change_type = self.map_keychain(KeychainKind::Internal);
-                match txout_index.index_of_spk(&txout.script_pubkey) {
-                    Some((keychain, _)) if keychain == change_type => change_index = Some(index),
-                    _ => {}
+                let derivation_indices = txout_index
+                    .indices_of_spk(&txout.script_pubkey)
+                    .iter()
+                    .cloned();
+                let is_internal = KeychainDerivation::from_keychain_kinds(derivation_indices)
+                    .and_then(|derivation| derivation.internal_index())
+                    .is_some();
+                if is_internal {
+                    change_index = Some(index);
                 }
             }
 
@@ -1960,13 +1991,16 @@ impl Wallet {
     /// This frees up the change address used when creating the tx for use in future transactions.
     // TODO: Make this free up reserved utxos when that's implemented
     pub fn cancel_tx(&mut self, tx: &Transaction) {
-        let txout_index = &mut self.indexed_graph.index;
-        for txout in &tx.output {
-            if let Some((keychain, index)) = txout_index.index_of_spk(&txout.script_pubkey) {
-                // NOTE: unmark_used will **not** make something unused if it has actually been used
-                // by a tx in the tracker. It only removes the superficial marking.
-                txout_index.unmark_used(keychain, index);
-            }
+        let keychain_indices = tx
+            .output
+            .iter()
+            .flat_map(|txo| self.indexed_graph.index.indices_of_spk(&txo.script_pubkey))
+            .cloned()
+            .collect::<Vec<_>>();
+        for (keychain, index) in keychain_indices {
+            // NOTE: unmark_used will **not** make something unused if it has actually been used
+            // by a tx in the tracker. It only removes the superficial marking.
+            self.indexed_graph.index.unmark_used(keychain, index);
         }
     }
 
@@ -1984,15 +2018,21 @@ impl Wallet {
         let (keychain, child) = self
             .indexed_graph
             .index
-            .index_of_spk(&txout.script_pubkey)?;
-        let descriptor = self.get_descriptor_for_keychain(keychain);
-        descriptor.at_derivation_index(child).ok()
+            .indices_of_spk(&txout.script_pubkey)
+            .iter()
+            .next()?;
+        let descriptor = self.get_descriptor_for_keychain(*keychain);
+        descriptor.at_derivation_index(*child).ok()
     }
 
     fn get_available_utxos(&self) -> Vec<(LocalOutput, usize)> {
         self.list_unspent()
             .map(|utxo| {
-                let keychain = utxo.keychain;
+                let keychain = match utxo.keychain_derivation {
+                    KeychainDerivation::External(_) => KeychainKind::External,
+                    KeychainDerivation::Internal(_) => KeychainKind::Internal,
+                    KeychainDerivation::ExternalAndInternal { .. } => KeychainKind::External,
+                };
                 (utxo, {
                     self.get_descriptor_for_keychain(keychain)
                         .max_weight_to_satisfy()
@@ -2200,7 +2240,9 @@ impl Wallet {
         let (keychain, child) = self
             .indexed_graph
             .index
-            .index_of_spk(&utxo.txout.script_pubkey)
+            .indices_of_spk(&utxo.txout.script_pubkey)
+            .iter()
+            .next()
             .ok_or(CreateTxError::UnknownUtxo)?;
 
         let mut psbt_input = psbt::Input {
@@ -2208,9 +2250,9 @@ impl Wallet {
             ..psbt::Input::default()
         };
 
-        let desc = self.get_descriptor_for_keychain(keychain);
+        let desc = self.get_descriptor_for_keychain(*keychain);
         let derived_descriptor = desc
-            .at_derivation_index(child)
+            .at_derivation_index(*child)
             .expect("child can't be hardened");
 
         psbt_input
@@ -2245,12 +2287,16 @@ impl Wallet {
 
         // Try to figure out the keychain and derivation for every input and output
         for (is_input, index, out) in utxos.into_iter() {
-            if let Some((keychain, child)) =
-                self.indexed_graph.index.index_of_spk(&out.script_pubkey)
+            if let Some((keychain, child)) = self
+                .indexed_graph
+                .index
+                .indices_of_spk(&out.script_pubkey)
+                .iter()
+                .next()
             {
-                let desc = self.get_descriptor_for_keychain(keychain);
+                let desc = self.get_descriptor_for_keychain(*keychain);
                 let desc = desc
-                    .at_derivation_index(child)
+                    .at_derivation_index(*child)
                     .expect("child can't be hardened");
 
                 if is_input {
@@ -2473,8 +2519,7 @@ where
 }
 
 fn new_local_utxo(
-    keychain: KeychainKind,
-    derivation_index: u32,
+    keychain_derivation: KeychainDerivation,
     full_txo: FullTxOut<ConfirmationTimeHeightAnchor>,
 ) -> LocalOutput {
     LocalOutput {
@@ -2482,8 +2527,7 @@ fn new_local_utxo(
         txout: full_txo.txout,
         is_spent: full_txo.spent_by.is_some(),
         confirmation_time: full_txo.chain_position.into(),
-        keychain,
-        derivation_index,
+        keychain_derivation,
     }
 }
 

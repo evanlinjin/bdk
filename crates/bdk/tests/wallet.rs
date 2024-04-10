@@ -9,7 +9,7 @@ use bdk::wallet::error::CreateTxError;
 use bdk::wallet::tx_builder::AddForeignUtxoError;
 use bdk::wallet::NewError;
 use bdk::wallet::{AddressInfo, Balance, Wallet};
-use bdk::KeychainKind;
+use bdk::{KeychainDerivation, KeychainKind};
 use bdk_chain::COINBASE_MATURITY;
 use bdk_chain::{BlockId, ConfirmationTime};
 use bitcoin::hashes::Hash;
@@ -1980,6 +1980,7 @@ fn test_bump_fee_add_input() {
 fn test_bump_fee_absolute_add_input() {
     let (mut wallet, _) = get_funded_wallet(get_test_wpkh());
     receive_output_in_latest_block(&mut wallet, 25_000);
+
     let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX")
         .unwrap()
         .assume_checked();
@@ -3811,7 +3812,7 @@ fn test_tx_cancellation() {
         .iter()
         .find_map(|txout| wallet.derivation_of_spk(&txout.script_pubkey))
         .unwrap();
-    assert_eq!(change_derivation_1, (KeychainKind::Internal, 0));
+    assert_eq!(change_derivation_1, KeychainDerivation::Internal(0));
 
     let psbt2 = new_tx!(wallet);
 
@@ -3821,7 +3822,7 @@ fn test_tx_cancellation() {
         .iter()
         .find_map(|txout| wallet.derivation_of_spk(&txout.script_pubkey))
         .unwrap();
-    assert_eq!(change_derivation_2, (KeychainKind::Internal, 1));
+    assert_eq!(change_derivation_2, KeychainDerivation::Internal(1));
 
     wallet.cancel_tx(&psbt1.extract_tx().expect("failed to extract tx"));
 
@@ -3832,7 +3833,7 @@ fn test_tx_cancellation() {
         .iter()
         .find_map(|txout| wallet.derivation_of_spk(&txout.script_pubkey))
         .unwrap();
-    assert_eq!(change_derivation_3, (KeychainKind::Internal, 0));
+    assert_eq!(change_derivation_3, KeychainDerivation::Internal(0));
 
     let psbt3 = new_tx!(wallet);
     let change_derivation_3 = psbt3
@@ -3841,7 +3842,7 @@ fn test_tx_cancellation() {
         .iter()
         .find_map(|txout| wallet.derivation_of_spk(&txout.script_pubkey))
         .unwrap();
-    assert_eq!(change_derivation_3, (KeychainKind::Internal, 2));
+    assert_eq!(change_derivation_3, KeychainDerivation::Internal(2));
 
     wallet.cancel_tx(&psbt3.extract_tx().expect("failed to extract tx"));
 
@@ -3852,7 +3853,7 @@ fn test_tx_cancellation() {
         .iter()
         .find_map(|txout| wallet.derivation_of_spk(&txout.script_pubkey))
         .unwrap();
-    assert_eq!(change_derivation_4, (KeychainKind::Internal, 2));
+    assert_eq!(change_derivation_4, KeychainDerivation::Internal(2));
 }
 
 #[test]

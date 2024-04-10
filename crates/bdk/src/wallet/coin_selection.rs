@@ -774,9 +774,8 @@ mod test {
                     value: Amount::from_sat(value),
                     script_pubkey: ScriptBuf::new(),
                 },
-                keychain: KeychainKind::External,
                 is_spent: false,
-                derivation_index: 42,
+                keychain_derivation: KeychainDerivation::External(42),
                 confirmation_time,
             }),
         }
@@ -838,9 +837,8 @@ mod test {
                         value: Amount::from_sat(rng.gen_range(0..200000000)),
                         script_pubkey: ScriptBuf::new(),
                     },
-                    keychain: KeychainKind::External,
                     is_spent: false,
-                    derivation_index: rng.next_u32(),
+                    keychain_derivation: KeychainDerivation::External(rng.next_u32()),
                     confirmation_time: if rng.gen_bool(0.5) {
                         ConfirmationTime::Confirmed {
                             height: rng.next_u32(),
@@ -869,9 +867,8 @@ mod test {
                         value: Amount::from_sat(utxos_value),
                         script_pubkey: ScriptBuf::new(),
                     },
-                    keychain: KeychainKind::External,
                     is_spent: false,
-                    derivation_index: 42,
+                    keychain_derivation: KeychainDerivation::External(42),
                     confirmation_time: ConfirmationTime::Unconfirmed { last_seen: 0 },
                 }),
             })
@@ -1520,9 +1517,8 @@ mod test {
                         value: Amount::from_sat(value),
                         script_pubkey: ScriptBuf::new(),
                     },
-                    keychain: KeychainKind::External,
                     is_spent: false,
-                    derivation_index: 0,
+                    keychain_derivation: KeychainDerivation::External(0),
                     confirmation_time: ConfirmationTime::Confirmed {
                         height: 12345,
                         time: 12345,

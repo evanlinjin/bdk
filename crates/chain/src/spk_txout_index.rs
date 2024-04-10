@@ -4,7 +4,7 @@ use crate::{
     collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap},
     indexed_tx_graph::Indexer,
 };
-use bitcoin::{OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{self, hashes::Hash, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid};
 
 /// An index storing [`TxOut`]s that have a script pubkey that matches those in a list.
 ///
@@ -30,14 +30,16 @@ use bitcoin::{OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid};
 pub struct SpkTxOutIndex<I> {
     /// script pubkeys ordered by index
     spks: BTreeMap<I, ScriptBuf>,
-    /// A reverse lookup from spk to spk index
-    spk_indices: HashMap<ScriptBuf, I>,
-    /// The set of unused indexes.
+    /// A reverse lookup from spk to spk indices
+    spk_indices: HashMap<ScriptBuf, BTreeSet<I>>,
+    /// The set of unused spk indices
     unused: BTreeSet<I>,
-    /// Lookup index and txout by outpoint.
-    txouts: BTreeMap<OutPoint, (I, TxOut)>,
-    /// Lookup from spk index to outpoints that had that spk
+    /// Lookup txout by outpoint
+    txouts: BTreeMap<OutPoint, TxOut>,
+    /// Lookup spk index to outpoint that has that spk
     spk_txouts: BTreeSet<(I, OutPoint)>,
+    /// An atrocity since `BTreeSet<I>` cannot be static (as it contains a generic `I`).
+    empty: BTreeSet<I>,
 }
 
 impl<I> Default for SpkTxOutIndex<I> {
@@ -48,6 +50,7 @@ impl<I> Default for SpkTxOutIndex<I> {
             spk_indices: Default::default(),
             spk_txouts: Default::default(),
             unused: Default::default(),
+            empty: Default::default(),
         }
     }
 }
@@ -89,7 +92,7 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
         let txid = tx.txid();
         for (i, txout) in tx.output.iter().enumerate() {
             let op = OutPoint::new(txid, i as u32);
-            if let Some(spk_i) = self.scan_txout(op, txout) {
+            for spk_i in self.scan_txout(op, txout) {
                 scanned_indices.insert(spk_i.clone());
             }
         }
@@ -99,14 +102,18 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
 
     /// Scan a single `TxOut` for a matching script pubkey and returns the index that matches the
     /// script pubkey (if any).
-    pub fn scan_txout(&mut self, op: OutPoint, txout: &TxOut) -> Option<&I> {
-        let spk_i = self.spk_indices.get(&txout.script_pubkey);
-        if let Some(spk_i) = spk_i {
-            self.txouts.insert(op, (spk_i.clone(), txout.clone()));
-            self.spk_txouts.insert((spk_i.clone(), op));
-            self.unused.remove(spk_i);
+    pub fn scan_txout(&mut self, op: OutPoint, txout: &TxOut) -> &BTreeSet<I> {
+        match self.spk_indices.get(&txout.script_pubkey) {
+            Some(spk_indices) => {
+                self.txouts.insert(op, txout.clone());
+                for spk_i in spk_indices {
+                    self.spk_txouts.insert((spk_i.clone(), op));
+                    self.unused.remove(spk_i);
+                }
+                spk_indices
+            }
+            None => &self.empty,
         }
-        spk_i
     }
 
     /// Get a reference to the set of indexed outpoints.
@@ -115,22 +122,34 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
     }
 
     /// Iterate over all known txouts that spend to tracked script pubkeys.
-    pub fn txouts(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (&I, OutPoint, &TxOut)> + ExactSizeIterator {
-        self.txouts
-            .iter()
-            .map(|(op, (index, txout))| (index, *op, txout))
+    pub fn txouts(&self) -> impl DoubleEndedIterator<Item = (OutPoint, &TxOut, &BTreeSet<I>)> {
+        self.txouts.iter().map(|(op, txo)| {
+            (
+                *op,
+                txo,
+                self.spk_indices
+                    .get(&txo.script_pubkey)
+                    .expect("spk must atleast have one associated index"),
+            )
+        })
     }
 
     /// Finds all txouts on a transaction that has previously been scanned and indexed.
     pub fn txouts_in_tx(
         &self,
         txid: Txid,
-    ) -> impl DoubleEndedIterator<Item = (&I, OutPoint, &TxOut)> {
+    ) -> impl DoubleEndedIterator<Item = (OutPoint, &TxOut, &BTreeSet<I>)> {
         self.txouts
             .range(OutPoint::new(txid, u32::MIN)..=OutPoint::new(txid, u32::MAX))
-            .map(|(op, (index, txout))| (index, *op, txout))
+            .map(|(op, txo)| {
+                (
+                    *op,
+                    txo,
+                    self.spk_indices
+                        .get(&txo.script_pubkey)
+                        .expect("spk must atleast have one associated index"),
+                )
+            })
     }
 
     /// Iterates over all the outputs with script pubkeys in an index range.
@@ -138,7 +157,6 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
         &self,
         range: impl RangeBounds<I>,
     ) -> impl DoubleEndedIterator<Item = (&I, OutPoint)> {
-        use bitcoin::hashes::Hash;
         use core::ops::Bound::*;
         let min_op = OutPoint {
             txid: Txid::all_zeros(),
@@ -167,8 +185,16 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
     /// Returns the txout and script pubkey index of the `TxOut` at `OutPoint`.
     ///
     /// Returns `None` if the `TxOut` hasn't been scanned or if nothing matching was found there.
-    pub fn txout(&self, outpoint: OutPoint) -> Option<(&I, &TxOut)> {
-        self.txouts.get(&outpoint).map(|v| (&v.0, &v.1))
+    pub fn txout(&self, outpoint: OutPoint) -> Option<(&BTreeSet<I>, &TxOut)> {
+        let spk_indices = &self.spk_indices;
+        self.txouts.get(&outpoint).map(|txo| {
+            (
+                spk_indices
+                    .get(&txo.script_pubkey)
+                    .expect("spk must have atleast one associated index"),
+                txo,
+            )
+        })
     }
 
     /// Returns the script that has been inserted at the `index`.
@@ -187,14 +213,49 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
     ///
     /// the index will look for outputs spending to this spk whenever it scans new data.
     pub fn insert_spk(&mut self, index: I, spk: ScriptBuf) -> bool {
+        let min_op = OutPoint::new(Txid::from_byte_array([u8::MIN; Txid::LEN]), u32::MIN);
+        let max_op = OutPoint::new(Txid::from_byte_array([u8::MAX; Txid::LEN]), u32::MAX);
+
         match self.spk_indices.entry(spk.clone()) {
-            Entry::Vacant(value) => {
-                value.insert(index.clone());
+            Entry::Vacant(indices_entry) => {
+                indices_entry.insert(BTreeSet::from([index.clone()]));
                 self.spks.insert(index.clone(), spk);
                 self.unused.insert(index);
                 true
             }
-            Entry::Occupied(_) => false,
+            Entry::Occupied(mut indices_entry) => {
+                let indices = indices_entry.get_mut();
+                if indices.insert(index.clone()) {
+                    return false;
+                }
+
+                // An spk can have multiple indices. We ensure that the unused status and
+                // associated outpoints of the other indices are syned with this index.
+                self.spks.insert(index.clone(), spk);
+                let mut is_unused = Option::<bool>::None;
+                let mut ops = BTreeSet::<OutPoint>::new();
+                for spk_i in indices.iter().filter(|&spk_i| spk_i != &index) {
+                    let index_unused = self.unused.contains(spk_i);
+                    if let Some(old_unused) = is_unused.replace(index_unused) {
+                        assert_eq!(
+                            old_unused, index_unused,
+                            "unused status should be consistent for the same spk"
+                        );
+                    }
+                    ops.extend(
+                        self.spk_txouts
+                            .range((spk_i.clone(), min_op)..=(spk_i.clone(), max_op))
+                            .map(|(_, op)| *op),
+                    );
+                }
+                if is_unused.expect("must have a value") {
+                    self.unused.insert(index.clone());
+                }
+                self.spk_txouts
+                    .extend(ops.into_iter().map(|op| (index.clone(), op)));
+
+                true
+            }
         }
     }
 
@@ -265,9 +326,9 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
         self.unused.insert(index.clone())
     }
 
-    /// Returns the index associated with the script pubkey.
-    pub fn index_of_spk(&self, script: &Script) -> Option<&I> {
-        self.spk_indices.get(script)
+    /// Returns the indices associated with the script pubkey.
+    pub fn indices_of_spk(&self, script: &Script) -> &BTreeSet<I> {
+        self.spk_indices.get(script).unwrap_or(&self.empty)
     }
 
     /// Computes the total value transfer effect `tx` has on the script pubkeys in `range`. Value is
@@ -280,17 +341,16 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
         let mut received = 0;
 
         for txin in &tx.input {
-            if let Some((index, txout)) = self.txout(txin.previous_output) {
-                if range.contains(index) {
+            if let Some((indices, txout)) = self.txout(txin.previous_output) {
+                if indices.iter().any(|index| range.contains(index)) {
                     sent += txout.value.to_sat();
                 }
             }
         }
         for txout in &tx.output {
-            if let Some(index) = self.index_of_spk(&txout.script_pubkey) {
-                if range.contains(index) {
-                    received += txout.value.to_sat();
-                }
+            let indices = self.indices_of_spk(&txout.script_pubkey);
+            if indices.iter().any(|index| range.contains(index)) {
+                received += txout.value.to_sat();
             }
         }
 

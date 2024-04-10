@@ -312,7 +312,14 @@ impl<'a, Cs, Ctx> TxBuilder<'a, Cs, Ctx> {
                 .collect::<Result<Vec<_>, _>>()?;
 
             for utxo in utxos {
-                let descriptor = wallet.get_descriptor_for_keychain(utxo.keychain);
+                let descriptor =
+                    wallet.get_descriptor_for_keychain(match utxo.keychain_derivation {
+                        crate::KeychainDerivation::External(_) => KeychainKind::External,
+                        crate::KeychainDerivation::Internal(_) => KeychainKind::Internal,
+                        crate::KeychainDerivation::ExternalAndInternal { .. } => {
+                            KeychainKind::External
+                        }
+                    });
                 let satisfaction_weight = descriptor.max_weight_to_satisfy().unwrap();
                 self.params.utxos.push(WeightedUtxo {
                     satisfaction_weight,
@@ -900,8 +907,10 @@ impl ChangeSpendPolicy {
     pub(crate) fn is_satisfied_by(&self, utxo: &LocalOutput) -> bool {
         match self {
             ChangeSpendPolicy::ChangeAllowed => true,
-            ChangeSpendPolicy::OnlyChange => utxo.keychain == KeychainKind::Internal,
-            ChangeSpendPolicy::ChangeForbidden => utxo.keychain == KeychainKind::External,
+            ChangeSpendPolicy::OnlyChange => utxo.keychain_derivation.internal_index().is_some(),
+            ChangeSpendPolicy::ChangeForbidden => {
+                utxo.keychain_derivation.external_index().is_some()
+            }
         }
     }
 }
@@ -925,6 +934,8 @@ mod test {
     use bitcoin::consensus::deserialize;
     use bitcoin::hex::FromHex;
     use bitcoin::TxOut;
+
+    use crate::KeychainDerivation;
 
     use super::*;
 
@@ -1013,10 +1024,13 @@ mod test {
                     vout: 0,
                 },
                 txout: TxOut::NULL,
-                keychain: KeychainKind::External,
                 is_spent: false,
+                keychain_derivation: KeychainDerivation::from_keychain_kinds(core::iter::once((
+                    KeychainKind::External,
+                    0,
+                )))
+                .expect("must create"),
                 confirmation_time: ConfirmationTime::Unconfirmed { last_seen: 0 },
-                derivation_index: 0,
             },
             LocalOutput {
                 outpoint: OutPoint {
@@ -1024,13 +1038,16 @@ mod test {
                     vout: 1,
                 },
                 txout: TxOut::NULL,
-                keychain: KeychainKind::Internal,
                 is_spent: false,
+                keychain_derivation: KeychainDerivation::from_keychain_kinds(core::iter::once((
+                    KeychainKind::Internal,
+                    1,
+                )))
+                .expect("must create"),
                 confirmation_time: ConfirmationTime::Confirmed {
                     height: 32,
                     time: 42,
                 },
-                derivation_index: 1,
             },
         ]
     }
@@ -1055,7 +1072,10 @@ mod test {
             .collect::<Vec<_>>();
 
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].keychain, KeychainKind::External);
+        assert!(matches!(
+            filtered[0].keychain_derivation,
+            KeychainDerivation::External(_)
+        ));
     }
 
     #[test]
@@ -1067,7 +1087,10 @@ mod test {
             .collect::<Vec<_>>();
 
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].keychain, KeychainKind::Internal);
+        assert!(matches!(
+            filtered[0].keychain_derivation,
+            KeychainDerivation::Internal(_)
+        ));
     }
 
     #[test]

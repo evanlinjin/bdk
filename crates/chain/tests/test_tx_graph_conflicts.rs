@@ -657,7 +657,7 @@ fn test_tx_conflict_handling() {
             &local_chain,
             chain_tip,
             spk_index.outpoints().iter().cloned(),
-            |_, spk: &Script| spk_index.index_of_spk(spk).is_some(),
+            |_, spk: &Script| spk_index.indices_of_spk(spk).len() > 0,
         );
         assert_eq!(
             balance, scenario.exp_balance,

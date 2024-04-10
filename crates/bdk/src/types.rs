@@ -46,6 +46,84 @@ impl AsRef<[u8]> for KeychainKind {
     }
 }
 
+/// Represents the keychain derivation of a script pubkey.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum KeychainDerivation {
+    /// The script pubkey is derived from the external keychain at index.
+    External(u32),
+    /// The script pubkey is derived from the internal keychain at index.
+    Internal(u32),
+    /// The script pubkey is derived from both the internal and external keychains at the given
+    /// indices.
+    ExternalAndInternal {
+        /// The derivation index of the external keychain.
+        external: u32,
+        /// The derivation index of the internal keychain.
+        internal: u32,
+    },
+}
+
+impl KeychainDerivation {
+    /// Attempt to construct [`KeychainDerivation`] from an iterator of [`KeychainKind`] coupled
+    /// with derivation index.
+    ///
+    /// Indices that appear later in the iterator have precedence.
+    pub fn from_keychain_kinds(
+        keychains: impl IntoIterator<Item = (KeychainKind, u32)>,
+    ) -> Option<Self> {
+        keychains
+            .into_iter()
+            .fold(Option::<Self>::None, |acc, (k, i)| match acc {
+                None => match k {
+                    KeychainKind::External => Some(Self::External(i)),
+                    KeychainKind::Internal => Some(Self::Internal(i)),
+                },
+                Some(Self::External(external)) => match k {
+                    KeychainKind::External => Some(Self::External(i)),
+                    KeychainKind::Internal => {
+                        let internal = i;
+                        Some(Self::ExternalAndInternal { external, internal })
+                    }
+                },
+                Some(Self::Internal(internal)) => match k {
+                    KeychainKind::External => {
+                        let external = i;
+                        Some(Self::ExternalAndInternal { external, internal })
+                    }
+                    KeychainKind::Internal => Some(Self::Internal(i)),
+                },
+                Some(Self::ExternalAndInternal {
+                    mut external,
+                    mut internal,
+                }) => {
+                    match k {
+                        KeychainKind::External => external = i,
+                        KeychainKind::Internal => internal = i,
+                    };
+                    Some(Self::ExternalAndInternal { external, internal })
+                }
+            })
+    }
+
+    /// Get the external keychain's derivation index (if any).
+    pub fn external_index(&self) -> Option<u32> {
+        match self {
+            KeychainDerivation::External(external) => Some(*external),
+            KeychainDerivation::Internal(_) => None,
+            KeychainDerivation::ExternalAndInternal { external, .. } => Some(*external),
+        }
+    }
+
+    /// Get the internal keychain's derivation index (if any).
+    pub fn internal_index(&self) -> Option<u32> {
+        match self {
+            KeychainDerivation::External(_) => None,
+            KeychainDerivation::Internal(internal) => Some(*internal),
+            KeychainDerivation::ExternalAndInternal { internal, .. } => Some(*internal),
+        }
+    }
+}
+
 /// An unspent output owned by a [`Wallet`].
 ///
 /// [`Wallet`]: crate::Wallet
@@ -55,12 +133,10 @@ pub struct LocalOutput {
     pub outpoint: OutPoint,
     /// Transaction output
     pub txout: TxOut,
-    /// Type of keychain
-    pub keychain: KeychainKind,
     /// Whether this UTXO is spent or not
     pub is_spent: bool,
-    /// The derivation index for the script pubkey in the wallet
-    pub derivation_index: u32,
+    /// Keychain derivation of this output's script pubkey
+    pub keychain_derivation: KeychainDerivation,
     /// The confirmation time for transaction containing this utxo
     pub confirmation_time: ConfirmationTime,
 }
