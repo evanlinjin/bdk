@@ -364,9 +364,7 @@ impl LocalChain {
     ///
     /// [module-level documentation]: crate::local_chain
     pub fn apply_update(&mut self, update: CheckPoint) -> Result<ChangeSet, CannotConnectError> {
-        let update_chain = LocalChain {
-            tip: update.clone(),
-        };
+        let update_chain = LocalChain { tip: update };
         self.merge_and_apply_changeset(update_chain)
     }
 
@@ -823,6 +821,16 @@ impl LocalChain {
                     prev_update = curr_update.take();
                     prev_orig = curr_orig.take();
                 }
+            }
+        }
+
+        // Final connectivity check. If no PoA, we mandate the entire
+        // original chain is invalidated.
+        if !prev_orig_was_invalidated && !point_of_agreement_found {
+            if let Some(curr_orig) = curr_orig {
+                return Err(CannotConnectError {
+                    try_include_height: curr_orig.height(),
+                });
             }
         }
 

@@ -39,6 +39,15 @@ macro_rules! chain_update {
 }
 
 #[allow(unused_macros)]
+macro_rules! update_cp {
+    [ $(($height:expr, $hash:expr)), * ] => {{
+        #[allow(unused_mut)]
+        bdk_chain::local_chain::CheckPoint::from_block_ids([$(($height, $hash).into()),*])
+            .expect("must be in order")
+    }};
+}
+
+#[allow(unused_macros)]
 macro_rules! changeset {
     (checkpoints: $($tail:tt)*) => { changeset!(index: TxHeight, checkpoints: $($tail)*) };
     (

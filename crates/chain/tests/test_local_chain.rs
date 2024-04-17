@@ -76,25 +76,40 @@ impl<'a> TestLocalChain<'a> {
 fn update_local_chain() {
     [
         TestLocalChain {
+            name: "disjoint chains no PoA",
+            chain: local_chain![(0, h!("g"))],
+            update: update_cp![(1, h!("A"))],
+            exp: ExpectedResult::Err(CannotConnectError { try_include_height: 0 })
+        },
+        TestLocalChain {
             name: "add first tip",
-            chain: local_chain![(0, h!("A"))],
-            update: chain_update![(0, h!("A"))],
+            chain: local_chain![(0, h!("g"))],
+            update: update_cp![(0, h!("g")), (1, h!("A"))],
             exp: ExpectedResult::Ok {
-                changeset: &[],
-                init_changeset: &[(0, Some(h!("A")))],
+                changeset: &[(1, Some(h!("A")))],
+                init_changeset: &[(0, Some(h!("g"))), (1, Some(h!("A")))],
             },
         },
         TestLocalChain {
-            name: "add second tip",
-            chain: local_chain![(0, h!("A"))],
-            update: chain_update![(0, h!("A")), (1, h!("B"))],
+            name: "add one above PoA",
+            chain: local_chain![(0, h!("g")), (1, h!("A"))],
+            update: update_cp![(1, h!("A")), (2, h!("B"))],
             exp: ExpectedResult::Ok {
-                changeset: &[(1, Some(h!("B")))],
-                init_changeset: &[(0, Some(h!("A"))), (1, Some(h!("B")))],
+                changeset: &[(2, Some(h!("B")))],
+                init_changeset: &[(0, Some(h!("g"))), (1, Some(h!("A"))), (2, Some(h!("B")))],
             },
         },
         TestLocalChain {
-            name: "two disjoint chains cannot merge",
+            name: "introduce older below PoA",
+            chain: local_chain![(0, h!("g")), (2, h!("B"))],
+            update: update_cp![(1, h!("A")), (2, h!("B"))],
+            exp: ExpectedResult::Ok {
+                changeset: &[(1, Some(h!("A")))],
+                init_changeset: &[(0, Some(h!("g"))), (1, Some(h!("A"))), (2, Some(h!("B")))],
+            },
+        },
+        TestLocalChain {
+            name: "disjoint chains above PoA",
             chain: local_chain![(0, h!("_")), (1, h!("A"))],
             update: chain_update![(0, h!("_")), (2, h!("B"))],
             exp: ExpectedResult::Err(CannotConnectError {
