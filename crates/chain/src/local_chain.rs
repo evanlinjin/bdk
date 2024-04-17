@@ -367,18 +367,7 @@ impl LocalChain {
         let update_chain = LocalChain {
             tip: update.clone(),
         };
-        let (changeset, can_replace) = self.merge_chains(update_chain)?;
-        if can_replace {
-            self.tip = update;
-        } else {
-            // `._check_index_is_consistent_with_tip` and `._check_changeset_is_applied` is called in
-            // `.apply_changeset`
-            self.apply_changeset(&changeset)
-                .map_err(|_| CannotConnectError {
-                    try_include_height: 0,
-                })?;
-        }
-        Ok(changeset)
+        self.merge_and_apply_changeset(update_chain)
     }
 
     /// Update the chain with a given [`Header`] at `height` which you claim is connected to a existing block in the chain.
@@ -704,6 +693,14 @@ impl core::fmt::Display for CannotConnectError {
 #[cfg(feature = "std")]
 impl std::error::Error for CannotConnectError {}
 
+impl From<MissingGenesisError> for CannotConnectError {
+    fn from(_err: MissingGenesisError) -> Self {
+        Self {
+            try_include_height: 0,
+        }
+    }
+}
+
 /// The error type for [`LocalChain::apply_header_connected_to`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplyHeaderError {
@@ -728,12 +725,9 @@ impl core::fmt::Display for ApplyHeaderError {
 #[cfg(feature = "std")]
 impl std::error::Error for ApplyHeaderError {}
 
-/// Applies `update_tip` onto `original_tip`.
-///
-/// On success, a tuple is returned `(changeset, can_replace)`. If `can_replace` is true, then the
-/// `update_tip` can replace the `original_tip`.
+/// Merges two chains by applying `other` to `self`, provided they share a point of agreement.
 impl LocalChain {
-    fn merge_chains(&mut self, other: Self) -> Result<(ChangeSet, bool), CannotConnectError> {
+    fn merge_and_apply_changeset(&mut self, other: Self) -> Result<ChangeSet, CannotConnectError> {
         let mut changeset = ChangeSet::default();
         let mut orig = self.tip.clone().iter();
         let mut update = other.tip.clone().iter();
@@ -744,11 +738,8 @@ impl LocalChain {
         let mut point_of_agreement_found = false;
         let mut prev_orig_was_invalidated = false;
         let mut potentially_invalidated_heights = vec![];
-
-        // Flag to set if heights are removed from original chain. If no heights are removed, and we
-        // have a matching node pointer between the two chains, we can conclude that the update tip can
-        // just replace the original tip.
-        let mut has_removed_heights = false;
+        // whether all heights in `self` are present in `other`
+        let mut all_heights_present = true;
 
         // To find the difference between the new chain and the original we iterate over both of them
         // from the tip backwards in tandem. We always dealing with the highest one from either chain
@@ -773,9 +764,8 @@ impl LocalChain {
                     // this block might be gone if an earlier block gets invalidated
                     potentially_invalidated_heights.push(o.height());
                     prev_orig_was_invalidated = false;
+                    all_heights_present = false;
                     prev_orig = curr_orig.take();
-
-                    has_removed_heights = true;
 
                     // OPTIMIZATION: we have run out of update blocks so we don't need to continue
                     // iterating because there's no possibility of adding anything to changeset.
@@ -801,10 +791,17 @@ impl LocalChain {
                         }
                         point_of_agreement_found = true;
                         prev_orig_was_invalidated = false;
-                        // OPTIMIZATION 2 -- if we have the same underlying pointer at this point, we
+                        // OPTIMIZATION -- if we have the same underlying pointer at this point, we
                         // can guarantee that no older blocks are introduced.
+                        // OPTIMIZATION -- if update heights are a superset of the original heights,
+                        // we can skip applying the changeset.
                         if Arc::as_ptr(&o.0) == Arc::as_ptr(&u.0) {
-                            return Ok((changeset, !has_removed_heights));
+                            if all_heights_present {
+                                self.tip = other.tip;
+                            } else {
+                                self.apply_changeset(&changeset)?;
+                            }
+                            return Ok(changeset);
                         }
                     } else {
                         // We have an invalidation height so we set the height to the updated hash and
@@ -838,6 +835,7 @@ impl LocalChain {
             }
         }
 
-        Ok((changeset, false))
+        self.apply_changeset(&changeset)?;
+        Ok(changeset)
     }
 }
