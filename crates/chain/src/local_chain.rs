@@ -728,6 +728,7 @@ impl std::error::Error for ApplyHeaderError {}
 /// Merges two chains by applying `other` to `self`, provided they share a point of agreement.
 impl LocalChain {
     fn merge_and_apply_changeset(&mut self, other: Self) -> Result<ChangeSet, CannotConnectError> {
+        use core::cmp::Ordering;
         let mut changeset = ChangeSet::default();
         let mut orig = self.tip.clone().iter();
         let mut update = other.tip.clone().iter();
@@ -742,7 +743,7 @@ impl LocalChain {
         let mut all_heights_present = true;
 
         // To find the difference between the new chain and the original we iterate over both of them
-        // from the tip backwards in tandem. We always dealing with the highest one from either chain
+        // from the tip backwards in tandem. We're always dealing with the highest one from either chain
         // first and move to the next highest. The crucial logic is applied when they have blocks at the
         // same height.
         loop {
@@ -752,29 +753,33 @@ impl LocalChain {
             if curr_update.is_none() {
                 curr_update = update.next();
             }
+            if curr_update.is_none() {
+                break;
+            }
 
-            match (curr_orig.as_ref(), curr_update.as_ref()) {
-                // Update block that doesn't exist in the original chain
-                (o, Some(u)) if Some(u.height()) > o.map(|o| o.height()) => {
+            // Comparing heights of other to self
+            match curr_update
+                .as_ref()
+                .map(CheckPoint::height)
+                .cmp(&curr_orig.as_ref().map(CheckPoint::height))
+            {
+                Ordering::Greater => {
+                    // Update block that doesn't exist in the original chain
+                    let u = curr_update.as_ref().unwrap();
                     changeset.insert(u.height(), Some(u.hash()));
                     prev_update = curr_update.take();
                 }
-                // Original block that isn't in the update
-                (Some(o), u) if Some(o.height()) > u.map(|u| u.height()) => {
-                    // this block might be gone if an earlier block gets invalidated
-                    potentially_invalidated_heights.push(o.height());
+                Ordering::Less => {
+                    // Original block that isn't in the update
+                    potentially_invalidated_heights.push(curr_orig.as_ref().unwrap().height());
                     prev_orig_was_invalidated = false;
                     all_heights_present = false;
                     prev_orig = curr_orig.take();
-
-                    // OPTIMIZATION: we have run out of update blocks so we don't need to continue
-                    // iterating because there's no possibility of adding anything to changeset.
-                    if u.is_none() {
-                        break;
-                    }
                 }
-                (Some(o), Some(u)) => {
-                    if o.hash() == u.hash() {
+                Ordering::Equal => {
+                    if curr_orig.as_ref().map(CheckPoint::hash)
+                        == curr_update.as_ref().map(CheckPoint::hash)
+                    {
                         // We have found our point of agreement 🎉 -- we require that the previous (i.e.
                         // higher because we are iterating backwards) block in the original chain was
                         // invalidated (if it exists). This ensures that there is an unambiguous point of
@@ -795,6 +800,8 @@ impl LocalChain {
                         // can guarantee that no older blocks are introduced.
                         // OPTIMIZATION -- if update heights are a superset of the original heights,
                         // we can skip applying the changeset.
+                        let o = curr_orig.as_ref().unwrap();
+                        let u = curr_update.as_ref().unwrap();
                         if Arc::as_ptr(&o.0) == Arc::as_ptr(&u.0) {
                             if all_heights_present {
                                 self.tip = other.tip;
@@ -806,6 +813,7 @@ impl LocalChain {
                     } else {
                         // We have an invalidation height so we set the height to the updated hash and
                         // also purge all the original chain block hashes above this block.
+                        let u = curr_update.as_ref().unwrap();
                         changeset.insert(u.height(), Some(u.hash()));
                         for invalidated_height in potentially_invalidated_heights.drain(..) {
                             changeset.insert(invalidated_height, None);
@@ -815,23 +823,6 @@ impl LocalChain {
                     prev_update = curr_update.take();
                     prev_orig = curr_orig.take();
                 }
-                (None, None) => {
-                    break;
-                }
-                _ => {
-                    unreachable!("compiler cannot tell that everything has been covered")
-                }
-            }
-        }
-
-        // When we don't have a point of agreement you can imagine it is implicitly the
-        // genesis block so we need to do the final connectivity check which in this case
-        // just means making sure the entire original chain was invalidated.
-        if !prev_orig_was_invalidated && !point_of_agreement_found {
-            if let Some(prev_orig) = prev_orig {
-                return Err(CannotConnectError {
-                    try_include_height: prev_orig.height(),
-                });
             }
         }
 
