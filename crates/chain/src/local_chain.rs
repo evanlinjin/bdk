@@ -364,7 +364,10 @@ impl LocalChain {
     ///
     /// [module-level documentation]: crate::local_chain
     pub fn apply_update(&mut self, update: CheckPoint) -> Result<ChangeSet, CannotConnectError> {
-        let (changeset, can_replace) = merge_chains(self.tip.clone(), update.clone())?;
+        let update_chain = LocalChain {
+            tip: update.clone(),
+        };
+        let (changeset, can_replace) = self.merge_chains(update_chain)?;
         if can_replace {
             self.tip = update;
         } else {
@@ -729,111 +732,112 @@ impl std::error::Error for ApplyHeaderError {}
 ///
 /// On success, a tuple is returned `(changeset, can_replace)`. If `can_replace` is true, then the
 /// `update_tip` can replace the `original_tip`.
-fn merge_chains(
-    original_tip: CheckPoint,
-    update_tip: CheckPoint,
-) -> Result<(ChangeSet, bool), CannotConnectError> {
-    let mut changeset = ChangeSet::default();
-    let mut orig = original_tip.into_iter();
-    let mut update = update_tip.into_iter();
-    let mut curr_orig = None;
-    let mut curr_update = None;
-    let mut prev_orig: Option<CheckPoint> = None;
-    let mut prev_update: Option<CheckPoint> = None;
-    let mut point_of_agreement_found = false;
-    let mut prev_orig_was_invalidated = false;
-    let mut potentially_invalidated_heights = vec![];
+impl LocalChain {
+    fn merge_chains(&mut self, other: Self) -> Result<(ChangeSet, bool), CannotConnectError> {
+        let mut changeset = ChangeSet::default();
+        let mut orig = self.tip.clone().iter();
+        let mut update = other.tip.clone().iter();
+        let mut curr_orig = None;
+        let mut curr_update = None;
+        let mut prev_orig: Option<CheckPoint> = None;
+        let mut prev_update: Option<CheckPoint> = None;
+        let mut point_of_agreement_found = false;
+        let mut prev_orig_was_invalidated = false;
+        let mut potentially_invalidated_heights = vec![];
 
-    // Flag to set if heights are removed from original chain. If no heights are removed, and we
-    // have a matching node pointer between the two chains, we can conclude that the update tip can
-    // just replace the original tip.
-    let mut has_removed_heights = false;
+        // Flag to set if heights are removed from original chain. If no heights are removed, and we
+        // have a matching node pointer between the two chains, we can conclude that the update tip can
+        // just replace the original tip.
+        let mut has_removed_heights = false;
 
-    // To find the difference between the new chain and the original we iterate over both of them
-    // from the tip backwards in tandem. We always dealing with the highest one from either chain
-    // first and move to the next highest. The crucial logic is applied when they have blocks at the
-    // same height.
-    loop {
-        if curr_orig.is_none() {
-            curr_orig = orig.next();
-        }
-        if curr_update.is_none() {
-            curr_update = update.next();
-        }
-
-        match (curr_orig.as_ref(), curr_update.as_ref()) {
-            // Update block that doesn't exist in the original chain
-            (o, Some(u)) if Some(u.height()) > o.map(|o| o.height()) => {
-                changeset.insert(u.height(), Some(u.hash()));
-                prev_update = curr_update.take();
+        // To find the difference between the new chain and the original we iterate over both of them
+        // from the tip backwards in tandem. We always dealing with the highest one from either chain
+        // first and move to the next highest. The crucial logic is applied when they have blocks at the
+        // same height.
+        loop {
+            if curr_orig.is_none() {
+                curr_orig = orig.next();
             }
-            // Original block that isn't in the update
-            (Some(o), u) if Some(o.height()) > u.map(|u| u.height()) => {
-                // this block might be gone if an earlier block gets invalidated
-                potentially_invalidated_heights.push(o.height());
-                prev_orig_was_invalidated = false;
-                prev_orig = curr_orig.take();
+            if curr_update.is_none() {
+                curr_update = update.next();
+            }
 
-                has_removed_heights = true;
+            match (curr_orig.as_ref(), curr_update.as_ref()) {
+                // Update block that doesn't exist in the original chain
+                (o, Some(u)) if Some(u.height()) > o.map(|o| o.height()) => {
+                    changeset.insert(u.height(), Some(u.hash()));
+                    prev_update = curr_update.take();
+                }
+                // Original block that isn't in the update
+                (Some(o), u) if Some(o.height()) > u.map(|u| u.height()) => {
+                    // this block might be gone if an earlier block gets invalidated
+                    potentially_invalidated_heights.push(o.height());
+                    prev_orig_was_invalidated = false;
+                    prev_orig = curr_orig.take();
 
-                // OPTIMIZATION: we have run out of update blocks so we don't need to continue
-                // iterating because there's no possibility of adding anything to changeset.
-                if u.is_none() {
+                    has_removed_heights = true;
+
+                    // OPTIMIZATION: we have run out of update blocks so we don't need to continue
+                    // iterating because there's no possibility of adding anything to changeset.
+                    if u.is_none() {
+                        break;
+                    }
+                }
+                (Some(o), Some(u)) => {
+                    if o.hash() == u.hash() {
+                        // We have found our point of agreement 🎉 -- we require that the previous (i.e.
+                        // higher because we are iterating backwards) block in the original chain was
+                        // invalidated (if it exists). This ensures that there is an unambiguous point of
+                        // connection to the original chain from the update chain (i.e. we know the
+                        // precisely which original blocks are invalid).
+                        if !prev_orig_was_invalidated && !point_of_agreement_found {
+                            if let (Some(prev_orig), Some(_prev_update)) =
+                                (&prev_orig, &prev_update)
+                            {
+                                return Err(CannotConnectError {
+                                    try_include_height: prev_orig.height(),
+                                });
+                            }
+                        }
+                        point_of_agreement_found = true;
+                        prev_orig_was_invalidated = false;
+                        // OPTIMIZATION 2 -- if we have the same underlying pointer at this point, we
+                        // can guarantee that no older blocks are introduced.
+                        if Arc::as_ptr(&o.0) == Arc::as_ptr(&u.0) {
+                            return Ok((changeset, !has_removed_heights));
+                        }
+                    } else {
+                        // We have an invalidation height so we set the height to the updated hash and
+                        // also purge all the original chain block hashes above this block.
+                        changeset.insert(u.height(), Some(u.hash()));
+                        for invalidated_height in potentially_invalidated_heights.drain(..) {
+                            changeset.insert(invalidated_height, None);
+                        }
+                        prev_orig_was_invalidated = true;
+                    }
+                    prev_update = curr_update.take();
+                    prev_orig = curr_orig.take();
+                }
+                (None, None) => {
                     break;
                 }
-            }
-            (Some(o), Some(u)) => {
-                if o.hash() == u.hash() {
-                    // We have found our point of agreement 🎉 -- we require that the previous (i.e.
-                    // higher because we are iterating backwards) block in the original chain was
-                    // invalidated (if it exists). This ensures that there is an unambiguous point of
-                    // connection to the original chain from the update chain (i.e. we know the
-                    // precisely which original blocks are invalid).
-                    if !prev_orig_was_invalidated && !point_of_agreement_found {
-                        if let (Some(prev_orig), Some(_prev_update)) = (&prev_orig, &prev_update) {
-                            return Err(CannotConnectError {
-                                try_include_height: prev_orig.height(),
-                            });
-                        }
-                    }
-                    point_of_agreement_found = true;
-                    prev_orig_was_invalidated = false;
-                    // OPTIMIZATION 2 -- if we have the same underlying pointer at this point, we
-                    // can guarantee that no older blocks are introduced.
-                    if Arc::as_ptr(&o.0) == Arc::as_ptr(&u.0) {
-                        return Ok((changeset, !has_removed_heights));
-                    }
-                } else {
-                    // We have an invalidation height so we set the height to the updated hash and
-                    // also purge all the original chain block hashes above this block.
-                    changeset.insert(u.height(), Some(u.hash()));
-                    for invalidated_height in potentially_invalidated_heights.drain(..) {
-                        changeset.insert(invalidated_height, None);
-                    }
-                    prev_orig_was_invalidated = true;
+                _ => {
+                    unreachable!("compiler cannot tell that everything has been covered")
                 }
-                prev_update = curr_update.take();
-                prev_orig = curr_orig.take();
-            }
-            (None, None) => {
-                break;
-            }
-            _ => {
-                unreachable!("compiler cannot tell that everything has been covered")
             }
         }
-    }
 
-    // When we don't have a point of agreement you can imagine it is implicitly the
-    // genesis block so we need to do the final connectivity check which in this case
-    // just means making sure the entire original chain was invalidated.
-    if !prev_orig_was_invalidated && !point_of_agreement_found {
-        if let Some(prev_orig) = prev_orig {
-            return Err(CannotConnectError {
-                try_include_height: prev_orig.height(),
-            });
+        // When we don't have a point of agreement you can imagine it is implicitly the
+        // genesis block so we need to do the final connectivity check which in this case
+        // just means making sure the entire original chain was invalidated.
+        if !prev_orig_was_invalidated && !point_of_agreement_found {
+            if let Some(prev_orig) = prev_orig {
+                return Err(CannotConnectError {
+                    try_include_height: prev_orig.height(),
+                });
+            }
         }
-    }
 
-    Ok((changeset, false))
+        Ok((changeset, false))
+    }
 }
