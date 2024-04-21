@@ -728,14 +728,14 @@ impl LocalChain {
     fn merge_and_apply_changeset(&mut self, other: Self) -> Result<ChangeSet, CannotConnectError> {
         use core::cmp::Ordering;
         let mut changeset = ChangeSet::default();
-        let mut orig = self.tip.clone().iter();
+        let mut cp = self.tip.clone().iter();
         let mut update = other.tip.clone().iter();
-        let mut curr_orig = None;
+        let mut curr_cp = None;
         let mut curr_update = None;
-        let mut prev_orig: Option<CheckPoint> = None;
+        let mut prev_cp: Option<CheckPoint> = None;
         let mut prev_update: Option<CheckPoint> = None;
-        let mut point_of_agreement_found = false;
-        let mut prev_orig_was_invalidated = false;
+        let mut point_of_agreement = false;
+        let mut previous_invalidated = false;
         let mut potentially_invalidated_heights = vec![];
         // whether all heights in `self` are present in `other`
         let mut all_heights_present = true;
@@ -745,8 +745,8 @@ impl LocalChain {
         // first and move to the next highest. The crucial logic is applied when they have blocks at the
         // same height.
         loop {
-            if curr_orig.is_none() {
-                curr_orig = orig.next();
+            if curr_cp.is_none() {
+                curr_cp = cp.next();
             }
             if curr_update.is_none() {
                 curr_update = update.next();
@@ -756,10 +756,12 @@ impl LocalChain {
             }
 
             // Comparing heights of other to self
+            // Note: we can `unwrap` below because we just checked `curr_update` above,
+            // AND as long as we have update blocks, `curr_cp` must not be None.
             match curr_update
                 .as_ref()
                 .map(CheckPoint::height)
-                .cmp(&curr_orig.as_ref().map(CheckPoint::height))
+                .cmp(&curr_cp.as_ref().map(CheckPoint::height))
             {
                 Ordering::Greater => {
                     // Update block that doesn't exist in the original chain
@@ -769,13 +771,13 @@ impl LocalChain {
                 }
                 Ordering::Less => {
                     // Original block that isn't in the update
-                    potentially_invalidated_heights.push(curr_orig.as_ref().unwrap().height());
-                    prev_orig_was_invalidated = false;
+                    potentially_invalidated_heights.push(curr_cp.as_ref().unwrap().height());
+                    previous_invalidated = false;
                     all_heights_present = false;
-                    prev_orig = curr_orig.take();
+                    prev_cp = curr_cp.take();
                 }
                 Ordering::Equal => {
-                    if curr_orig.as_ref().map(CheckPoint::hash)
+                    if curr_cp.as_ref().map(CheckPoint::hash)
                         == curr_update.as_ref().map(CheckPoint::hash)
                     {
                         // We have found our point of agreement 🎉 -- we require that the previous (i.e.
@@ -783,22 +785,20 @@ impl LocalChain {
                         // invalidated (if it exists). This ensures that there is an unambiguous point of
                         // connection to the original chain from the update chain (i.e. we know the
                         // precisely which original blocks are invalid).
-                        if !prev_orig_was_invalidated && !point_of_agreement_found {
-                            if let (Some(prev_orig), Some(_prev_update)) =
-                                (&prev_orig, &prev_update)
-                            {
+                        if !previous_invalidated && !point_of_agreement {
+                            if let (Some(prev_cp), Some(_prev_update)) = (&prev_cp, &prev_update) {
                                 return Err(CannotConnectError {
-                                    try_include_height: prev_orig.height(),
+                                    try_include_height: prev_cp.height(),
                                 });
                             }
                         }
-                        point_of_agreement_found = true;
-                        prev_orig_was_invalidated = false;
+                        point_of_agreement = true;
+                        previous_invalidated = false;
                         // OPTIMIZATION -- if we have the same underlying pointer at this point, we
                         // can guarantee that no older blocks are introduced.
                         // OPTIMIZATION -- if update heights are a superset of the original heights,
                         // we can skip applying the changeset.
-                        let o = curr_orig.as_ref().unwrap();
+                        let o = curr_cp.as_ref().unwrap();
                         let u = curr_update.as_ref().unwrap();
                         if Arc::as_ptr(&o.0) == Arc::as_ptr(&u.0) {
                             if all_heights_present {
@@ -816,20 +816,20 @@ impl LocalChain {
                         for invalidated_height in potentially_invalidated_heights.drain(..) {
                             changeset.insert(invalidated_height, None);
                         }
-                        prev_orig_was_invalidated = true;
+                        previous_invalidated = true;
                     }
                     prev_update = curr_update.take();
-                    prev_orig = curr_orig.take();
+                    prev_cp = curr_cp.take();
                 }
             }
         }
 
         // Final connectivity check. If no PoA, we mandate the entire
         // original chain is invalidated.
-        if !prev_orig_was_invalidated && !point_of_agreement_found {
-            if let Some(curr_orig) = curr_orig {
+        if !previous_invalidated && !point_of_agreement {
+            if let Some(curr_cp) = curr_cp {
                 return Err(CannotConnectError {
-                    try_include_height: curr_orig.height(),
+                    try_include_height: curr_cp.height(),
                 });
             }
         }
