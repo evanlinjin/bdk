@@ -168,11 +168,17 @@ const DEFAULT_LOOKAHEAD: u32 = 25;
 /// this is useful in case a user unassigns a keychain from a descriptor and after some time
 /// assigns it again.
 ///
-/// Additionally, although a keychain can only be assigned to one descriptor, different keychains
-/// can be assigned to the same descriptor. When a method returns spks/outpoints that is associated
-/// with a descriptor, it may be associated with multiple keychain variants. The keychain variant
-/// with the higher rank will be returned. Rank is determined by the [`Ord`] implementation of the
-/// keychain type. Earlier keychain variants have higher rank.
+/// # Different keychains assigned to one descriptor
+///
+/// Although a keychain can only be assigned to one descriptor, different keychains
+/// can be assigned to the same descriptor. This is not recommended.
+///
+/// If multiple keycahins are assigned to the same descriptor:
+/// 1. Methods that take in a keychain, such as [`KeychainTxOutIndex::reveal_next_spk`],
+/// will work normally when either keychain is passed in.
+/// 2. Methods that return a keychain, such as [`KeychainTxOutIndex::outpoints`] will
+/// return only the keychain variant with the highest rank.
+/// Rank is determined by the [`Ord`] implementation of the keychain type.
 ///
 /// [`Ord`]: core::cmp::Ord
 /// [`SpkTxOutIndex`]: crate::spk_txout_index::SpkTxOutIndex
