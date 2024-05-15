@@ -71,3 +71,15 @@ impl<K, A> From<indexed_tx_graph::ChangeSet<A, keychain::ChangeSet<K>>>
         }
     }
 }
+
+impl<K, A> From<bdk_chain::keychain::ChangeSet<K>> for CombinedChangeSet<K, A> {
+    fn from(indexer: bdk_chain::keychain::ChangeSet<K>) -> Self {
+        Self {
+            indexed_tx_graph: indexed_tx_graph::ChangeSet {
+                indexer,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+}
