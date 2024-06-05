@@ -12,6 +12,7 @@ use bitcoin::{
 use core::{
     fmt::Debug,
     ops::{Bound, RangeBounds},
+    u32,
 };
 
 use crate::Append;
@@ -449,8 +450,12 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
         tx: &Transaction,
         range: impl RangeBounds<K>,
     ) -> (Amount, Amount) {
-        self.inner
-            .sent_and_received(tx, self.map_to_inner_bounds(range))
+        self.map_to_inner_ranges(range)
+            .map(|(_, inner_range)| self.inner.sent_and_received(tx, inner_range))
+            .fold(
+                (Amount::ZERO, Amount::ZERO),
+                |(acc_sent, acc_recv), (sent, recv)| (acc_sent + sent, acc_recv + recv),
+            )
     }
 
     /// Computes the net value that this transaction gives to the script pubkeys in the index and
@@ -461,7 +466,9 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     ///
     /// [`sent_and_received`]: Self::sent_and_received
     pub fn net_value(&self, tx: &Transaction, range: impl RangeBounds<K>) -> SignedAmount {
-        self.inner.net_value(tx, self.map_to_inner_bounds(range))
+        self.map_to_inner_ranges(range)
+            .map(|(_, inner_range)| self.inner.net_value(tx, inner_range))
+            .sum()
     }
 }
 
@@ -943,7 +950,7 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     pub fn keychain_outpoints<'a>(
         &'a self,
         keychain: &'a K,
-    ) -> impl DoubleEndedIterator<Item = (u32, OutPoint)> + 'a {
+    ) -> impl Iterator<Item = (u32, OutPoint)> + 'a {
         self.keychain_outpoints_in_range(keychain..=keychain)
             .map(move |(_, i, op)| (i, op))
     }
@@ -952,40 +959,29 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     pub fn keychain_outpoints_in_range<'a>(
         &'a self,
         range: impl RangeBounds<K> + 'a,
-    ) -> impl DoubleEndedIterator<Item = (&'a K, u32, OutPoint)> + 'a {
-        let bounds = self.map_to_inner_bounds(range);
-        self.inner
-            .outputs_in_range(bounds)
-            .map(move |((desc_id, i), op)| {
-                let keychain = self
-                    .keychain_of_desc_id(desc_id)
-                    .expect("keychain must exist");
-                (keychain, *i, op)
+    ) -> impl Iterator<Item = (K, u32, OutPoint)> + 'a {
+        self.map_to_inner_ranges(range)
+            .flat_map(|(k, inner_range)| {
+                self.inner
+                    .outputs_in_range(inner_range)
+                    .map(move |((_, i), op)| (k.clone(), *i, op))
             })
     }
 
-    fn map_to_inner_bounds(
+    fn map_to_inner_ranges(
         &self,
         bound: impl RangeBounds<K>,
-    ) -> impl RangeBounds<(DescriptorId, u32)> {
-        let get_desc_id = |keychain| {
-            self.keychains_to_descriptor_ids
-                .get(keychain)
-                .copied()
-                .unwrap_or_else(|| DescriptorId::from_byte_array([0; 32]))
-        };
-        let start = match bound.start_bound() {
-            Bound::Included(keychain) => Bound::Included((get_desc_id(keychain), u32::MIN)),
-            Bound::Excluded(keychain) => Bound::Excluded((get_desc_id(keychain), u32::MAX)),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-        let end = match bound.end_bound() {
-            Bound::Included(keychain) => Bound::Included((get_desc_id(keychain), u32::MAX)),
-            Bound::Excluded(keychain) => Bound::Excluded((get_desc_id(keychain), u32::MIN)),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-
-        (start, end)
+    ) -> impl Iterator<Item = (K, impl RangeBounds<(DescriptorId, u32)>)> + '_ {
+        self.keychains_to_descriptor_ids
+            .range(bound)
+            .filter({
+                // We do not want to query for the same descriptor multiple times. This can happen
+                // if the caller has the same descriptor assigned to multiple keychains. The
+                // earlier `K` variant has precedence (determined by `Ord` impl of `K`).
+                let mut no_dup = BTreeSet::new();
+                move |k| no_dup.insert(*k)
+            })
+            .map(|(k, desc_id)| (k.to_owned(), (*desc_id, u32::MIN)..=(*desc_id, u32::MAX)))
     }
 
     /// Returns the highest derivation index of the `keychain` where [`KeychainTxOutIndex`] has
