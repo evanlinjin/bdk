@@ -698,7 +698,7 @@ impl Wallet {
     }
 
     /// Iterator over all keychains in this wallet
-    pub fn keychains(&self) -> impl Iterator<Item = (&KeychainKind, &ExtendedDescriptor)> {
+    pub fn keychains(&self) -> impl Iterator<Item = (KeychainKind, &ExtendedDescriptor)> {
         self.indexed_graph.index.keychains()
     }
 
@@ -741,8 +741,11 @@ impl Wallet {
     ///
     /// If writing to persistent storage fails.
     pub fn reveal_next_address(&mut self, keychain: KeychainKind) -> anyhow::Result<AddressInfo> {
-        let (next_spk, index_changeset) = self.indexed_graph.index.reveal_next_spk(&keychain);
-        let (index, spk) = next_spk.expect("Must exist (we called map_keychain)");
+        let ((index, spk), index_changeset) = self
+            .indexed_graph
+            .index
+            .reveal_next_spk(&keychain)
+            .expect("keychain must exist");
         self.persist
             .stage_and_commit(indexed_tx_graph::ChangeSet::from(index_changeset).into())?;
 
@@ -767,19 +770,23 @@ impl Wallet {
         &mut self,
         keychain: KeychainKind,
         index: u32,
-    ) -> anyhow::Result<impl Iterator<Item = AddressInfo> + '_> {
-        let (spk_iter, index_changeset) =
-            self.indexed_graph.index.reveal_to_target(&keychain, index);
-        let spk_iter = spk_iter.expect("Must exist (we called map_keychain)");
+    ) -> anyhow::Result<impl ExactSizeIterator<Item = AddressInfo> + '_> {
+        let (revealed_spks, index_changeset) = self
+            .indexed_graph
+            .index
+            .reveal_to_target(&keychain, index)
+            .expect("keychain must exist");
 
         self.persist
             .stage_and_commit(indexed_tx_graph::ChangeSet::from(index_changeset).into())?;
 
-        Ok(spk_iter.map(move |(index, spk)| AddressInfo {
-            index,
-            address: Address::from_script(&spk, self.network).expect("must have address form"),
-            keychain,
-        }))
+        Ok(revealed_spks
+            .into_iter()
+            .map(move |(index, spk)| AddressInfo {
+                index,
+                address: Address::from_script(&spk, self.network).expect("must have address form"),
+                keychain,
+            }))
     }
 
     /// Get the next unused address for the given `keychain`, i.e. the address with the lowest
@@ -792,8 +799,11 @@ impl Wallet {
     ///
     /// If writing to persistent storage fails.
     pub fn next_unused_address(&mut self, keychain: KeychainKind) -> anyhow::Result<AddressInfo> {
-        let (next_spk, index_changeset) = self.indexed_graph.index.next_unused_spk(&keychain);
-        let (index, spk) = next_spk.expect("Must exist (we called map_keychain)");
+        let ((index, spk), index_changeset) = self
+            .indexed_graph
+            .index
+            .next_unused_spk(&keychain)
+            .expect("must exist");
 
         self.persist
             .stage_and_commit(indexed_tx_graph::ChangeSet::from(index_changeset).into())?;
@@ -923,7 +933,7 @@ impl Wallet {
     /// Returns the utxo owned by this wallet corresponding to `outpoint` if it exists in the
     /// wallet's database.
     pub fn get_utxo(&self, op: OutPoint) -> Option<LocalOutput> {
-        let (keychain, index, _) = self.indexed_graph.index.txout(op)?;
+        let ((keychain, index), _) = self.indexed_graph.index.txout(op)?;
         self.indexed_graph
             .graph()
             .filter_chain_unspents(
@@ -1499,11 +1509,11 @@ impl Wallet {
         let drain_script = match params.drain_to {
             Some(ref drain_recipient) => drain_recipient.clone(),
             None => {
-                let (next_spk, index_changeset) = self
+                let ((index, spk), index_changeset) = self
                     .indexed_graph
                     .index
-                    .next_unused_spk(&KeychainKind::Internal);
-                let (index, spk) = next_spk.expect("Keychain exists (we called map_keychain)");
+                    .next_unused_spk(&KeychainKind::Internal)
+                    .expect("keychain must exist");
                 self.indexed_graph
                     .index
                     .mark_used(KeychainKind::Internal, index);
@@ -1866,7 +1876,7 @@ impl Wallet {
         self.indexed_graph
             .index
             .keychains()
-            .find(|(k, _)| *k == &keychain)
+            .find(|(k, _)| k == &keychain)
             .map(|(_, d)| d)
             .expect("keychain must exist")
     }

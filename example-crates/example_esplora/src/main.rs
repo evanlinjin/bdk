@@ -242,12 +242,8 @@ fn main() -> anyhow::Result<()> {
                 let chain = chain.lock().unwrap();
 
                 if *all_spks {
-                    let all_spks = graph
-                        .index
-                        .revealed_spks(..)
-                        .map(|(k, i, spk)| (k.to_owned(), i, spk))
-                        .collect::<Vec<_>>();
-                    request = request.chain_spks(all_spks.into_iter().map(|(k, i, spk)| {
+                    let all_spks = graph.index.revealed_spks(..).collect::<Vec<_>>();
+                    request = request.chain_spks(all_spks.into_iter().map(|((k, i), spk)| {
                         eprint!("scanning {}:{}", k, i);
                         // Flush early to ensure we print at every iteration.
                         let _ = io::stderr().flush();
@@ -257,7 +253,7 @@ fn main() -> anyhow::Result<()> {
                 if unused_spks {
                     let unused_spks = graph.index.unused_spks().collect::<Vec<_>>();
                     request =
-                        request.chain_spks(unused_spks.into_iter().map(move |(k, i, spk)| {
+                        request.chain_spks(unused_spks.into_iter().map(move |((k, i), spk)| {
                             eprint!(
                                 "Checking if address {} {}:{} has been used",
                                 Address::from_script(&spk, args.network).unwrap(),

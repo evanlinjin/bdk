@@ -155,7 +155,7 @@ fn new_or_load() -> anyhow::Result<()> {
             let db = new_or_load(&file_path).expect("must create db");
             let wallet = Wallet::new_or_load(desc, change_desc, db, Network::Testnet)
                 .expect("must init wallet");
-            wallet.keychains().map(|(k, v)| (*k, v.clone())).collect()
+            wallet.keychains().map(|(k, v)| (k, v.clone())).collect()
         };
 
         // wrong network
@@ -254,7 +254,7 @@ fn new_or_load() -> anyhow::Result<()> {
             assert_eq!(wallet.network(), Network::Testnet);
             assert!(wallet
                 .keychains()
-                .map(|(k, v)| (*k, v.clone()))
+                .map(|(k, v)| (k, v.clone()))
                 .eq(wallet_keychains));
         }
         Ok(())

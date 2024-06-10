@@ -71,3 +71,9 @@ impl core::ops::Add for Balance {
         }
     }
 }
+
+/// A tuple of keychain index and corresponding data.
+pub type Indexed<S> = (u32, S);
+
+/// A tuple of keychain, index and the corresponding data.
+pub type KeychainIndexed<K, S> = ((K, u32), S);

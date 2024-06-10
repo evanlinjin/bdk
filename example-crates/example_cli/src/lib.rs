@@ -252,22 +252,24 @@ where
     let internal_keychain = if graph
         .index
         .keychains()
-        .any(|(k, _)| *k == Keychain::Internal)
+        .any(|(k, _)| k == Keychain::Internal)
     {
         Keychain::Internal
     } else {
         Keychain::External
     };
 
-    let (change_next_spk, change_changeset) = graph.index.next_unused_spk(&internal_keychain);
-    let (change_index, change_script) = change_next_spk.expect("must have next spk");
+    let ((change_index, change_script), change_changeset) = graph
+        .index
+        .next_unused_spk(&internal_keychain)
+        .expect("must have next spk");
     changeset.append(change_changeset);
 
     let change_plan = bdk_tmp_plan::plan_satisfaction(
         &graph
             .index
             .keychains()
-            .find(|(k, _)| *k == &internal_keychain)
+            .find(|(k, _)| k == &internal_keychain)
             .expect("must exist")
             .1
             .at_derivation_index(change_index)
@@ -286,7 +288,7 @@ where
         min_drain_value: graph
             .index
             .keychains()
-            .find(|(k, _)| *k == &internal_keychain)
+            .find(|(k, _)| k == &internal_keychain)
             .expect("must exist")
             .1
             .dust_value(),
@@ -431,7 +433,7 @@ pub fn planned_utxos<A: Anchor, O: ChainOracle, K: Clone + bdk_tmp_plan::CanDeri
             let desc = graph
                 .index
                 .keychains()
-                .find(|(keychain, _)| *keychain == &k)
+                .find(|(keychain, _)| keychain == &k)
                 .expect("keychain must exist")
                 .1
                 .at_derivation_index(i)
@@ -469,8 +471,8 @@ where
                         _ => unreachable!("only these two variants exist in match arm"),
                     };
 
-                    let (next_spk, index_changeset) = spk_chooser(index, &Keychain::External);
-                    let (spk_i, spk) = next_spk.expect("keychain must exist");
+                    let ((spk_i, spk), index_changeset) =
+                        spk_chooser(index, &Keychain::External).expect("keychain must exist");
                     let db = &mut *db.lock().unwrap();
                     db.stage_and_commit(C::from((
                         local_chain::ChangeSet::default(),

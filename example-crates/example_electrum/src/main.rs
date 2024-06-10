@@ -225,12 +225,8 @@ fn main() -> anyhow::Result<()> {
             let mut request = SyncRequest::from_chain_tip(chain_tip.clone());
 
             if all_spks {
-                let all_spks = graph
-                    .index
-                    .revealed_spks(..)
-                    .map(|(k, i, spk)| (k.to_owned(), i, spk))
-                    .collect::<Vec<_>>();
-                request = request.chain_spks(all_spks.into_iter().map(|(k, spk_i, spk)| {
+                let all_spks = graph.index.revealed_spks(..).collect::<Vec<_>>();
+                request = request.chain_spks(all_spks.into_iter().map(|((k, spk_i), spk)| {
                     eprint!("Scanning {}: {}", k, spk_i);
                     spk
                 }));
@@ -238,7 +234,7 @@ fn main() -> anyhow::Result<()> {
             if unused_spks {
                 let unused_spks = graph.index.unused_spks().collect::<Vec<_>>();
                 request =
-                    request.chain_spks(unused_spks.into_iter().map(move |(k, spk_i, spk)| {
+                    request.chain_spks(unused_spks.into_iter().map(move |((k, spk_i), spk)| {
                         eprint!(
                             "Checking if address {} {}:{} has been used",
                             Address::from_script(&spk, args.network).unwrap(),

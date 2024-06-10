@@ -149,18 +149,22 @@ fn test_list_owned_txouts() {
     let mut untrusted_spks: Vec<ScriptBuf> = Vec::new();
 
     {
-        // we need to scope here to take immutanble reference of the graph
+        // we need to scope here to take immutable reference of the graph
         for exp_i in 0_u32..10 {
-            let (next_spk, _) = graph.index.reveal_next_spk(&"keychain_1".to_string());
-            let (spk_i, spk) = next_spk.expect("must exist");
+            let ((spk_i, spk), _) = graph
+                .index
+                .reveal_next_spk(&"keychain_1".to_string()) // panic here?
+                .expect("must exist");
             assert_eq!(spk_i, exp_i);
             trusted_spks.push(spk);
         }
     }
     {
         for exp_i in 0_u32..10 {
-            let (next_spk, _) = graph.index.reveal_next_spk(&"keychain_2".to_string());
-            let (spk_i, spk) = next_spk.expect("must exist");
+            let ((spk_i, spk), _) = graph
+                .index
+                .reveal_next_spk(&"keychain_2".to_string())
+                .expect("must exist");
             assert_eq!(spk_i, exp_i);
             untrusted_spks.push(spk);
         }
