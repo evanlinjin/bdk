@@ -34,10 +34,7 @@ fn insert_relevant_txs() {
     let mut graph = IndexedTxGraph::<ConfirmationHeightAnchor, KeychainTxOutIndex<()>>::new(
         KeychainTxOutIndex::new(10),
     );
-    let _ = graph
-        .index
-        .insert_descriptor((), descriptor.clone())
-        .unwrap();
+    let _ = graph.index.insert_keychain((), descriptor.clone()).unwrap();
 
     let tx_a = Transaction {
         output: vec![
@@ -145,12 +142,12 @@ fn test_list_owned_txouts() {
 
     assert!(!graph
         .index
-        .insert_descriptor("keychain_1".into(), desc_1)
+        .insert_keychain("keychain_1".into(), desc_1)
         .unwrap()
         .is_empty());
     assert!(!graph
         .index
-        .insert_descriptor("keychain_2".into(), desc_2)
+        .insert_keychain("keychain_2".into(), desc_2)
         .unwrap()
         .is_empty());
 

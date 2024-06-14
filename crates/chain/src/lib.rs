@@ -45,7 +45,7 @@ pub use miniscript;
 #[cfg(feature = "miniscript")]
 mod descriptor_ext;
 #[cfg(feature = "miniscript")]
-pub use descriptor_ext::{DescriptorExt, DescriptorId};
+pub use descriptor_ext::{DescriptorExt, KeychainId};
 #[cfg(feature = "miniscript")]
 mod spk_iter;
 #[cfg(feature = "miniscript")]

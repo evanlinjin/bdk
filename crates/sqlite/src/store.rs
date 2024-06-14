@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use crate::Error;
 use bdk_chain::CombinedChangeSet;
 use bdk_chain::{
-    indexed_tx_graph, keychain, local_chain, tx_graph, Anchor, Append, DescriptorExt, DescriptorId,
+    indexed_tx_graph, keychain, local_chain, tx_graph, Anchor, Append, DescriptorExt, KeychainId,
 };
 
 /// Persists data in to a relational schema based [SQLite] database file.
@@ -249,7 +249,7 @@ where
     /// Select descriptor last revealed indexes.
     fn select_last_revealed(
         db_transaction: &rusqlite::Transaction,
-    ) -> Result<BTreeMap<DescriptorId, u32>, Error> {
+    ) -> Result<BTreeMap<KeychainId, u32>, Error> {
         let mut select_last_revealed_stmt = db_transaction
             .prepare_cached(
                 "SELECT descriptor, last_revealed FROM keychain WHERE last_revealed IS NOT NULL",

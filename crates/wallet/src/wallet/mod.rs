@@ -2501,20 +2501,20 @@ fn create_signers<E: IntoWalletDescriptor>(
     let (descriptor, keymap) = descriptor;
     let signers = Arc::new(SignersContainer::build(keymap, &descriptor, secp));
     let _ = index
-        .insert_descriptor(KeychainKind::External, descriptor)
+        .insert_keychain(KeychainKind::External, descriptor)
         .expect("this is the first descriptor we're inserting");
 
     let (descriptor, keymap) = change_descriptor;
     let change_signers = Arc::new(SignersContainer::build(keymap, &descriptor, secp));
     let _ = index
-        .insert_descriptor(KeychainKind::Internal, descriptor)
+        .insert_keychain(KeychainKind::Internal, descriptor)
         .map_err(|e| {
-            use bdk_chain::keychain::InsertDescriptorError;
+            use bdk_chain::keychain::InsertKeychainError;
             match e {
-                InsertDescriptorError::DescriptorAlreadyAssigned { .. } => {
+                InsertKeychainError::DescriptorAlreadyLabelled { .. } => {
                     crate::descriptor::error::Error::ExternalAndInternalAreTheSame
                 }
-                InsertDescriptorError::KeychainAlreadyAssigned { .. } => {
+                InsertKeychainError::LabelAlreadyUsed { .. } => {
                     unreachable!("this is the first time we're assigning internal")
                 }
             }

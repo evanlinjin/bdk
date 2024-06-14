@@ -9,12 +9,16 @@
 //! also maintains "revealed" and "lookahead" index counts per keychain.
 //!
 //! [`SpkTxOutIndex`]: crate::SpkTxOutIndex
-
 #[cfg(feature = "miniscript")]
 mod txout_index;
 use bitcoin::{Amount, ScriptBuf};
 #[cfg(feature = "miniscript")]
 pub use txout_index::*;
+
+/// A tuple of the keychain's derivation index and `T` representing the indexed value.
+pub type Indexed<T> = (u32, T);
+/// A tuple of the keychain's label (`L`), derivation index (`u32`) and a `T` associated with them.
+pub type KeychainIndexed<L, T> = ((L, u32), T);
 
 /// Balance, differentiated into various categories.
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
@@ -48,11 +52,6 @@ impl Balance {
         self.confirmed + self.trusted_pending + self.untrusted_pending + self.immature
     }
 }
-
-/// A tuple of keychain index and `T` representing the indexed value.
-pub type Indexed<T> = (u32, T);
-/// A tuple of keychain `K`, derivation index (`u32`) and a `T` associated with them.
-pub type KeychainIndexed<K, T> = ((K, u32), T);
 
 impl core::fmt::Display for Balance {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

@@ -717,7 +717,7 @@ where
     // them in the index here. However, the keymap is not stored in the database.
     let (descriptor, mut keymap) =
         Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &args.descriptor)?;
-    let _ = index.insert_descriptor(Keychain::External, descriptor)?;
+    let _ = index.insert_keychain(Keychain::External, descriptor)?;
 
     if let Some((internal_descriptor, internal_keymap)) = args
         .change_descriptor
@@ -726,7 +726,7 @@ where
         .transpose()?
     {
         keymap.extend(internal_keymap);
-        let _ = index.insert_descriptor(Keychain::Internal, internal_descriptor)?;
+        let _ = index.insert_keychain(Keychain::Internal, internal_descriptor)?;
     }
 
     let mut db_backend = match Store::<C>::open_or_create_new(db_magic, &args.db_path) {

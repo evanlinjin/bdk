@@ -12,7 +12,7 @@ hash_newtype! {
     /// in particular, we use it to persist application state changes related to the
     /// descriptor without having to re-write the whole descriptor each time.
     ///
-    pub struct DescriptorId(pub sha256::Hash);
+    pub struct KeychainId(pub sha256::Hash);
 }
 
 /// A trait to extend the functionality of a miniscript descriptor.
@@ -23,7 +23,7 @@ pub trait DescriptorExt {
 
     /// Returns the descriptor id, calculated as the sha256 of the descriptor, checksum not
     /// included.
-    fn descriptor_id(&self) -> DescriptorId;
+    fn descriptor_id(&self) -> KeychainId;
 }
 
 impl DescriptorExt for Descriptor<DescriptorPublicKey> {
@@ -35,10 +35,10 @@ impl DescriptorExt for Descriptor<DescriptorPublicKey> {
             .to_sat()
     }
 
-    fn descriptor_id(&self) -> DescriptorId {
+    fn descriptor_id(&self) -> KeychainId {
         let desc = self.to_string();
         let desc_without_checksum = desc.split('#').next().expect("Must be here");
         let descriptor_bytes = <Vec<u8>>::from(desc_without_checksum.as_bytes());
-        DescriptorId(sha256::Hash::hash(&descriptor_bytes))
+        KeychainId(sha256::Hash::hash(&descriptor_bytes))
     }
 }
