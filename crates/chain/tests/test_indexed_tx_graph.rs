@@ -10,7 +10,7 @@ use bdk_chain::{
     indexed_tx_graph::{self, IndexedTxGraph},
     keychain::{self, Balance, KeychainTxOutIndex},
     local_chain::LocalChain,
-    tx_graph, Append, ChainPosition, ConfirmationHeightAnchor, DescriptorExt,
+    tx_graph, ChainPosition, ConfirmationHeightAnchor, DescriptorExt,
 };
 use bitcoin::{
     secp256k1::Secp256k1, Amount, OutPoint, Script, ScriptBuf, Transaction, TxIn, TxOut,
@@ -75,7 +75,6 @@ fn insert_relevant_txs() {
         },
         indexer: keychain::ChangeSet {
             last_revealed: [(descriptor.descriptor_id(), 9_u32)].into(),
-            keychains_added: [].into(),
         },
     };
 
@@ -89,7 +88,6 @@ fn insert_relevant_txs() {
         graph: changeset.graph,
         indexer: keychain::ChangeSet {
             last_revealed: changeset.indexer.last_revealed,
-            keychains_added: [((), descriptor)].into(),
         },
     };
 
@@ -140,16 +138,14 @@ fn test_list_owned_txouts() {
         KeychainTxOutIndex::new(10),
     );
 
-    assert!(!graph
+    assert!(graph
         .index
         .insert_keychain("keychain_1".into(), desc_1)
-        .unwrap()
-        .is_empty());
-    assert!(!graph
+        .unwrap());
+    assert!(graph
         .index
         .insert_keychain("keychain_2".into(), desc_2)
-        .unwrap()
-        .is_empty());
+        .unwrap());
 
     // Get trusted and untrusted addresses
 

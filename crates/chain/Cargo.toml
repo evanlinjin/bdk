@@ -20,11 +20,15 @@ serde_crate = { package = "serde", version = "1", optional = true, features = ["
 hashbrown = { version = "0.9.1", optional = true, features = ["serde"] }
 miniscript = { version = "12.0.0", optional = true, default-features = false }
 
+# Feature dependencies
+bdk_sqlite = { version = "0.2.0", path = "../sqlite", optional = true, default-features = false }
+
 [dev-dependencies]
 rand = "0.8"
 proptest = "1.2.0"
 
 [features]
-default = ["std", "miniscript"]
+default = ["std", "miniscript", "sqlite"]
 std = ["bitcoin/std", "miniscript?/std"]
 serde = ["serde_crate", "bitcoin/serde", "miniscript?/serde"]
+sqlite = ["serde", "bdk_sqlite", "bdk_sqlite/serde_json"]

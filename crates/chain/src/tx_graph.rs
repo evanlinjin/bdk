@@ -92,10 +92,12 @@ use crate::{
     collections::*, keychain::Balance, Anchor, Append, BlockId, ChainOracle, ChainPosition,
     FullTxOut,
 };
+use alloc::borrow::ToOwned;
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use bitcoin::{Amount, OutPoint, Script, SignedAmount, Transaction, TxOut, Txid};
+use bdk_sqlite::rusqlite::named_params;
+use bitcoin::{Amount, OutPoint, Script, ScriptBuf, SignedAmount, Transaction, TxOut, Txid};
 use core::fmt::{self, Formatter};
 use core::{
     convert::Infallible,
@@ -1247,6 +1249,224 @@ impl<A> Default for ChangeSet<A> {
     }
 }
 
+/// Parameters for storing a [`crate::tx_graph::ChangeSet`].
+#[cfg(feature = "sqlite")]
+pub struct SqlParams<'p> {
+    /// Parameters for defining the schema table.
+    pub schema: crate::sqlite_util::SchemaParams<'p>,
+    /// Transactions table name.
+    pub txs_table_name: &'p str,
+    /// Floating transaction outputs table name.
+    pub txouts_table_name: &'p str,
+    /// Anchors table name.
+    pub anchors_table_name: &'p str,
+}
+
+#[cfg(feature = "sqlite")]
+impl<'p> Default for SqlParams<'p> {
+    fn default() -> Self {
+        Self {
+            schema: crate::sqlite_util::SchemaParams::new("bdk_txgraph"),
+            txs_table_name: "bdk_txgraph_txs",
+            txouts_table_name: "bdk_txgraph_txouts",
+            anchors_table_name: "bdk_txgraph_anchors",
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl<A> bdk_sqlite::Storable for ChangeSet<A>
+where
+    A: Anchor + Clone + Ord + serde::Serialize + serde::de::DeserializeOwned,
+{
+    type Params = SqlParams<'static>;
+
+    fn init(
+        db_tx: &bdk_sqlite::rusqlite::Transaction,
+        params: &Self::Params,
+    ) -> bdk_sqlite::rusqlite::Result<()> {
+        let schema_v0: &[&str] = &[
+            // full transactions
+            &format!(
+                "CREATE TABLE {} ( \
+                txid TEXT PRIMARY KEY NOT NULL, \
+                raw_tx BLOB NOT NULL, \
+                last_seen INTEGER \
+                ) STRICT;",
+                params.txs_table_name
+            ),
+            // floating txouts
+            &format!(
+                "CREATE TABLE {} ( \
+                txid TEXT NOT NULL, \
+                vout INTEGER NOT NULL, \
+                value INTEGER NOT NULL, \
+                script BLOB NOT NULL, \
+                PRIMARY KEY (txid, vout) \
+                ) STRICT;",
+                params.txouts_table_name
+            ),
+            // anchors
+            &format!(
+                "CREATE TABLE {} ( \
+                txid TEXT NOT NULL REFERENCES bdk_txgraph_txs (txid), \
+                block_height INTEGER NOT NULL, \
+                block_hash TEXT NOT NULL, \
+                anchor BLOB NOT NULL, \
+                PRIMARY KEY (txid, block_height, block_hash) \
+                ) STRICT;",
+                params.anchors_table_name
+            ),
+        ];
+        let schema_by_version = &[schema_v0];
+
+        let current_version = params.schema.version(db_tx)?;
+
+        let schemas_to_init = {
+            let exec_from = current_version.map_or(0_usize, |v| v as usize + 1);
+            schema_by_version.iter().enumerate().skip(exec_from)
+        };
+        for (version, schema) in schemas_to_init {
+            params.schema.set_version(db_tx, version as u32)?;
+            db_tx.execute_batch(&schema.join("\n"))?;
+        }
+
+        Ok(())
+    }
+
+    fn read(
+        db_tx: &bdk_sqlite::rusqlite::Transaction,
+        params: &Self::Params,
+    ) -> bdk_sqlite::rusqlite::Result<Option<Self>> {
+        use crate::sqlite_util::Sql;
+
+        let mut changeset = Self::default();
+
+        let mut statement = db_tx.prepare(&format!(
+            "SELECT txid, raw_tx, last_seen FROM {}",
+            params.txs_table_name
+        ))?;
+        let row_iter = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Sql<Txid>>("txid")?,
+                row.get::<_, Sql<Transaction>>("raw_tx")?,
+                row.get::<_, Option<u64>>("last_seen")?,
+            ))
+        })?;
+        for row in row_iter {
+            let (Sql(txid), Sql(tx), last_seen) = row?;
+            changeset.txs.insert(Arc::new(tx));
+            if let Some(last_seen) = last_seen {
+                changeset.last_seen.insert(txid, last_seen);
+            }
+        }
+
+        let mut statement = db_tx.prepare(&format!(
+            "SELECT txid, vout, value, script FROM {}",
+            params.txouts_table_name
+        ))?;
+        let row_iter = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Sql<Txid>>("txid")?,
+                row.get::<_, u32>("vout")?,
+                row.get::<_, Sql<Amount>>("value")?,
+                row.get::<_, Sql<ScriptBuf>>("script")?,
+            ))
+        })?;
+        for row in row_iter {
+            let (Sql(txid), vout, Sql(value), Sql(script_pubkey)) = row?;
+            changeset.txouts.insert(
+                OutPoint { txid, vout },
+                TxOut {
+                    value,
+                    script_pubkey,
+                },
+            );
+        }
+
+        let mut statement = db_tx.prepare(&format!(
+            "SELECT json(anchor), txid FROM {}",
+            params.anchors_table_name
+        ))?;
+        let row_iter = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Sql<A>>("anchor")?,
+                row.get::<_, Sql<Txid>>("txid")?,
+            ))
+        })?;
+        for row in row_iter {
+            let (Sql(anchor), Sql(txid)) = row?;
+            changeset.anchors.insert((anchor, txid));
+        }
+
+        Ok(if changeset.is_empty() {
+            None
+        } else {
+            Some(changeset)
+        })
+    }
+
+    fn write(
+        &self,
+        db_tx: &bdk_sqlite::rusqlite::Transaction,
+        params: &Self::Params,
+    ) -> bdk_sqlite::rusqlite::Result<()> {
+        use crate::sqlite_util::Sql;
+
+        let mut statement = db_tx.prepare_cached(&format!(
+            "INSERT INTO {}(txid, raw_tx) VALUES(:txid, :raw_tx) ON DUPLICATE KEY UPDATE raw_tx=:raw_tx",
+            params.txs_table_name,
+        ))?;
+        for tx in &self.txs {
+            statement.execute(named_params! {
+                ":txid": Sql(tx.compute_txid()),
+                ":raw_tx": Sql(tx.as_ref().to_owned()),
+            })?;
+        }
+
+        let mut statement = db_tx
+            .prepare_cached(&format!(
+                "INSERT INTO {}(txid, last_seen) VALUES(:txid, :last_seen) ON DUPLICATE KEY UPDATE last_seen=:last_seen",
+                params.txs_table_name,
+            ))?;
+        for (&txid, &last_seen) in &self.last_seen {
+            statement.execute(named_params! {
+                ":txid": Sql(txid),
+                ":last_seen": Some(last_seen),
+            })?;
+        }
+
+        let mut statement = db_tx.prepare_cached(&format!(
+            "REPLACE INTO {}(txid, vout, value, script) VALUES(:txid, :vout, :value, :script)",
+            params.txouts_table_name
+        ))?;
+        for (op, txo) in &self.txouts {
+            statement.execute(named_params! {
+                ":txid": Sql(op.txid),
+                ":vout": op.vout,
+                ":value": Sql(txo.value),
+                ":script": Sql(txo.script_pubkey.clone()),
+            })?;
+        }
+
+        let mut statement = db_tx.prepare_cached(&format!(
+            "REPLACE INTO {}(txid, block_height, block_hash, anchor) VALUES(:txid, :block_height, :block_hash, jsonb(:anchor))",
+            params.anchors_table_name,
+        ))?;
+        for (anchor, txid) in &self.anchors {
+            let anchor_block = anchor.anchor_block();
+            statement.execute(named_params! {
+                ":txid": Sql(*txid),
+                ":block_height": anchor_block.height,
+                ":block_hash": Sql(anchor_block.hash),
+                ":anchor": Sql(anchor.to_owned()),
+            })?;
+        }
+
+        Ok(())
+    }
+}
+
 impl<A> ChangeSet<A> {
     /// Iterates over all outpoints contained within [`ChangeSet`].
     pub fn txouts(&self) -> impl Iterator<Item = (OutPoint, &TxOut)> {
@@ -1571,4 +1791,20 @@ where
 
 fn tx_outpoint_range(txid: Txid) -> RangeInclusive<OutPoint> {
     OutPoint::new(txid, u32::MIN)..=OutPoint::new(txid, u32::MAX)
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn what() {
+        let out = format!(
+            "CREATE TABLE {} ( \
+                txid TEXT PRIMARY KEY NOT NULL, \
+                raw_tx BLOB NOT NULL, \
+                last_seen INTEGER \
+            ) STRICT;",
+            "what"
+        );
+        println!("{}", out);
+    }
 }

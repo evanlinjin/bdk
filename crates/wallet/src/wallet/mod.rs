@@ -143,7 +143,7 @@ impl From<SyncResult> for Update {
 }
 
 /// The changes made to a wallet by applying an [`Update`].
-pub type ChangeSet = bdk_chain::CombinedChangeSet<KeychainKind, ConfirmationTimeHeightAnchor>;
+pub type ChangeSet = bdk_chain::WalletChangeSet;
 
 /// A derived address and the index it was found at.
 /// For convenience this automatically derefs to `Address`
@@ -369,15 +369,18 @@ impl Wallet {
     ) -> Result<Self, NewError> {
         let secp = Secp256k1::new();
         let (chain, chain_changeset) = LocalChain::from_genesis_hash(genesis_hash);
-        let mut index = KeychainTxOutIndex::<KeychainKind>::default();
 
-        let (signers, change_signers) =
-            create_signers(&mut index, &secp, descriptor, change_descriptor, network)
+        let (index, signers, change_signers) =
+            create_index_and_signers(&secp, descriptor, change_descriptor, network)
                 .map_err(NewError::Descriptor)?;
 
+        let descriptor = index.keychain(&KeychainKind::External).cloned();
+        let change_descriptor = index.keychain(&KeychainKind::Internal).cloned();
         let indexed_graph = IndexedTxGraph::new(index);
 
-        let staged = ChangeSet {
+        let stage = ChangeSet {
+            descriptor,
+            change_descriptor,
             chain: chain_changeset,
             indexed_tx_graph: indexed_graph.initial_changeset(),
             network: Some(network),
@@ -389,7 +392,7 @@ impl Wallet {
             network,
             chain,
             indexed_graph,
-            stage: staged,
+            stage,
             secp,
         })
     }
@@ -441,25 +444,17 @@ impl Wallet {
         let network = changeset.network.ok_or(LoadError::MissingNetwork)?;
         let chain =
             LocalChain::from_changeset(changeset.chain).map_err(|_| LoadError::MissingGenesis)?;
-        let mut index = KeychainTxOutIndex::<KeychainKind>::default();
-        let descriptor = changeset
-            .indexed_tx_graph
-            .indexer
-            .keychains_added
-            .get(&KeychainKind::External)
-            .ok_or(LoadError::MissingDescriptor(KeychainKind::External))?
-            .clone();
-        let change_descriptor = changeset
-            .indexed_tx_graph
-            .indexer
-            .keychains_added
-            .get(&KeychainKind::Internal)
-            .ok_or(LoadError::MissingDescriptor(KeychainKind::Internal))?
-            .clone();
 
-        let (signers, change_signers) =
-            create_signers(&mut index, &secp, descriptor, change_descriptor, network)
-                .expect("Can't fail: we passed in valid descriptors, recovered from the changeset");
+        let descriptor = changeset
+            .descriptor
+            .ok_or(LoadError::MissingDescriptor(KeychainKind::External))?;
+        let change_descriptor = changeset
+            .change_descriptor
+            .ok_or(LoadError::MissingDescriptor(KeychainKind::Internal))?;
+
+        let (index, signers, change_signers) =
+            create_index_and_signers(&secp, descriptor, change_descriptor, network)
+                .map_err(LoadError::Descriptor)?;
 
         let mut indexed_graph = IndexedTxGraph::new(index);
         indexed_graph.apply_changeset(changeset.indexed_tx_graph);
@@ -689,7 +684,7 @@ impl Wallet {
             .reveal_next_spk(&keychain)
             .expect("keychain must exist");
 
-        stage.append(indexed_tx_graph::ChangeSet::from(index_changeset).into());
+        stage.append(index_changeset.into());
 
         AddressInfo {
             index,
@@ -2489,25 +2484,35 @@ fn new_local_utxo(
     }
 }
 
-fn create_signers<E: IntoWalletDescriptor>(
-    index: &mut KeychainTxOutIndex<KeychainKind>,
+#[allow(clippy::type_complexity)]
+fn create_index_and_signers<E: IntoWalletDescriptor>(
     secp: &Secp256k1<All>,
     descriptor: E,
     change_descriptor: E,
     network: Network,
-) -> Result<(Arc<SignersContainer>, Arc<SignersContainer>), DescriptorError> {
-    let descriptor = into_wallet_descriptor_checked(descriptor, secp, network)?;
-    let change_descriptor = into_wallet_descriptor_checked(change_descriptor, secp, network)?;
-    let (descriptor, keymap) = descriptor;
-    let signers = Arc::new(SignersContainer::build(keymap, &descriptor, secp));
-    let _ = index
-        .insert_keychain(KeychainKind::External, descriptor)
-        .expect("this is the first descriptor we're inserting");
+) -> Result<
+    (
+        KeychainTxOutIndex<KeychainKind>,
+        Arc<SignersContainer>,
+        Arc<SignersContainer>,
+    ),
+    DescriptorError,
+> {
+    let mut index = KeychainTxOutIndex::<KeychainKind>::default();
 
-    let (descriptor, keymap) = change_descriptor;
-    let change_signers = Arc::new(SignersContainer::build(keymap, &descriptor, secp));
-    let _ = index
-        .insert_keychain(KeychainKind::Internal, descriptor)
+    let (descriptor, keymap) = into_wallet_descriptor_checked(descriptor, secp, network)?;
+    let signers = Arc::new(SignersContainer::build(keymap, &descriptor, secp));
+
+    let (change_descriptor, change_keymap) =
+        into_wallet_descriptor_checked(change_descriptor, secp, network)?;
+    let change_signers = Arc::new(SignersContainer::build(change_keymap, &descriptor, secp));
+
+    assert!(index
+        .insert_keychain(KeychainKind::External, descriptor)
+        .expect("first descriptor introduced must succeed"));
+
+    assert!(index
+        .insert_keychain(KeychainKind::Internal, change_descriptor)
         .map_err(|e| {
             use bdk_chain::keychain::InsertKeychainError;
             match e {
@@ -2518,9 +2523,9 @@ fn create_signers<E: IntoWalletDescriptor>(
                     unreachable!("this is the first time we're assigning internal")
                 }
             }
-        })?;
+        })?);
 
-    Ok((signers, change_signers))
+    Ok((index, signers, change_signers))
 }
 
 /// Transforms a [`FeeRate`] to `f64` with unit as sat/vb.

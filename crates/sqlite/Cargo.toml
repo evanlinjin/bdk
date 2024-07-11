@@ -11,7 +11,5 @@ authors = ["Bitcoin Dev Kit Developers"]
 readme = "README.md"
 
 [dependencies]
-bdk_chain = { path = "../chain", version = "0.16.0", features = ["serde", "miniscript"] }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = {version = "1", optional = true }

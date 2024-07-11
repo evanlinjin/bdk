@@ -18,10 +18,15 @@ CREATE TABLE network
 -- last revealed index is a u32
 CREATE TABLE keychain
 (
-    keychain      BLOB PRIMARY KEY NOT NULL,
-    descriptor    TEXT             NOT NULL,
-    descriptor_id BLOB             NOT NULL,
+    keychain_id   BLOB PRIMARY KEY NOT NULL,
+    keychain      TEXT             NOT NULL,
     last_revealed INTEGER
+) STRICT;
+
+CREATE TABLE keychain_label
+(
+    label       BLOB PRIMARY KEY NOT NULL,
+    keychain_id BLOB             NOT NULL REFERENCES keychain (keychain_id),
 ) STRICT;
 
 -- hash is block hash hex string,
