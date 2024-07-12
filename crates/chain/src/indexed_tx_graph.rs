@@ -329,39 +329,43 @@ impl<A> From<crate::keychain::ChangeSet> for ChangeSet<A, crate::keychain::Chang
     }
 }
 
+/// Parameters for persisting a [`indexed_tx_graph::ChangeSet`](ChangeSet) to
+/// [`sqlite::Store`](crate::sqlite::Store).
 #[cfg(feature = "sqlite")]
-impl<A, IA> bdk_sqlite::Storable for ChangeSet<A, IA>
-where
-    IA: bdk_sqlite::Storable + Default,
-    tx_graph::ChangeSet<A>: bdk_sqlite::Storable,
-    Self: Append,
-{
-    type Params = (
-        <tx_graph::ChangeSet<A> as bdk_sqlite::Storable>::Params,
-        <IA as bdk_sqlite::Storable>::Params,
-    );
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SqlParams<'p, A, IP> {
+    /// Parameters for persisting the internal [`tx_graph::ChangeSet`].
+    pub graph: crate::tx_graph::SqlParams<'p, A>,
+    /// Parameters for persisting the internal indexer changeset (whatever it may be).
+    pub indexer: IP,
+}
 
-    fn init(
-        db_tx: &bdk_sqlite::rusqlite::Transaction,
-        params: &Self::Params,
-    ) -> bdk_sqlite::rusqlite::Result<()> {
-        let (tx_graph_params, indexer_params) = params;
-        <tx_graph::ChangeSet<A> as bdk_sqlite::Storable>::init(db_tx, tx_graph_params)?;
-        <IA as bdk_sqlite::Storable>::init(db_tx, indexer_params)?;
+#[cfg(feature = "sqlite")]
+impl<'p, A, IP> crate::sqlite::StoreParams for SqlParams<'p, A, IP>
+where
+    A: Anchor + Clone + Ord + serde::Serialize + serde::de::DeserializeOwned,
+    crate::tx_graph::ChangeSet<A>: Default + Append,
+    IP: crate::sqlite::StoreParams,
+    IP::ChangeSet: Default + Append,
+{
+    type ChangeSet = ChangeSet<A, IP::ChangeSet>;
+
+    fn initialize_tables(
+        &self,
+        db_tx: &rusqlite::Transaction,
+    ) -> rusqlite::Result<()> {
+        self.graph.initialize_tables(db_tx)?;
+        self.indexer.initialize_tables(db_tx)?;
         Ok(())
     }
 
-    fn read(
-        db_tx: &bdk_sqlite::rusqlite::Transaction,
-        params: &Self::Params,
-    ) -> bdk_sqlite::rusqlite::Result<Option<Self>> {
-        let (tx_graph_params, indexer_params) = params;
-        let tx_graph_changeset =
-            <tx_graph::ChangeSet<A> as bdk_sqlite::Storable>::read(db_tx, tx_graph_params)?;
-        let indexer_changeset = <IA as bdk_sqlite::Storable>::read(db_tx, indexer_params)?;
-        let changeset = Self {
-            graph: tx_graph_changeset.unwrap_or_default(),
-            indexer: indexer_changeset.unwrap_or_default(),
+    fn load_changeset(
+        &self,
+        db_tx: &rusqlite::Transaction,
+    ) -> rusqlite::Result<Option<Self::ChangeSet>> {
+        let changeset = Self::ChangeSet {
+            graph: self.graph.load_changeset(db_tx)?.unwrap_or_default(),
+            indexer: self.indexer.load_changeset(db_tx)?.unwrap_or_default(),
         };
         if changeset.is_empty() {
             Ok(None)
@@ -370,18 +374,13 @@ where
         }
     }
 
-    fn write(
+    fn write_changeset(
         &self,
-        db_tx: &bdk_sqlite::rusqlite::Transaction,
-        params: &Self::Params,
-    ) -> bdk_sqlite::rusqlite::Result<()> {
-        let (tx_graph_params, indexer_params) = params;
-        <tx_graph::ChangeSet<A> as bdk_sqlite::Storable>::write(
-            &self.graph,
-            db_tx,
-            tx_graph_params,
-        )?;
-        <IA as bdk_sqlite::Storable>::write(&self.indexer, db_tx, indexer_params)?;
+        db_tx: &rusqlite::Transaction,
+        changeset: &Self::ChangeSet,
+    ) -> rusqlite::Result<()> {
+        self.graph.write_changeset(db_tx, &changeset.graph)?;
+        self.indexer.write_changeset(db_tx, &changeset.indexer)?;
         Ok(())
     }
 }

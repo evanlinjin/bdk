@@ -6,8 +6,7 @@ use crate::{
     DescriptorExt, KeychainId, SpkIterator, SpkTxOutIndex,
 };
 use alloc::{borrow::ToOwned, vec::Vec};
-use bdk_sqlite::rusqlite::named_params;
-use bitcoin::{Amount, OutPoint, Script, SignedAmount, Transaction, TxOut, Txid};
+use bitcoin::{Amount, OutPoint, Script, ScriptBuf, SignedAmount, Transaction, TxOut, Txid};
 use core::{
     fmt::Debug,
     ops::{Bound, RangeBounds},
@@ -881,29 +880,35 @@ impl Append for ChangeSet {
     }
 }
 
+/// Parameters for persisting [`keychain::ChangeSet`](ChangeSet) to
+/// [`sqlite::Store`](crate::sqlite::Store).
 #[cfg(feature = "sqlite")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SqlParams<'p> {
-    pub schema: crate::sqlite_util::SchemaParams<'p>,
+    /// Parameters for the schema table.
+    pub schema: crate::sqlite::SchemaParams<'p>,
+    /// Table name for last revealed index.
     pub last_revealed_table_name: &'p str,
 }
 
+#[cfg(feature = "sqlite")]
 impl<'p> Default for SqlParams<'p> {
     fn default() -> Self {
         Self {
-            schema: crate::sqlite_util::SchemaParams::new("bdk_keychain"),
+            schema: crate::sqlite::SchemaParams::new("bdk_keychain"),
             last_revealed_table_name: "bdk_keychain_last_revealed",
         }
     }
 }
 
 #[cfg(feature = "sqlite")]
-impl bdk_sqlite::Storable for ChangeSet {
-    type Params = SqlParams<'static>;
+impl<'p> crate::sqlite::StoreParams for SqlParams<'p> {
+    type ChangeSet = ChangeSet;
 
-    fn init(
-        db_tx: &bdk_sqlite::rusqlite::Transaction,
-        params: &Self::Params,
-    ) -> bdk_sqlite::rusqlite::Result<()> {
+    fn initialize_tables(
+        &self,
+        db_tx: &rusqlite::Transaction,
+    ) -> rusqlite::Result<()> {
         let schema_v0: &[&str] = &[
             // last revealed
             &format!(
@@ -911,36 +916,35 @@ impl bdk_sqlite::Storable for ChangeSet {
                 keychain_id TEXT PRIMARY KEY NOT NULL, \
                 last_revealed INTEGER NOT NULL \
                 ) STRICT;",
-                params.last_revealed_table_name,
+                self.last_revealed_table_name,
             ),
         ];
         let schema_by_version = &[schema_v0];
 
-        let current_version = params.schema.version(db_tx)?;
-
+        let current_version = self.schema.version(db_tx)?;
         let schemas_to_init = {
             let exec_from = current_version.map_or(0_usize, |v| v as usize + 1);
             schema_by_version.iter().enumerate().skip(exec_from)
         };
         for (version, schema) in schemas_to_init {
-            params.schema.set_version(db_tx, version as u32)?;
+            self.schema.set_version(db_tx, version as u32)?;
             db_tx.execute_batch(&schema.join("\n"))?;
         }
 
         Ok(())
     }
 
-    fn read(
-        db_tx: &bdk_sqlite::rusqlite::Transaction,
-        params: &Self::Params,
-    ) -> bdk_sqlite::rusqlite::Result<Option<Self>> {
-        use crate::sqlite_util::Sql;
+    fn load_changeset(
+        &self,
+        db_tx: &rusqlite::Transaction,
+    ) -> rusqlite::Result<Option<Self::ChangeSet>> {
+        use crate::sqlite::Sql;
 
-        let mut changeset = Self::default();
+        let mut changeset = ChangeSet::default();
 
         let mut statement = db_tx.prepare(&format!(
             "SELECT keychain_id, last_revealed FROM {}",
-            params.last_revealed_table_name,
+            self.last_revealed_table_name,
         ))?;
         let row_iter = statement.query_map([], |row| {
             Ok((
@@ -960,18 +964,19 @@ impl bdk_sqlite::Storable for ChangeSet {
         }
     }
 
-    fn write(
+    fn write_changeset(
         &self,
-        db_tx: &bdk_sqlite::rusqlite::Transaction,
-        params: &Self::Params,
-    ) -> bdk_sqlite::rusqlite::Result<()> {
-        use crate::sqlite_util::Sql;
+        db_tx: &rusqlite::Transaction,
+        changeset: &Self::ChangeSet,
+    ) -> rusqlite::Result<()> {
+        use crate::sqlite::Sql;
+        use crate::rusqlite::named_params;
 
         let mut statement = db_tx.prepare_cached(&format!(
             "REPLACE INTO {}(keychain_id, last_revealed) VALUES(:keychain_id, :last_revealed)",
-            params.last_revealed_table_name,
+            self.last_revealed_table_name,
         ))?;
-        for (&keychain_id, &last_revealed) in &self.last_revealed {
+        for (&keychain_id, &last_revealed) in &changeset.last_revealed {
             statement.execute(named_params! {
                 ":keychain_id": Sql(keychain_id),
                 ":last_revealed": last_revealed,

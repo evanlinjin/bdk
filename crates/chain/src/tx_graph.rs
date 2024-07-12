@@ -92,12 +92,10 @@ use crate::{
     collections::*, keychain::Balance, Anchor, Append, BlockId, ChainOracle, ChainPosition,
     FullTxOut,
 };
-use alloc::borrow::ToOwned;
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use bdk_sqlite::rusqlite::named_params;
-use bitcoin::{Amount, OutPoint, Script, ScriptBuf, SignedAmount, Transaction, TxOut, Txid};
+use bitcoin::{Amount, OutPoint, Script, SignedAmount, Transaction, TxOut, Txid};
 use core::fmt::{self, Formatter};
 use core::{
     convert::Infallible,
@@ -1249,42 +1247,47 @@ impl<A> Default for ChangeSet<A> {
     }
 }
 
-/// Parameters for storing a [`crate::tx_graph::ChangeSet`].
+/// Parameters for persisting [`tx_graph::ChangeSet`](crate::tx_graph::ChangeSet) to
+/// [`sqlite::Store`](crate::sqlite::Store).
 #[cfg(feature = "sqlite")]
-pub struct SqlParams<'p> {
-    /// Parameters for defining the schema table.
-    pub schema: crate::sqlite_util::SchemaParams<'p>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqlParams<'p, A> {
+    /// Parameters for the schema table.
+    pub schema: crate::sqlite::SchemaParams<'p>,
     /// Transactions table name.
     pub txs_table_name: &'p str,
     /// Floating transaction outputs table name.
     pub txouts_table_name: &'p str,
     /// Anchors table name.
     pub anchors_table_name: &'p str,
+    /// Marker for anchor type.
+    pub anchor_marker: core::marker::PhantomData<A>,
 }
 
 #[cfg(feature = "sqlite")]
-impl<'p> Default for SqlParams<'p> {
+impl<'p, A: Default> Default for SqlParams<'p, A> {
     fn default() -> Self {
         Self {
-            schema: crate::sqlite_util::SchemaParams::new("bdk_txgraph"),
+            schema: crate::sqlite::SchemaParams::new("bdk_txgraph"),
             txs_table_name: "bdk_txgraph_txs",
             txouts_table_name: "bdk_txgraph_txouts",
             anchors_table_name: "bdk_txgraph_anchors",
+            anchor_marker: Default::default(),
         }
     }
 }
 
 #[cfg(feature = "sqlite")]
-impl<A> bdk_sqlite::Storable for ChangeSet<A>
+impl<'p, A> crate::sqlite::StoreParams for SqlParams<'p, A>
 where
     A: Anchor + Clone + Ord + serde::Serialize + serde::de::DeserializeOwned,
 {
-    type Params = SqlParams<'static>;
+    type ChangeSet = ChangeSet<A>;
 
-    fn init(
-        db_tx: &bdk_sqlite::rusqlite::Transaction,
-        params: &Self::Params,
-    ) -> bdk_sqlite::rusqlite::Result<()> {
+    fn initialize_tables(
+        &self,
+        db_tx: &rusqlite::Transaction,
+    ) -> rusqlite::Result<()> {
         let schema_v0: &[&str] = &[
             // full transactions
             &format!(
@@ -1293,7 +1296,7 @@ where
                 raw_tx BLOB NOT NULL, \
                 last_seen INTEGER \
                 ) STRICT;",
-                params.txs_table_name
+                self.txs_table_name
             ),
             // floating txouts
             &format!(
@@ -1304,7 +1307,7 @@ where
                 script BLOB NOT NULL, \
                 PRIMARY KEY (txid, vout) \
                 ) STRICT;",
-                params.txouts_table_name
+                self.txouts_table_name
             ),
             // anchors
             &format!(
@@ -1315,36 +1318,35 @@ where
                 anchor BLOB NOT NULL, \
                 PRIMARY KEY (txid, block_height, block_hash) \
                 ) STRICT;",
-                params.anchors_table_name
+                self.anchors_table_name
             ),
         ];
         let schema_by_version = &[schema_v0];
 
-        let current_version = params.schema.version(db_tx)?;
-
+        let current_version = self.schema.version(db_tx)?;
         let schemas_to_init = {
             let exec_from = current_version.map_or(0_usize, |v| v as usize + 1);
             schema_by_version.iter().enumerate().skip(exec_from)
         };
         for (version, schema) in schemas_to_init {
-            params.schema.set_version(db_tx, version as u32)?;
+            self.schema.set_version(db_tx, version as u32)?;
             db_tx.execute_batch(&schema.join("\n"))?;
         }
 
         Ok(())
     }
 
-    fn read(
-        db_tx: &bdk_sqlite::rusqlite::Transaction,
-        params: &Self::Params,
-    ) -> bdk_sqlite::rusqlite::Result<Option<Self>> {
-        use crate::sqlite_util::Sql;
+    fn load_changeset(
+        &self,
+        db_tx: &rusqlite::Transaction,
+    ) -> rusqlite::Result<Option<Self::ChangeSet>> {
+        use crate::sqlite::Sql;
 
-        let mut changeset = Self::default();
+        let mut changeset = ChangeSet::default();
 
         let mut statement = db_tx.prepare(&format!(
             "SELECT txid, raw_tx, last_seen FROM {}",
-            params.txs_table_name
+            self.txs_table_name
         ))?;
         let row_iter = statement.query_map([], |row| {
             Ok((
@@ -1363,14 +1365,14 @@ where
 
         let mut statement = db_tx.prepare(&format!(
             "SELECT txid, vout, value, script FROM {}",
-            params.txouts_table_name
+            self.txouts_table_name
         ))?;
         let row_iter = statement.query_map([], |row| {
             Ok((
                 row.get::<_, Sql<Txid>>("txid")?,
                 row.get::<_, u32>("vout")?,
                 row.get::<_, Sql<Amount>>("value")?,
-                row.get::<_, Sql<ScriptBuf>>("script")?,
+                row.get::<_, Sql<bitcoin::ScriptBuf>>("script")?,
             ))
         })?;
         for row in row_iter {
@@ -1386,7 +1388,7 @@ where
 
         let mut statement = db_tx.prepare(&format!(
             "SELECT json(anchor), txid FROM {}",
-            params.anchors_table_name
+            self.anchors_table_name
         ))?;
         let row_iter = statement.query_map([], |row| {
             Ok((
@@ -1406,30 +1408,31 @@ where
         })
     }
 
-    fn write(
+    fn write_changeset(
         &self,
-        db_tx: &bdk_sqlite::rusqlite::Transaction,
-        params: &Self::Params,
-    ) -> bdk_sqlite::rusqlite::Result<()> {
-        use crate::sqlite_util::Sql;
+        db_tx: &rusqlite::Transaction,
+        changeset: &Self::ChangeSet,
+    ) -> rusqlite::Result<()> {
+        use crate::sqlite::Sql;
+        use crate::rusqlite::named_params;
 
         let mut statement = db_tx.prepare_cached(&format!(
             "INSERT INTO {}(txid, raw_tx) VALUES(:txid, :raw_tx) ON DUPLICATE KEY UPDATE raw_tx=:raw_tx",
-            params.txs_table_name,
+            self.txs_table_name,
         ))?;
-        for tx in &self.txs {
+        for tx in &changeset.txs {
             statement.execute(named_params! {
                 ":txid": Sql(tx.compute_txid()),
-                ":raw_tx": Sql(tx.as_ref().to_owned()),
+                ":raw_tx": Sql(tx.as_ref().clone()),
             })?;
         }
 
         let mut statement = db_tx
             .prepare_cached(&format!(
                 "INSERT INTO {}(txid, last_seen) VALUES(:txid, :last_seen) ON DUPLICATE KEY UPDATE last_seen=:last_seen",
-                params.txs_table_name,
+                self.txs_table_name,
             ))?;
-        for (&txid, &last_seen) in &self.last_seen {
+        for (&txid, &last_seen) in &changeset.last_seen {
             statement.execute(named_params! {
                 ":txid": Sql(txid),
                 ":last_seen": Some(last_seen),
@@ -1438,9 +1441,9 @@ where
 
         let mut statement = db_tx.prepare_cached(&format!(
             "REPLACE INTO {}(txid, vout, value, script) VALUES(:txid, :vout, :value, :script)",
-            params.txouts_table_name
+            self.txouts_table_name
         ))?;
-        for (op, txo) in &self.txouts {
+        for (op, txo) in &changeset.txouts {
             statement.execute(named_params! {
                 ":txid": Sql(op.txid),
                 ":vout": op.vout,
@@ -1451,15 +1454,15 @@ where
 
         let mut statement = db_tx.prepare_cached(&format!(
             "REPLACE INTO {}(txid, block_height, block_hash, anchor) VALUES(:txid, :block_height, :block_hash, jsonb(:anchor))",
-            params.anchors_table_name,
+            self.anchors_table_name,
         ))?;
-        for (anchor, txid) in &self.anchors {
+        for (anchor, txid) in &changeset.anchors {
             let anchor_block = anchor.anchor_block();
             statement.execute(named_params! {
                 ":txid": Sql(*txid),
                 ":block_height": anchor_block.height,
                 ":block_hash": Sql(anchor_block.hash),
-                ":anchor": Sql(anchor.to_owned()),
+                ":anchor": Sql(anchor.clone()),
             })?;
         }
 
