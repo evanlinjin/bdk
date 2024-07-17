@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use crate::Error;
 use bdk_chain::CombinedChangeSet;
 use bdk_chain::{
-    indexed_tx_graph, indexer::keychain_txout, local_chain, tx_graph, Anchor, DescriptorExt,
+    indexed_tx_graph, indexer::keychain_txout, local_chain, tx_graph, BlockId, DescriptorExt,
     DescriptorId, Merge,
 };
 
@@ -36,10 +36,9 @@ impl<K, A> Debug for Store<K, A> {
     }
 }
 
-impl<K, A> Store<K, A>
+impl<K, AM> Store<K, AM>
 where
     K: Ord + for<'de> Deserialize<'de> + Serialize + Send,
-    A: Anchor + for<'de> Deserialize<'de> + Serialize + Send,
 {
     /// Creates a new store from a [`Connection`].
     pub fn new(mut conn: Connection) -> Result<Self, rusqlite::Error> {
@@ -59,7 +58,7 @@ where
 }
 
 /// Network table related functions.
-impl<K, A> Store<K, A> {
+impl<K, AM> Store<K, AM> {
     /// Insert [`Network`] for which all other tables data is valid.
     ///
     /// Error if trying to insert different network value.
@@ -116,7 +115,7 @@ impl<K, A> Store<K, A> {
 }
 
 /// Block table related functions.
-impl<K, A> Store<K, A> {
+impl<K, AM> Store<K, AM> {
     /// Insert or delete local chain blocks.
     ///
     /// Error if trying to insert existing block hash.
@@ -178,17 +177,16 @@ impl<K, A> Store<K, A> {
 ///
 /// The keychain objects are stored as [`JSONB`] data.
 /// [`JSONB`]: https://sqlite.org/json1.html#jsonb
-impl<K, A> Store<K, A>
+impl<K, AM> Store<K, AM>
 where
     K: Ord + for<'de> Deserialize<'de> + Serialize + Send,
-    A: Anchor + Send,
 {
     /// Insert keychain with descriptor and last active index.
     ///
     /// If keychain exists only update last active index.
     fn insert_keychains(
         db_transaction: &rusqlite::Transaction,
-        tx_graph_changeset: &indexed_tx_graph::ChangeSet<A, keychain_txout::ChangeSet<K>>,
+        tx_graph_changeset: &indexed_tx_graph::ChangeSet<AM, keychain_txout::ChangeSet<K>>,
     ) -> Result<(), Error> {
         let keychain_changeset = &tx_graph_changeset.indexer;
         for (keychain, descriptor) in keychain_changeset.keychains_added.iter() {
@@ -207,7 +205,7 @@ where
     /// Update descriptor last revealed index.
     fn update_last_revealed(
         db_transaction: &rusqlite::Transaction,
-        tx_graph_changeset: &indexed_tx_graph::ChangeSet<A, keychain_txout::ChangeSet<K>>,
+        tx_graph_changeset: &indexed_tx_graph::ChangeSet<AM, keychain_txout::ChangeSet<K>>,
     ) -> Result<(), Error> {
         let keychain_changeset = &tx_graph_changeset.indexer;
         for (descriptor_id, last_revealed) in keychain_changeset.last_revealed.iter() {
@@ -411,24 +409,24 @@ impl<K, A> Store<K, A> {
 }
 
 /// Anchor table related functions.
-impl<K, A> Store<K, A>
+impl<K, AM> Store<K, AM>
 where
     K: Ord + for<'de> Deserialize<'de> + Serialize + Send,
-    A: Anchor + for<'de> Deserialize<'de> + Serialize + Send,
+    AM: Ord + Clone + for<'de> Deserialize<'de> + Serialize + Send,
 {
     /// Insert anchors.
     fn insert_anchors(
         db_transaction: &rusqlite::Transaction,
-        tx_graph_changeset: &indexed_tx_graph::ChangeSet<A, keychain_txout::ChangeSet<K>>,
+        tx_graph_changeset: &indexed_tx_graph::ChangeSet<AM, keychain_txout::ChangeSet<K>>,
     ) -> Result<(), Error> {
         // serde_json::to_string
-        for anchor in tx_graph_changeset.graph.anchors.iter() {
+        for ((txid, blockid), anchor_meta) in tx_graph_changeset.graph.anchors.iter() {
             let insert_anchor_stmt = &mut db_transaction
                 .prepare_cached("INSERT INTO anchor_tx (block_hash, anchor, txid) VALUES (:block_hash, jsonb(:anchor), :txid)")
                 .expect("insert anchor statement");
-            let block_hash = anchor.0.anchor_block().hash.to_string();
-            let anchor_json = serde_json::to_string(&anchor.0).expect("anchor json");
-            let txid = anchor.1.to_string();
+            let block_hash = blockid.hash.to_string();
+            let anchor_json = serde_json::to_string(&(blockid, anchor_meta)).expect("anchor json");
+            let txid = txid.to_string();
             insert_anchor_stmt.execute(named_params! {":block_hash": block_hash, ":anchor": anchor_json, ":txid": txid })
                 .map_err(Error::Sqlite)?;
         }
@@ -438,7 +436,7 @@ where
     /// Select all anchors.
     fn select_anchors(
         db_transaction: &rusqlite::Transaction,
-    ) -> Result<BTreeSet<(A, Txid)>, Error> {
+    ) -> Result<BTreeMap<(Txid, BlockId), AM>, Error> {
         // serde_json::from_str
         let mut select_anchor_stmt = db_transaction
             .prepare_cached("SELECT block_hash, json(anchor), txid FROM anchor_tx")
@@ -448,12 +446,13 @@ where
                 let hash = row.get_unwrap::<usize, String>(0);
                 let hash = BlockHash::from_str(hash.as_str()).expect("block hash");
                 let anchor = row.get_unwrap::<usize, String>(1);
-                let anchor: A = serde_json::from_str(anchor.as_str()).expect("anchor");
+                let (blockid, anchor_meta): (BlockId, AM) =
+                    serde_json::from_str(anchor.as_str()).expect("anchor");
                 // double check anchor blob block hash matches
-                assert_eq!(hash, anchor.anchor_block().hash);
+                assert_eq!(hash, blockid.hash);
                 let txid = row.get_unwrap::<usize, String>(2);
                 let txid = Txid::from_str(&txid).expect("txid");
-                Ok((anchor, txid))
+                Ok(((txid, blockid), anchor_meta))
             })
             .map_err(Error::Sqlite)?;
         anchors
@@ -464,13 +463,13 @@ where
 }
 
 /// Functions to read and write all [`CombinedChangeSet`] data.
-impl<K, A> Store<K, A>
+impl<K, AM> Store<K, AM>
 where
     K: Ord + for<'de> Deserialize<'de> + Serialize + Send,
-    A: Anchor + for<'de> Deserialize<'de> + Serialize + Send,
+    AM: Ord + Clone + for<'de> Deserialize<'de> + Serialize + Send,
 {
     /// Write the given `changeset` atomically.
-    pub fn write(&mut self, changeset: &CombinedChangeSet<K, A>) -> Result<(), Error> {
+    pub fn write(&mut self, changeset: &CombinedChangeSet<K, AM>) -> Result<(), Error> {
         // no need to write anything if changeset is empty
         if changeset.is_empty() {
             return Ok(());
@@ -496,7 +495,7 @@ where
     }
 
     /// Read the entire database and return the aggregate [`CombinedChangeSet`].
-    pub fn read(&mut self) -> Result<Option<CombinedChangeSet<K, A>>, Error> {
+    pub fn read(&mut self) -> Result<Option<CombinedChangeSet<K, AM>>, Error> {
         let db_transaction = self.db_transaction()?;
 
         let network = Self::select_network(&db_transaction)?;
@@ -508,7 +507,7 @@ where
         let txouts = Self::select_txouts(&db_transaction)?;
         let anchors = Self::select_anchors(&db_transaction)?;
 
-        let graph: tx_graph::ChangeSet<A> = tx_graph::ChangeSet {
+        let graph: tx_graph::ChangeSet<AM> = tx_graph::ChangeSet {
             txs,
             txouts,
             anchors,
@@ -520,7 +519,7 @@ where
             last_revealed,
         };
 
-        let indexed_tx_graph: indexed_tx_graph::ChangeSet<A, keychain_txout::ChangeSet<K>> =
+        let indexed_tx_graph: indexed_tx_graph::ChangeSet<AM, keychain_txout::ChangeSet<K>> =
             indexed_tx_graph::ChangeSet { graph, indexer };
 
         if network.is_none() && chain.is_empty() && indexed_tx_graph.is_empty() {
@@ -547,7 +546,7 @@ mod test {
     use bdk_chain::bitcoin::{secp256k1, BlockHash, OutPoint};
     use bdk_chain::miniscript::Descriptor;
     use bdk_chain::CombinedChangeSet;
-    use bdk_chain::{indexed_tx_graph, tx_graph, BlockId, ConfirmationBlockTime, DescriptorExt};
+    use bdk_chain::{indexed_tx_graph, tx_graph, BlockId, BlockTime, DescriptorExt};
     use std::str::FromStr;
     use std::sync::Arc;
 
@@ -558,16 +557,13 @@ mod test {
     }
 
     #[test]
-    fn insert_and_load_aggregate_changesets_with_confirmation_block_time_anchor() {
+    fn insert_and_load_aggregate_changesets_with_block_time_anchor() {
         let (test_changesets, agg_test_changesets) =
-            create_test_changesets(&|height, time, hash| ConfirmationBlockTime {
-                confirmation_time: time,
-                block_id: (height, hash).into(),
-            });
+            create_test_changesets(&|_height, time, _hash| BlockTime::new(time as u32));
 
         let conn = Connection::open_in_memory().expect("in memory connection");
-        let mut store = Store::<Keychain, ConfirmationBlockTime>::new(conn)
-            .expect("create new memory db store");
+        let mut store =
+            Store::<Keychain, BlockTime>::new(conn).expect("create new memory db store");
 
         test_changesets.iter().for_each(|changeset| {
             store.write(changeset).expect("write changeset");
@@ -578,28 +574,11 @@ mod test {
         assert_eq!(agg_changeset, Some(agg_test_changesets));
     }
 
-    #[test]
-    fn insert_and_load_aggregate_changesets_with_blockid_anchor() {
-        let (test_changesets, agg_test_changesets) =
-            create_test_changesets(&|height, _time, hash| BlockId { height, hash });
-
-        let conn = Connection::open_in_memory().expect("in memory connection");
-        let mut store = Store::<Keychain, BlockId>::new(conn).expect("create new memory db store");
-
-        test_changesets.iter().for_each(|changeset| {
-            store.write(changeset).expect("write changeset");
-        });
-
-        let agg_changeset = store.read().expect("aggregated changeset");
-
-        assert_eq!(agg_changeset, Some(agg_test_changesets));
-    }
-
-    fn create_test_changesets<A: Anchor + Copy>(
-        anchor_fn: &dyn Fn(u32, u64, BlockHash) -> A,
+    fn create_test_changesets<AM: Ord + Clone + Copy>(
+        anchor_fn: &dyn Fn(u32, u64, BlockHash) -> AM,
     ) -> (
-        Vec<CombinedChangeSet<Keychain, A>>,
-        CombinedChangeSet<Keychain, A>,
+        Vec<CombinedChangeSet<Keychain, AM>>,
+        CombinedChangeSet<Keychain, AM>,
     ) {
         let secp = &secp256k1::Secp256k1::signing_only();
 
@@ -645,13 +624,35 @@ mod test {
         let outpoint1_0 = OutPoint::new(tx1.compute_txid(), 0);
         let txout1_0 = tx1.output.first().unwrap().clone();
 
-        let anchor1 = anchor_fn(1, 1296667328, block_hash_1);
-        let anchor2 = anchor_fn(2, 1296688946, block_hash_2);
+        let anchor_meta1 = anchor_fn(1, 1296667328, block_hash_1);
+        let anchor_meta2 = anchor_fn(2, 1296688946, block_hash_2);
 
-        let tx_graph_changeset = tx_graph::ChangeSet::<A> {
+        let tx_graph_changeset = tx_graph::ChangeSet::<AM> {
             txs: [tx0.clone(), tx1.clone()].into(),
             txouts: [(outpoint0_0, txout0_0), (outpoint1_0, txout1_0)].into(),
-            anchors: [(anchor1, tx0.compute_txid()), (anchor1, tx1.compute_txid())].into(),
+            anchors: [
+                (
+                    (
+                        tx0.compute_txid(),
+                        BlockId {
+                            height: 1,
+                            hash: block_hash_1,
+                        },
+                    ),
+                    anchor_meta1,
+                ),
+                (
+                    (
+                        tx1.compute_txid(),
+                        BlockId {
+                            height: 1,
+                            hash: block_hash_1,
+                        },
+                    ),
+                    anchor_meta1,
+                ),
+            ]
+            .into(),
             last_seen: [
                 (tx0.compute_txid(), 1598918400),
                 (tx1.compute_txid(), 1598919121),
@@ -665,7 +666,7 @@ mod test {
             last_revealed: [(ext_desc_id, 124), (int_desc_id, 421)].into(),
         };
 
-        let graph_changeset: indexed_tx_graph::ChangeSet<A, keychain_txout::ChangeSet<Keychain>> =
+        let graph_changeset: indexed_tx_graph::ChangeSet<AM, keychain_txout::ChangeSet<Keychain>> =
             indexed_tx_graph::ChangeSet {
                 graph: tx_graph_changeset,
                 indexer: keychain_changeset,
@@ -681,14 +682,14 @@ mod test {
         });
 
         // create changeset that sets the whole tx2 and updates it's lastseen where before there was only the txid and last_seen
-        let tx_graph_changeset2 = tx_graph::ChangeSet::<A> {
+        let tx_graph_changeset2 = tx_graph::ChangeSet::<AM> {
             txs: [tx2.clone()].into(),
             txouts: BTreeMap::default(),
-            anchors: BTreeSet::default(),
+            anchors: BTreeMap::default(),
             last_seen: [(tx2.compute_txid(), 1708919121)].into(),
         };
 
-        let graph_changeset2: indexed_tx_graph::ChangeSet<A, keychain_txout::ChangeSet<Keychain>> =
+        let graph_changeset2: indexed_tx_graph::ChangeSet<AM, keychain_txout::ChangeSet<Keychain>> =
             indexed_tx_graph::ChangeSet {
                 graph: tx_graph_changeset2,
                 indexer: keychain_txout::ChangeSet::default(),
@@ -701,14 +702,36 @@ mod test {
         });
 
         // create changeset that adds a new anchor2 for tx0 and tx1
-        let tx_graph_changeset3 = tx_graph::ChangeSet::<A> {
+        let tx_graph_changeset3 = tx_graph::ChangeSet::<AM> {
             txs: BTreeSet::default(),
             txouts: BTreeMap::default(),
-            anchors: [(anchor2, tx0.compute_txid()), (anchor2, tx1.compute_txid())].into(),
+            anchors: [
+                (
+                    (
+                        tx0.compute_txid(),
+                        BlockId {
+                            height: 2,
+                            hash: block_hash_2,
+                        },
+                    ),
+                    anchor_meta2,
+                ),
+                (
+                    (
+                        tx1.compute_txid(),
+                        BlockId {
+                            height: 2,
+                            hash: block_hash_2,
+                        },
+                    ),
+                    anchor_meta2,
+                ),
+            ]
+            .into(),
             last_seen: BTreeMap::default(),
         };
 
-        let graph_changeset3: indexed_tx_graph::ChangeSet<A, keychain_txout::ChangeSet<Keychain>> =
+        let graph_changeset3: indexed_tx_graph::ChangeSet<AM, keychain_txout::ChangeSet<Keychain>> =
             indexed_tx_graph::ChangeSet {
                 graph: tx_graph_changeset3,
                 indexer: keychain_txout::ChangeSet::default(),
@@ -724,7 +747,7 @@ mod test {
         let agg_test_changesets =
             changesets
                 .iter()
-                .fold(CombinedChangeSet::<Keychain, A>::default(), |mut i, cs| {
+                .fold(CombinedChangeSet::<Keychain, AM>::default(), |mut i, cs| {
                     i.merge(cs.clone());
                     i
                 });

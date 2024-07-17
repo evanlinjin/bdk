@@ -20,7 +20,7 @@ use bdk_chain::{
         descriptor::{DescriptorSecretKey, KeyMap},
         Descriptor, DescriptorPublicKey,
     },
-    Anchor, ChainOracle, DescriptorExt, FullTxOut, Merge,
+    ChainOracle, DescriptorExt, FullTxOut, Merge,
 };
 pub use bdk_file_store;
 pub use clap;
@@ -196,8 +196,8 @@ pub struct CreateTxChange {
     pub index: u32,
 }
 
-pub fn create_tx<A: Anchor, O: ChainOracle>(
-    graph: &mut KeychainTxGraph<A>,
+pub fn create_tx<AM, O: ChainOracle>(
+    graph: &mut KeychainTxGraph<AM>,
     chain: &O,
     keymap: &BTreeMap<DescriptorPublicKey, DescriptorSecretKey>,
     cs_algorithm: CoinSelectionAlgo,
@@ -206,6 +206,7 @@ pub fn create_tx<A: Anchor, O: ChainOracle>(
 ) -> anyhow::Result<(Transaction, Option<CreateTxChange>)>
 where
     O::Error: std::error::Error + Send + Sync + 'static,
+    AM: Ord + Clone,
 {
     let mut changeset = keychain_txout::ChangeSet::default();
 
@@ -415,17 +416,17 @@ where
 // Alias the elements of `Result` of `planned_utxos`
 pub type PlannedUtxo<K, A> = (bdk_tmp_plan::Plan<K>, FullTxOut<A>);
 
-pub fn planned_utxos<A: Anchor, O: ChainOracle, K: Clone + bdk_tmp_plan::CanDerive>(
-    graph: &KeychainTxGraph<A>,
+pub fn planned_utxos<AM: Ord + Clone, O: ChainOracle, K: Clone + bdk_tmp_plan::CanDerive>(
+    graph: &KeychainTxGraph<AM>,
     chain: &O,
     assets: &bdk_tmp_plan::Assets<K>,
-) -> Result<Vec<PlannedUtxo<K, A>>, O::Error> {
+) -> Result<Vec<PlannedUtxo<K, AM>>, O::Error> {
     let chain_tip = chain.get_chain_tip()?;
     let outpoints = graph.index.outpoints();
     graph
         .graph()
         .try_filter_chain_unspents(chain, chain_tip, outpoints.iter().cloned())
-        .filter_map(|r| -> Option<Result<PlannedUtxo<K, A>, _>> {
+        .filter_map(|r| -> Option<Result<PlannedUtxo<K, AM>, _>> {
             let (k, i, full_txo) = match r {
                 Err(err) => return Some(Err(err)),
                 Ok(((k, i), full_txo)) => (k, i, full_txo),
@@ -444,8 +445,8 @@ pub fn planned_utxos<A: Anchor, O: ChainOracle, K: Clone + bdk_tmp_plan::CanDeri
         .collect()
 }
 
-pub fn handle_commands<CS: clap::Subcommand, S: clap::Args, A: Anchor, O: ChainOracle, C>(
-    graph: &Mutex<KeychainTxGraph<A>>,
+pub fn handle_commands<CS: clap::Subcommand, S: clap::Args, AM, O: ChainOracle, C>(
+    graph: &Mutex<KeychainTxGraph<AM>>,
     db: &Mutex<Store<C>>,
     chain: &Mutex<O>,
     keymap: &BTreeMap<DescriptorPublicKey, DescriptorSecretKey>,
@@ -454,12 +455,13 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args, A: Anchor, O: ChainO
     cmd: Commands<CS, S>,
 ) -> anyhow::Result<()>
 where
+    AM: Ord + Clone + Debug,
     O::Error: std::error::Error + Send + Sync + 'static,
     C: Default
         + Merge
         + DeserializeOwned
         + Serialize
-        + From<KeychainChangeSet<A>>
+        + From<KeychainChangeSet<AM>>
         + Send
         + Sync
         + Debug,

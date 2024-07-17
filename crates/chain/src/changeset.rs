@@ -7,23 +7,23 @@
     serde(
         crate = "crate::serde",
         bound(
-            deserialize = "A: Ord + crate::serde::Deserialize<'de>, K: Ord + crate::serde::Deserialize<'de>",
-            serialize = "A: Ord + crate::serde::Serialize, K: Ord + crate::serde::Serialize",
+            deserialize = "AM: Ord + crate::serde::Deserialize<'de>, K: Ord + crate::serde::Deserialize<'de>",
+            serialize = "AM: Ord + crate::serde::Serialize, K: Ord + crate::serde::Serialize",
         ),
     )
 )]
-pub struct CombinedChangeSet<K, A> {
+pub struct CombinedChangeSet<K, AM> {
     /// Changes to the [`LocalChain`](crate::local_chain::LocalChain).
     pub chain: crate::local_chain::ChangeSet,
     /// Changes to [`IndexedTxGraph`](crate::indexed_tx_graph::IndexedTxGraph).
     pub indexed_tx_graph:
-        crate::indexed_tx_graph::ChangeSet<A, crate::indexer::keychain_txout::ChangeSet<K>>,
+        crate::indexed_tx_graph::ChangeSet<AM, crate::indexer::keychain_txout::ChangeSet<K>>,
     /// Stores the network type of the transaction data.
     pub network: Option<bitcoin::Network>,
 }
 
 #[cfg(feature = "miniscript")]
-impl<K, A> core::default::Default for CombinedChangeSet<K, A> {
+impl<K, AM> core::default::Default for CombinedChangeSet<K, AM> {
     fn default() -> Self {
         Self {
             chain: core::default::Default::default(),
@@ -34,7 +34,10 @@ impl<K, A> core::default::Default for CombinedChangeSet<K, A> {
 }
 
 #[cfg(feature = "miniscript")]
-impl<K: Ord, A: crate::Anchor> crate::Merge for CombinedChangeSet<K, A> {
+impl<K: Ord, AM> crate::Merge for CombinedChangeSet<K, AM>
+where
+    AM: Ord + Clone,
+{
     fn merge(&mut self, other: Self) {
         crate::Merge::merge(&mut self.chain, other.chain);
         crate::Merge::merge(&mut self.indexed_tx_graph, other.indexed_tx_graph);
@@ -53,7 +56,7 @@ impl<K: Ord, A: crate::Anchor> crate::Merge for CombinedChangeSet<K, A> {
 }
 
 #[cfg(feature = "miniscript")]
-impl<K, A> From<crate::local_chain::ChangeSet> for CombinedChangeSet<K, A> {
+impl<K, AM> From<crate::local_chain::ChangeSet> for CombinedChangeSet<K, AM> {
     fn from(chain: crate::local_chain::ChangeSet) -> Self {
         Self {
             chain,
@@ -63,12 +66,13 @@ impl<K, A> From<crate::local_chain::ChangeSet> for CombinedChangeSet<K, A> {
 }
 
 #[cfg(feature = "miniscript")]
-impl<K, A> From<crate::indexed_tx_graph::ChangeSet<A, crate::indexer::keychain_txout::ChangeSet<K>>>
-    for CombinedChangeSet<K, A>
+impl<K, AM>
+    From<crate::indexed_tx_graph::ChangeSet<AM, crate::indexer::keychain_txout::ChangeSet<K>>>
+    for CombinedChangeSet<K, AM>
 {
     fn from(
         indexed_tx_graph: crate::indexed_tx_graph::ChangeSet<
-            A,
+            AM,
             crate::indexer::keychain_txout::ChangeSet<K>,
         >,
     ) -> Self {
@@ -80,7 +84,7 @@ impl<K, A> From<crate::indexed_tx_graph::ChangeSet<A, crate::indexer::keychain_t
 }
 
 #[cfg(feature = "miniscript")]
-impl<K, A> From<crate::indexer::keychain_txout::ChangeSet<K>> for CombinedChangeSet<K, A> {
+impl<K, AM> From<crate::indexer::keychain_txout::ChangeSet<K>> for CombinedChangeSet<K, AM> {
     fn from(indexer: crate::indexer::keychain_txout::ChangeSet<K>) -> Self {
         Self {
             indexed_tx_graph: crate::indexed_tx_graph::ChangeSet {
