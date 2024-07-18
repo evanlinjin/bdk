@@ -1547,7 +1547,7 @@ impl Wallet {
         let pos = graph
             .get_chain_position(&self.chain, chain_tip, txid)
             .ok_or(BuildFeeBumpError::TransactionNotFound(txid))?;
-        if let ChainPosition::Confirmed(_) = pos {
+        if let ChainPosition::Confirmed(_, _) = pos {
             return Err(BuildFeeBumpError::TransactionConfirmed(txid));
         }
 
@@ -1799,7 +1799,7 @@ impl Wallet {
                 .graph()
                 .get_chain_position(&self.chain, chain_tip, input.previous_output.txid)
                 .map(|chain_position| match chain_position {
-                    ChainPosition::Confirmed(((_, blockid), _)) => blockid.height,
+                    ChainPosition::Confirmed(bid, _) => bid.height,
                     ChainPosition::Unconfirmed(_) => u32::MAX,
                 });
             let current_height = sign_options

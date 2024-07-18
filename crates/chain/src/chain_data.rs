@@ -1,12 +1,12 @@
 use bitcoin::{hashes::Hash, BlockHash, OutPoint, TxOut, Txid};
 
-use crate::{Anchor, BlockTime, COINBASE_MATURITY};
+use crate::{BlockTime, COINBASE_MATURITY};
 
 /// Represents the observed position of some chain data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, core::hash::Hash)]
 pub enum ChainPosition<AM> {
     /// The chain data is seen as confirmed, and in anchored by `Anchor`.
-    Confirmed((Anchor, AM)),
+    Confirmed(BlockId, AM),
     /// The chain data is not confirmed and last seen in the mempool at this timestamp.
     Unconfirmed(u64),
 }
@@ -14,7 +14,7 @@ pub enum ChainPosition<AM> {
 impl<AM> ChainPosition<AM> {
     /// Returns whether [`ChainPosition`] is confirmed or not.
     pub fn is_confirmed(&self) -> bool {
-        matches!(self, Self::Confirmed(_))
+        matches!(self, Self::Confirmed(_, _))
     }
 }
 
@@ -22,7 +22,9 @@ impl<AM: Clone> ChainPosition<AM> {
     /// Maps a [`ChainPosition`] into a [`ChainPosition`] by cloning the contents.
     pub fn cloned(self) -> ChainPosition<AM> {
         match self {
-            ChainPosition::Confirmed(a) => ChainPosition::Confirmed(a),
+            ChainPosition::Confirmed(bid, anchor_meta) => {
+                ChainPosition::Confirmed(bid, anchor_meta.clone())
+            }
             ChainPosition::Unconfirmed(last_seen) => ChainPosition::Unconfirmed(last_seen),
         }
     }
@@ -65,8 +67,8 @@ impl ConfirmationTime {
 impl From<ChainPosition<BlockTime>> for ConfirmationTime {
     fn from(observed_as: ChainPosition<BlockTime>) -> Self {
         match observed_as {
-            ChainPosition::Confirmed(((_txid, blockid), anchor_meta)) => Self::Confirmed {
-                height: blockid.height,
+            ChainPosition::Confirmed(bid, anchor_meta) => Self::Confirmed {
+                height: bid.height,
                 time: *anchor_meta.as_ref() as u64,
             },
             ChainPosition::Unconfirmed(last_seen) => Self::Unconfirmed { last_seen },
@@ -147,7 +149,7 @@ impl<AM> FullTxOut<AM> {
     pub fn is_mature(&self, tip: u32) -> bool {
         if self.is_on_coinbase {
             let tx_height = match &self.chain_position {
-                ChainPosition::Confirmed(((_, blockid), _)) => blockid.height,
+                ChainPosition::Confirmed(bid, _) => bid.height,
                 ChainPosition::Unconfirmed(_) => {
                     debug_assert!(false, "coinbase tx can never be unconfirmed");
                     return false;
@@ -177,7 +179,7 @@ impl<AM> FullTxOut<AM> {
         }
 
         let confirmation_height = match &self.chain_position {
-            ChainPosition::Confirmed(((_, blockid), _)) => blockid.height,
+            ChainPosition::Confirmed(bid, _) => bid.height,
             ChainPosition::Unconfirmed(_) => return false,
         };
         if confirmation_height > tip {
@@ -185,8 +187,8 @@ impl<AM> FullTxOut<AM> {
         }
 
         // if the spending tx is confirmed within tip height, the txout is no longer spendable
-        if let Some((ChainPosition::Confirmed(((_, spending_blockid), _)), _)) = &self.spent_by {
-            if spending_blockid.height <= tip {
+        if let Some((ChainPosition::Confirmed(spending_bid, _), _)) = &self.spent_by {
+            if spending_bid.height <= tip {
                 return false;
             }
         }

@@ -110,9 +110,8 @@ use core::{
 #[derive(Clone, Debug, PartialEq)]
 pub struct TxGraph<AM = BlockTime> {
     // all transactions that the graph is aware of in format: `(tx_node, tx_anchors)`
-    txs: HashMap<Txid, (TxNodeInternal, BTreeMap<Anchor, AM>)>,
+    txs: HashMap<Txid, (TxNodeInternal, BTreeMap<BlockId, AM>)>,
     spends: BTreeMap<OutPoint, HashSet<Txid>>,
-    anchors: BTreeMap<Anchor, AM>,
     last_seen: HashMap<Txid, u64>,
 
     // This atrocity exists so that `TxGraph::outspends()` can return a reference.
@@ -125,7 +124,6 @@ impl<AM> Default for TxGraph<AM> {
         Self {
             txs: Default::default(),
             spends: Default::default(),
-            anchors: Default::default(),
             last_seen: Default::default(),
             empty_outspends: Default::default(),
         }
@@ -140,7 +138,7 @@ pub struct TxNode<'a, T, AM> {
     /// A partial or full representation of the transaction.
     pub tx: T,
     /// The blocks that the transaction is "anchored" in.
-    pub anchors: &'a BTreeMap<Anchor, AM>,
+    pub anchors: &'a BTreeMap<BlockId, AM>,
     /// The last-seen unix timestamp of the transaction as unconfirmed.
     pub last_seen_unconfirmed: Option<u64>,
 }
@@ -470,8 +468,12 @@ impl<AM> TxGraph<AM> {
     }
 
     /// Get all transaction anchors known by [`TxGraph`].
-    pub fn all_anchors(&self) -> &BTreeMap<Anchor, AM> {
-        &self.anchors
+    pub fn all_anchors(&self) -> impl Iterator<Item = (Anchor, &AM)> {
+        self.txs.iter().flat_map(|(&txid, (_, blocks))| {
+            blocks
+                .iter()
+                .map(move |(&bid, anchor_data)| ((txid, bid), anchor_data))
+        })
     }
 
     /// Whether the graph has any transactions or outputs in it.
@@ -547,7 +549,11 @@ impl<AM: Clone + Ord> TxGraph<AM> {
     /// `anchor`.
     pub fn insert_anchor(&mut self, anchor: Anchor, anchor_meta: AM) -> ChangeSet<AM> {
         let mut update = Self::default();
-        update.anchors.insert(anchor, anchor_meta);
+        let (txid, bid) = anchor;
+        update.txs.insert(
+            txid,
+            (TxNodeInternal::default(), [(bid, anchor_meta)].into()),
+        );
         self.apply_update(update)
     }
 
@@ -684,15 +690,12 @@ impl<AM: Clone + Ord> TxGraph<AM> {
             }
         }
 
-        for ((txid, blockid), anchor_meta) in changeset.anchors {
-            if self
-                .anchors
-                .insert((txid, blockid), anchor_meta.clone())
-                .is_none()
-            {
-                let (_, anchors) = self.txs.entry(txid).or_default();
-                anchors.insert((txid, blockid), anchor_meta);
-            }
+        for ((txid, bid), anchor_data) in changeset.anchors {
+            let (_, blocks) = self
+                .txs
+                .entry(txid)
+                .or_insert((TxNodeInternal::default(), BTreeMap::new()));
+            blocks.insert(bid, anchor_data);
         }
 
         for (txid, new_last_seen) in changeset.last_seen {
@@ -740,6 +743,12 @@ impl<AM: Clone + Ord> TxGraph<AM> {
             }
         }
 
+        changeset.anchors = update
+            .all_anchors()
+            .filter(|&(anchor, anchor_data)| self.anchor_data(anchor) != Some(anchor_data))
+            .map(|(anchor, anchor_data)| (anchor, anchor_data.clone()))
+            .collect();
+
         for (txid, update_last_seen) in update.last_seen {
             let prev_last_seen = self.last_seen.get(&txid).copied();
             if Some(update_last_seen) > prev_last_seen {
@@ -747,14 +756,14 @@ impl<AM: Clone + Ord> TxGraph<AM> {
             }
         }
 
-        changeset.anchors = update
-            .anchors
-            .iter()
-            .filter(|(k, _)| !self.anchors.contains_key(k))
-            .map(|(k, v)| (*k, v.clone()))
-            .collect::<BTreeMap<_, _>>();
-
         changeset
+    }
+
+    /// Get data for a given `anchor`.
+    pub fn anchor_data(&self, anchor: Anchor) -> Option<&AM> {
+        let (txid, bid) = anchor;
+        let (_, blocks) = self.txs.get(&txid)?;
+        blocks.get(&bid)
     }
 }
 
@@ -788,19 +797,14 @@ impl<AM: Ord + Clone> TxGraph<AM> {
         chain_tip: BlockId,
         txid: Txid,
     ) -> Result<Option<ChainPosition<AM>>, C::Error> {
-        let (tx_node, anchors) = match self.txs.get(&txid) {
+        let (tx_node, blocks) = match self.txs.get(&txid) {
             Some(v) => v,
             None => return Ok(None),
         };
 
-        for (anchor, anchor_meta) in anchors {
-            match chain.is_block_in_chain(anchor.1, chain_tip)? {
-                Some(true) => {
-                    return Ok(Some(ChainPosition::Confirmed((
-                        *anchor,
-                        anchor_meta.clone(),
-                    ))))
-                }
+        for (&bid, anchor_meta) in blocks {
+            match chain.is_block_in_chain(bid, chain_tip)? {
+                Some(true) => return Ok(Some(ChainPosition::Confirmed(bid, anchor_meta.clone()))),
                 _ => continue,
             }
         }
@@ -843,8 +847,8 @@ impl<AM: Ord + Clone> TxGraph<AM> {
                 let tx_node = self.get_tx_node(ancestor_tx.as_ref().compute_txid())?;
                 // We're filtering the ancestors to keep only the unconfirmed ones (= no anchors in
                 // the best chain)
-                for (_, block) in tx_node.anchors.keys() {
-                    match chain.is_block_in_chain(*block, chain_tip) {
+                for bid in tx_node.anchors.keys() {
+                    match chain.is_block_in_chain(*bid, chain_tip) {
                         Ok(Some(true)) => return None,
                         Err(e) => return Some(Err(e)),
                         _ => continue,
@@ -863,8 +867,8 @@ impl<AM: Ord + Clone> TxGraph<AM> {
                 let tx_node = self.get_tx_node(descendant_txid)?;
                 // We're filtering the ancestors to keep only the unconfirmed ones (= no anchors in
                 // the best chain)
-                for (_, block) in tx_node.anchors.keys() {
-                    match chain.is_block_in_chain(*block, chain_tip) {
+                for bid in tx_node.anchors.keys() {
+                    match chain.is_block_in_chain(*bid, chain_tip) {
                         Ok(Some(true)) => return None,
                         Err(e) => return Some(Err(e)),
                         _ => continue,
@@ -890,8 +894,8 @@ impl<AM: Ord + Clone> TxGraph<AM> {
             // If a conflicting tx is in the best chain, or has `last_seen` higher than this ancestor, then
             // this tx cannot exist in the best chain
             for conflicting_tx in conflicting_txs {
-                for (_, block) in conflicting_tx.anchors.keys() {
-                    if chain.is_block_in_chain(*block, chain_tip)? == Some(true) {
+                for bid in conflicting_tx.anchors.keys() {
+                    if chain.is_block_in_chain(*bid, chain_tip)? == Some(true) {
                         return Ok(None);
                     }
                 }
@@ -1174,7 +1178,7 @@ impl<AM: Ord + Clone> TxGraph<AM> {
             let (spk_i, txout) = res?;
 
             match &txout.chain_position {
-                ChainPosition::Confirmed(_) => {
+                ChainPosition::Confirmed(_, _) => {
                     if txout.is_confirmed_and_spendable(chain_tip.height) {
                         confirmed += txout.txout.value;
                     } else if !txout.is_mature(chain_tip.height) {
