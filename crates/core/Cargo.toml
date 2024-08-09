@@ -1,0 +1,23 @@
+[package]
+name = "bdk_core"
+version = "0.1.0"
+edition = "2021"
+authors.workspace = true
+homepage = "https://bitcoindevkit.org"
+repository = "https://github.com/bitcoindevkit/bdk"
+documentation = "https://docs.rs/bdk_core"
+description = "Collection of very-core structures for Bitcoin Dev Kit."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+bitcoin = { version = "0.32.0", default-features = false }
+serde = { version = "1", optional = true, features = ["derive", "rc"] }
+
+# Use hashbrown as a feature flag to have HashSet and HashMap from it.
+hashbrown = { version = "0.9.1", optional = true, features = ["serde"] }
+
+[features]
+default = ["std"]
+std = ["bitcoin/std"]
+serde = ["dep:serde", "bitcoin/serde"]
