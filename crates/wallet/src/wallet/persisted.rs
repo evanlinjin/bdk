@@ -1,130 +1,238 @@
-use core::fmt;
+use core::{
+    fmt,
+    future::Future,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+};
 
-use crate::{descriptor::DescriptorError, Wallet};
+use alloc::boxed::Box;
+use chain::{Merge, Staged};
+
+use crate::{descriptor::DescriptorError, ChangeSet, CreateParams, LoadParams, Wallet};
+
+/// A trait for persisting [`Wallet`].
+pub trait WalletPersister {
+    /// Error when initializing the persister.
+    type Error;
+
+    /// Initialize the persister.
+    fn initialize(persister: &mut Self) -> Result<(), Self::Error>;
+
+    /// Persist changes.
+    fn persist(persister: &mut Self, changeset: &ChangeSet) -> Result<(), Self::Error>;
+
+    /// Load changes.
+    fn load(persister: &mut Self) -> Result<Option<ChangeSet>, Self::Error>;
+}
+
+type FutureResult<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+
+/// Async version of [`WalletPersister`].
+pub trait AsyncWalletPersister {
+    /// Error with persistence.
+    type Error;
+
+    fn initialize(persister: &mut Self) -> FutureResult<(), Self::Error>;
+
+    /// Persist changes.
+    fn persist<'a>(
+        persister: &'a mut Self,
+        changeset: &'a ChangeSet,
+    ) -> FutureResult<'a, (), Self::Error>;
+
+    /// Load changes.
+    fn load(persister: &mut Self) -> FutureResult<Option<ChangeSet>, Self::Error>;
+}
 
 /// Represents a persisted wallet.
-pub type PersistedWallet = bdk_chain::Persisted<Wallet>;
+#[derive(Debug)]
+pub struct PersistedWallet(pub(crate) Wallet);
 
-#[cfg(feature = "rusqlite")]
-impl<'c> chain::PersistWith<bdk_chain::rusqlite::Transaction<'c>> for Wallet {
-    type CreateParams = crate::CreateParams;
-    type LoadParams = crate::LoadParams;
+impl Deref for PersistedWallet {
+    type Target = Wallet;
 
-    type CreateError = CreateWithPersistError<bdk_chain::rusqlite::Error>;
-    type LoadError = LoadWithPersistError<bdk_chain::rusqlite::Error>;
-    type PersistError = bdk_chain::rusqlite::Error;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
-    fn create(
-        db: &mut bdk_chain::rusqlite::Transaction<'c>,
-        params: Self::CreateParams,
-    ) -> Result<Self, Self::CreateError> {
-        let mut wallet =
-            Self::create_with_params(params).map_err(CreateWithPersistError::Descriptor)?;
-        if let Some(changeset) = wallet.take_staged() {
-            changeset
-                .persist_to_sqlite(db)
+impl DerefMut for PersistedWallet {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl PersistedWallet {
+    pub fn create<P>(
+        persister: &mut P,
+        params: CreateParams,
+    ) -> Result<Self, CreateWithPersistError<P::Error>>
+    where
+        P: WalletPersister,
+    {
+        let mut inner =
+            Wallet::create_with_params(params).map_err(CreateWithPersistError::Descriptor)?;
+        if let Some(changeset) = inner.take_staged() {
+            P::persist(persister, &changeset).map_err(CreateWithPersistError::Persist)?;
+        }
+        Ok(Self(inner))
+    }
+
+    pub async fn create_async<P>(
+        persister: &mut P,
+        params: CreateParams,
+    ) -> Result<Self, CreateWithPersistError<P::Error>>
+    where
+        P: AsyncWalletPersister,
+    {
+        let mut inner =
+            Wallet::create_with_params(params).map_err(CreateWithPersistError::Descriptor)?;
+        if let Some(changeset) = inner.take_staged() {
+            P::persist(persister, &changeset)
+                .await
                 .map_err(CreateWithPersistError::Persist)?;
         }
-        Ok(wallet)
+        Ok(Self(inner))
     }
 
-    fn load(
-        conn: &mut bdk_chain::rusqlite::Transaction<'c>,
-        params: Self::LoadParams,
-    ) -> Result<Option<Self>, Self::LoadError> {
-        let changeset =
-            crate::ChangeSet::from_sqlite(conn).map_err(LoadWithPersistError::Persist)?;
-        if chain::Merge::is_empty(&changeset) {
-            return Ok(None);
+    pub fn load<P>(
+        persister: &mut P,
+        params: LoadParams,
+    ) -> Result<Option<Self>, LoadWithPersistError<P::Error>>
+    where
+        P: WalletPersister,
+    {
+        let changeset = match P::load(persister).map_err(LoadWithPersistError::Persist)? {
+            Some(changeset) => changeset,
+            None => return Ok(None),
+        };
+        Wallet::load_with_params(changeset, params)
+            .map(|opt| opt.map(|inner| PersistedWallet(inner)))
+            .map_err(LoadWithPersistError::InvalidChangeSet)
+    }
+
+    pub async fn load_async<P>(
+        persister: &mut P,
+        params: LoadParams,
+    ) -> Result<Option<Self>, LoadWithPersistError<P::Error>>
+    where
+        P: AsyncWalletPersister,
+    {
+        let changeset = match P::load(persister)
+            .await
+            .map_err(LoadWithPersistError::Persist)?
+        {
+            Some(changeset) => changeset,
+            None => return Ok(None),
+        };
+        Wallet::load_with_params(changeset, params)
+            .map(|opt| opt.map(|inner| PersistedWallet(inner)))
+            .map_err(LoadWithPersistError::InvalidChangeSet)
+    }
+
+    pub fn persist<P>(&mut self, persister: &mut P) -> Result<bool, P::Error>
+    where
+        P: WalletPersister,
+    {
+        let stage = Staged::staged(&mut self.0);
+        if stage.is_empty() {
+            return Ok(false);
         }
-        Self::load_with_params(changeset, params).map_err(LoadWithPersistError::InvalidChangeSet)
+        P::persist(persister, &*stage)?;
+        stage.take();
+        Ok(true)
     }
 
-    fn persist(
-        db: &mut bdk_chain::rusqlite::Transaction<'c>,
-        changeset: &<Self as chain::Staged>::ChangeSet,
-    ) -> Result<(), Self::PersistError> {
-        changeset.persist_to_sqlite(db)
+    pub async fn persist_async<'a, P>(&'a mut self, persister: &mut P) -> Result<bool, P::Error>
+    where
+        P: AsyncWalletPersister,
+    {
+        let stage = Staged::staged(&mut self.0);
+        if stage.is_empty() {
+            return Ok(false);
+        }
+        P::persist(persister, &*stage).await?;
+        stage.take();
+        Ok(true)
     }
 }
 
 #[cfg(feature = "rusqlite")]
-impl chain::PersistWith<bdk_chain::rusqlite::Connection> for Wallet {
-    type CreateParams = crate::CreateParams;
-    type LoadParams = crate::LoadParams;
+impl<'c> WalletPersister for bdk_chain::rusqlite::Transaction<'c> {
+    type Error = bdk_chain::rusqlite::Error;
 
-    type CreateError = CreateWithPersistError<bdk_chain::rusqlite::Error>;
-    type LoadError = LoadWithPersistError<bdk_chain::rusqlite::Error>;
-    type PersistError = bdk_chain::rusqlite::Error;
-
-    fn create(
-        db: &mut bdk_chain::rusqlite::Connection,
-        params: Self::CreateParams,
-    ) -> Result<Self, Self::CreateError> {
-        let mut db_tx = db.transaction().map_err(CreateWithPersistError::Persist)?;
-        let wallet = chain::PersistWith::create(&mut db_tx, params)?;
-        db_tx.commit().map_err(CreateWithPersistError::Persist)?;
-        Ok(wallet)
+    fn initialize(persister: &mut Self) -> Result<(), Self::Error> {
+        // TODO: expose init methods
+        Ok(())
     }
 
-    fn load(
-        db: &mut bdk_chain::rusqlite::Connection,
-        params: Self::LoadParams,
-    ) -> Result<Option<Self>, Self::LoadError> {
-        let mut db_tx = db.transaction().map_err(LoadWithPersistError::Persist)?;
-        let wallet_opt = chain::PersistWith::load(&mut db_tx, params)?;
-        db_tx.commit().map_err(LoadWithPersistError::Persist)?;
-        Ok(wallet_opt)
+    fn persist(persister: &mut Self, changeset: &ChangeSet) -> Result<(), Self::Error> {
+        changeset.persist_to_sqlite(persister)
     }
 
-    fn persist(
-        db: &mut bdk_chain::rusqlite::Connection,
-        changeset: &<Self as chain::Staged>::ChangeSet,
-    ) -> Result<(), Self::PersistError> {
-        let db_tx = db.transaction()?;
+    fn load(persister: &mut Self) -> Result<Option<ChangeSet>, Self::Error> {
+        ChangeSet::from_sqlite(persister).map(Some)
+    }
+}
+
+#[cfg(feature = "rusqlite")]
+impl WalletPersister for bdk_chain::rusqlite::Connection {
+    type Error = bdk_chain::rusqlite::Error;
+
+    fn initialize(persister: &mut Self) -> Result<(), Self::Error> {
+        // TODO: expose init methods
+        Ok(())
+    }
+
+    fn persist(persister: &mut Self, changeset: &ChangeSet) -> Result<(), Self::Error> {
+        let db_tx = persister.transaction()?;
         changeset.persist_to_sqlite(&db_tx)?;
         db_tx.commit()
+    }
+
+    fn load(persister: &mut Self) -> Result<Option<ChangeSet>, Self::Error> {
+        let db_tx = persister.transaction()?;
+        let changeset = ChangeSet::from_sqlite(&db_tx).map(Some)?;
+        db_tx.commit()?;
+        Ok(changeset)
     }
 }
 
 #[cfg(feature = "file_store")]
-impl chain::PersistWith<bdk_file_store::Store<crate::ChangeSet>> for Wallet {
-    type CreateParams = crate::CreateParams;
-    type LoadParams = crate::LoadParams;
-    type CreateError = CreateWithPersistError<std::io::Error>;
-    type LoadError =
-        LoadWithPersistError<bdk_file_store::AggregateChangesetsError<crate::ChangeSet>>;
-    type PersistError = std::io::Error;
+#[derive(Debug)]
+pub enum FileStoreError {
+    Load(bdk_file_store::AggregateChangesetsError<ChangeSet>),
+    Write(std::io::Error),
+}
 
-    fn create(
-        db: &mut bdk_file_store::Store<crate::ChangeSet>,
-        params: Self::CreateParams,
-    ) -> Result<Self, Self::CreateError> {
-        let mut wallet =
-            Self::create_with_params(params).map_err(CreateWithPersistError::Descriptor)?;
-        if let Some(changeset) = wallet.take_staged() {
-            db.append_changeset(&changeset)
-                .map_err(CreateWithPersistError::Persist)?;
+#[cfg(feature = "file_store")]
+impl core::fmt::Display for FileStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use core::fmt::Display;
+        match self {
+            FileStoreError::Load(e) => Display::fmt(e, f),
+            FileStoreError::Write(e) => Display::fmt(e, f),
         }
-        Ok(wallet)
+    }
+}
+
+#[cfg(feature = "file_store")]
+impl std::error::Error for FileStoreError {}
+
+#[cfg(feature = "file_store")]
+impl WalletPersister for bdk_file_store::Store<ChangeSet> {
+    type Error = FileStoreError;
+
+    fn initialize(persister: &mut Self) -> Result<(), Self::Error> {
+        Ok(())
     }
 
-    fn load(
-        db: &mut bdk_file_store::Store<crate::ChangeSet>,
-        params: Self::LoadParams,
-    ) -> Result<Option<Self>, Self::LoadError> {
-        let changeset = db
-            .aggregate_changesets()
-            .map_err(LoadWithPersistError::Persist)?
-            .unwrap_or_default();
-        Self::load_with_params(changeset, params).map_err(LoadWithPersistError::InvalidChangeSet)
+    fn persist(persister: &mut Self, changeset: &ChangeSet) -> Result<(), Self::Error> {
+        persister.append_changeset(changeset).map_err(FileStoreError::Write)
     }
 
-    fn persist(
-        db: &mut bdk_file_store::Store<crate::ChangeSet>,
-        changeset: &<Self as chain::Staged>::ChangeSet,
-    ) -> Result<(), Self::PersistError> {
-        db.append_changeset(changeset)
+    fn load(persister: &mut Self) -> Result<Option<ChangeSet>, Self::Error> {
+        persister.aggregate_changesets().map_err(FileStoreError::Load)
     }
 }
 
