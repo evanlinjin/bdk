@@ -1,105 +1,208 @@
-use core::fmt;
-use std::prelude::rust_2021::Box;
-use chain::{FutureResult, sqlx};
 use crate::{descriptor::DescriptorError, Wallet};
+use chain::{sqlx, FutureResult};
+use core::{any::Any, fmt};
+use std::prelude::rust_2021::Box;
 
 /// Represents a persisted wallet.
 pub type PersistedWallet = bdk_chain::Persisted<Wallet>;
 
+// #[cfg(feature = "sqlx")]
+// impl<'c> chain::PersistAsyncWith<sqlx::Transaction<'c, sqlx::Postgres>> for Wallet {
+//     type CreateParams = crate::CreateParams;
+//     type LoadParams = crate::LoadParams;
+//
+//     type CreateError = CreateWithPersistError<sqlx::Error>;
+//     type LoadError = LoadWithPersistError<sqlx::Error>;
+//     type PersistError = sqlx::Error;
+//
+//     fn create<'a>(
+//         db: &'a mut sqlx::Transaction<'c, sqlx::Postgres>,
+//         params: Self::CreateParams,
+//     ) -> FutureResult<'a, Self, Self::CreateError>
+//     where
+//         Self: 'a,
+//     {
+//         Box::pin(async move {
+//             let mut wallet =
+//                 Self::create_with_params(params).map_err(CreateWithPersistError::Descriptor)?;
+//             if let Some(changeset) = wallet.take_staged() {
+//                 changeset
+//                     .persist_to_postgres(db)
+//                     .await
+//                     .map_err(CreateWithPersistError::Persist)?;
+//             }
+//             Ok(wallet)
+//         })
+//     }
+//
+//     fn load<'a>(
+//         conn: &'a mut sqlx::Transaction<'c, sqlx::Postgres>,
+//         params: Self::LoadParams,
+//     ) -> FutureResult<'a, Option<Self>, Self::LoadError>
+//     where
+//         Self: 'a,
+//     {
+//         Box::pin(async move {
+//             let changeset = crate::ChangeSet::from_postgres(conn)
+//                 .await
+//                 .map_err(LoadWithPersistError::Persist)?;
+//             if chain::Merge::is_empty(&changeset) {
+//                 return Ok(None);
+//             }
+//             Self::load_with_params(changeset, params)
+//                 .map_err(LoadWithPersistError::InvalidChangeSet)
+//         })
+//     }
+//
+//     fn persist<'a>(
+//         db: &'a mut sqlx::Transaction<'c, sqlx::Postgres>,
+//         changeset: &'a <Self as chain::Staged>::ChangeSet,
+//     ) -> FutureResult<'a, (), Self::PersistError>
+//     where
+//         Self: 'a,
+//     {
+//         Box::pin(async move { changeset.persist_to_postgres(&mut *db).await })
+//     }
+// }
+
 #[cfg(feature = "sqlx")]
-impl<'c> chain::PersistAsyncWith<sqlx::Transaction<'c, sqlx::Postgres>> for Wallet {
+impl<C: sqlx::Connection<Database = sqlx::Postgres>> chain::PersistAsyncWith<C> for Wallet {
     type CreateParams = crate::CreateParams;
+
     type LoadParams = crate::LoadParams;
 
     type CreateError = CreateWithPersistError<sqlx::Error>;
+
     type LoadError = LoadWithPersistError<sqlx::Error>;
+
     type PersistError = sqlx::Error;
 
-    async fn create(
-        db: &mut sqlx::Transaction<'c, sqlx::Postgres>,
+    fn create<'db>(
+        db: &'db mut C,
         params: Self::CreateParams,
-    ) -> Result<Self, Self::CreateError> {
-        // Box::pin(async move {
-            let mut wallet = Self::create_with_params(params).map_err(CreateWithPersistError::Descriptor)?;
+    ) -> FutureResult<'db, Self, Self::CreateError>
+    where
+        Self: 'db,
+    {
+        Box::pin(async move {
+            let mut db_tx = db.begin().await.map_err(CreateWithPersistError::Persist)?;
+            let mut wallet =
+                Self::create_with_params(params).map_err(CreateWithPersistError::Descriptor)?;
             if let Some(changeset) = wallet.take_staged() {
                 changeset
-                    .persist_to_postgres(db)
+                    .persist_to_postgres(&mut db_tx)
                     .await
                     .map_err(CreateWithPersistError::Persist)?;
             }
+            db_tx
+                .commit()
+                .await
+                .map_err(CreateWithPersistError::Persist)?;
             Ok(wallet)
-        // })
+        })
     }
 
-    async fn load(
-        conn: &mut sqlx::Transaction<'c, sqlx::Postgres>,
+    fn load<'db>(
+        db: &'db mut C,
         params: Self::LoadParams,
-    ) -> Result<Option<Self>, Self::LoadError> {
-        // Box::pin(async move {
-            let changeset = crate::ChangeSet::from_postgres(conn)
+    ) -> FutureResult<'db, Option<Self>, Self::LoadError>
+    where
+        Self: 'db,
+    {
+        Box::pin(async move {
+            let mut db_tx = db.begin().await.map_err(LoadWithPersistError::Persist)?;
+            let changeset = crate::ChangeSet::from_postgres(&mut db_tx)
                 .await
                 .map_err(LoadWithPersistError::Persist)?;
             if chain::Merge::is_empty(&changeset) {
                 return Ok(None);
             }
-            Self::load_with_params(changeset, params).map_err(LoadWithPersistError::InvalidChangeSet)
-        // })
-    }
-
-    async fn persist(
-        db: &mut sqlx::Transaction<'c, sqlx::Postgres>,
-        changeset: &<Self as chain::Staged>::ChangeSet,
-    ) -> Result<(), Self::PersistError> {
-        // Box::pin(async move {
-            changeset.persist_to_postgres(&mut *db).await
-        // })
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl chain::PersistAsyncWith<sqlx::PgPool> for Wallet {
-    type CreateParams = crate::CreateParams;
-    type LoadParams = crate::LoadParams;
-
-    type CreateError = CreateWithPersistError<sqlx::Error>;
-    type LoadError = LoadWithPersistError<sqlx::Error>;
-    type PersistError = sqlx::Error;
-
-    async fn create<'a>(
-        db: &'a mut sqlx::PgPool,
-        params: Self::CreateParams,
-    ) -> FutureResult<'a, Self, Self::CreateError> {
-        Box::pin(async move {
-            let mut db_tx = db.begin().await.map_err(CreateWithPersistError::Persist)?;
-            let wallet = chain::PersistAsyncWith::create(&mut db_tx, params).await?;
-            db_tx.commit().await.map_err(CreateWithPersistError::Persist)?;
-            Ok(wallet)
+            let wallet_opt = Self::load_with_params(changeset, params)
+                .map_err(LoadWithPersistError::InvalidChangeSet)?;
+            db_tx
+                .commit()
+                .await
+                .map_err(LoadWithPersistError::Persist)?;
+            Ok(wallet_opt)
         })
     }
 
-    async fn load(
-        db: &mut sqlx::PgPool,
-        params: Self::LoadParams,
-    ) -> Result<Option<Self>, Self::LoadError> {
-        // Box::pin(async move {
-            let mut db_tx = db.begin().await.map_err(LoadWithPersistError::Persist)?;
-            let wallet_opt = chain::PersistAsyncWith::load(&mut db_tx, params).await?;
-            db_tx.commit().await.map_err(LoadWithPersistError::Persist)?;
-            Ok(wallet_opt)
-        // })
-    }
-
-    async fn persist(
-        db: &mut sqlx::PgPool,
-        changeset: &<Self as chain::Staged>::ChangeSet,
-    ) -> Result<(), Self::PersistError> {
+    fn persist<'db>(
+        db: &'db mut C,
+        changeset: &'db <Self as chain::Staged>::ChangeSet,
+    ) -> FutureResult<'db, (), Self::PersistError>
+    where
+        Self: 'db,
+    {
+        Box::pin(async move {
             let mut db_tx = db.begin().await?;
             changeset.persist_to_postgres(&mut db_tx).await?;
             db_tx.commit().await?;
-        Ok(())
+            Ok(())
+        })
     }
 }
 
+// #[cfg(feature = "sqlx")]
+// impl chain::PersistAsyncWith<sqlx::PgPool> for Wallet {
+//     type CreateParams = crate::CreateParams;
+//     type LoadParams = crate::LoadParams;
+//
+//     type CreateError = CreateWithPersistError<sqlx::Error>;
+//     type LoadError = LoadWithPersistError<sqlx::Error>;
+//     type PersistError = sqlx::Error;
+//
+//     fn create<'db>(
+//         db: &'db mut sqlx::PgPool,
+//         params: Self::CreateParams,
+//     ) -> FutureResult<'db, Self, Self::CreateError>
+//     where
+//         Self: 'db,
+//     {
+//         Box::pin(async move {
+//             let mut db_tx = db.begin().await.map_err(CreateWithPersistError::Persist)?;
+//             let wallet = chain::PersistAsyncWith::create(&mut db_tx, params).await?;
+//             db_tx
+//                 .commit()
+//                 .await
+//                 .map_err(CreateWithPersistError::Persist)?;
+//             Ok(wallet)
+//         })
+//     }
+//
+//     fn load<'db>(
+//         db: &'db mut sqlx::PgPool,
+//         params: Self::LoadParams,
+//     ) -> FutureResult<'db, Option<Self>, Self::LoadError>
+//     where
+//         Self: 'db,
+//     {
+//         Box::pin(async move {
+//             let mut db_tx = db.begin().await.map_err(LoadWithPersistError::Persist)?;
+//             let wallet_opt = chain::PersistAsyncWith::load(&mut db_tx, params).await?;
+//             db_tx
+//                 .commit()
+//                 .await
+//                 .map_err(LoadWithPersistError::Persist)?;
+//             Ok(wallet_opt)
+//         })
+//     }
+//
+//     fn persist<'db>(
+//         db: &'db mut sqlx::PgPool,
+//         changeset: &'db <Self as chain::Staged>::ChangeSet,
+//     ) -> FutureResult<'db, (), Self::PersistError>
+//     where
+//         Self: 'db,
+//     {
+//         Box::pin(async move {
+//             let mut db_tx = db.begin().await?;
+//             changeset.persist_to_postgres(&mut db_tx).await?;
+//             db_tx.commit().await?;
+//             Ok(())
+//         })
+//     }
+// }
 
 // #[cfg(feature = "rusqlite")]
 // impl<'c> chain::PersistWith<bdk_chain::rusqlite::Transaction<'c>> for Wallet {

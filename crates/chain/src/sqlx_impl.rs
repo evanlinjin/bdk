@@ -73,9 +73,8 @@ where
         // // migrate_schema(db_tx, Self::SCHEMA_NAME, &[schema_v0])
         // Ok(())
         // let db = db_tx.acquire().await.unwrap();
-        migrate!("./tx_graph_migrations").run(db_tx).await
-
-
+        // migrate!("./tx_graph_migrations").run(db_tx).await
+        Ok(())
     }
 
     pub async fn from_postgres(db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> sqlx::Result<Self> {
@@ -215,7 +214,8 @@ impl local_chain::ChangeSet {
 
     /// Initialize sqlite tables for persisting [`local_chain::LocalChain`].
     async fn init_postgres_tables(db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), MigrateError> {
-        sqlx::migrate!("./local_chain_migrations").run(&mut **db_tx).await
+        //sqlx::migrate!("./local_chain_migrations").run(&mut **db_tx).await
+        Ok(())
     }
 
     pub async fn from_postgres(db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> sqlx::Result<Self> {
@@ -282,8 +282,8 @@ impl keychain_txout::ChangeSet {
     /// Initialize PostgreSQL tables for persisting
     /// [`KeychainTxOutIndex`](keychain_txout::KeychainTxOutIndex).
     async fn init_postgres_tables(db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), MigrateError> {
-        sqlx::migrate!("./keychain_migrations").run(&mut **db_tx).await
-
+        // sqlx::migrate!("./keychain_migrations").run(&mut **db_tx).await
+        Ok(())
     }
 
     /// Construct [`KeychainTxOutIndex`](keychain_txout::KeychainTxOutIndex) from PostgreSQL database

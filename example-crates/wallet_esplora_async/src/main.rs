@@ -2,12 +2,12 @@ use std::{collections::BTreeSet, io::Write};
 
 use anyhow::Ok;
 use bdk_esplora::{esplora_client, EsploraAsyncExt};
+use bdk_wallet::chain::sqlx;
 use bdk_wallet::{
     bitcoin::{Amount, Network},
-    // rusqlite::Connection,
+    sqlx::Connection,
     KeychainKind, SignOptions, Wallet,
 };
-use bdk_wallet::chain::sqlx;
 
 const SEND_AMOUNT: Amount = Amount::from_sat(5000);
 const STOP_GAP: usize = 5;
@@ -21,22 +21,26 @@ const ESPLORA_URL: &str = "http://signet.bitcoindevkit.net";
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let mut conn = sqlx::Connection::connect("postgresql://sirendb_owner:2vDJjo9pGKiP@ep-sweet-shape-a5ouj5s7.us-east-2.aws.neon.tech/sirendb?sslmode=require").await.unwrap();
-        // Connection::open(DB_PATH)?;
+    let mut conn = sqlx::PgConnection::connect("postgresql://sirendb_owner:2vDJjo9pGKiP@ep-sweet-shape-a5ouj5s7.us-east-2.aws.neon.tech/sirendb?sslmode=require").await.unwrap();
+    // Connection::open(DB_PATH)?;
 
     let wallet_opt = Wallet::load()
         .descriptors(EXTERNAL_DESC, INTERNAL_DESC)
         .network(NETWORK)
-        .load_wallet(&mut conn)?;
+        .load_wallet_async(&mut conn)
+        .await?;
     let mut wallet = match wallet_opt {
         Some(wallet) => wallet,
-        None => Wallet::create(EXTERNAL_DESC, INTERNAL_DESC)
-            .network(NETWORK)
-            .create_wallet(&mut conn)?,
+        None => {
+            Wallet::create(EXTERNAL_DESC, INTERNAL_DESC)
+                .network(NETWORK)
+                .create_wallet_async(&mut conn)
+                .await?
+        }
     };
 
     let address = wallet.next_unused_address(KeychainKind::External);
-    wallet.persist(&mut conn)?;
+    wallet.persist_async(&mut conn).await?;
     println!("Next unused address: ({}) {}", address.index, address);
 
     let balance = wallet.balance();
@@ -63,7 +67,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let _ = update.graph_update.update_last_seen_unconfirmed(now);
 
     wallet.apply_update(update)?;
-    wallet.persist(&mut conn)?;
+    wallet.persist_async(&mut conn).await?;
     println!();
 
     let balance = wallet.balance();
