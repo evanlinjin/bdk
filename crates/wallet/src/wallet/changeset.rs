@@ -1,3 +1,5 @@
+use core::str::FromStr;
+use std::prelude::rust_2015::{String, ToString};
 use bdk_chain::{
     indexed_tx_graph, keychain_txout, local_chain, tx_graph, ConfirmationBlockTime, Merge,
 };
@@ -62,6 +64,102 @@ impl Merge for ChangeSet {
             && self.local_chain.is_empty()
             && self.tx_graph.is_empty()
             && self.indexer.is_empty()
+    }
+}
+
+
+
+#[cfg(feature = "sqlx")]
+impl ChangeSet {
+
+    /// Schema name for wallet.
+    // pub const WALLET_SCHEMA_NAME: &'static str = "bdk_wallet";
+    /// Name of table to store wallet descriptors and network.
+    // pub const WALLET_TABLE_NAME: &'static str = "bdk_wallet";
+
+    /// Initialize PostgreSQL tables for wallet schema & table.
+    async fn init_wallet_postgres_tables(
+        db_tx: &mut chain::sqlx::Transaction<'_, chain::sqlx::Postgres>,
+    ) -> chain::sqlx::Result<()> {
+
+        // sqlx::migrate!("/Users/matthiasdebernardini/Projects/bdk/crates/wallet/src/wallet_migrations").run(db_tx).await
+        Ok(())
+    }
+
+    /// Recover a [`ChangeSet`] from PostgreSQL database.
+    pub async fn from_postgres(db_tx: &mut chain::sqlx::Transaction<'_, chain::sqlx::Postgres>) -> chain::sqlx::Result<Self> {
+        Self::init_wallet_postgres_tables(db_tx).await?;
+
+        let mut changeset = Self::default();
+
+        let row = chain::sqlx::query(&format!(
+            "SELECT descriptor, change_descriptor, network FROM {}",
+            Self::WALLET_TABLE_NAME,
+        ))
+            .fetch_optional(&mut **db_tx)
+            .await?;
+
+        use chain::sqlx::Row;
+        if let Some(row) = row {
+            changeset.descriptor = row.get::<Option<String>, _>("descriptor")
+                .and_then(|s| Descriptor::<DescriptorPublicKey>::from_str(&s).ok());
+            changeset.change_descriptor = row.get::<Option<String>, _>("change_descriptor")
+                .and_then(|s| Descriptor::<DescriptorPublicKey>::from_str(&s).ok());
+            changeset.network = row.get::<Option<String>, _>("network")
+                .and_then(|s| bitcoin::Network::from_str(&s).ok());
+        }
+
+        changeset.local_chain = local_chain::ChangeSet::from_postgres(db_tx).await?;
+        changeset.tx_graph = tx_graph::ChangeSet::<_>::from_postgres(db_tx).await?;
+        changeset.indexer = keychain_txout::ChangeSet::from_postgres(db_tx).await?;
+
+        Ok(changeset)
+    }
+
+    /// Persist [`ChangeSet`] to PostgreSQL database.
+    pub async fn persist_to_postgres(
+        &self,
+        db_tx: &mut chain::sqlx::Transaction<'_, chain::sqlx::Postgres>,
+    ) -> chain::sqlx::Result<()> {
+        Self::init_wallet_postgres_tables(db_tx).await?;
+
+        if let Some(descriptor) = &self.descriptor {
+            chain::sqlx::query(&format!(
+                "INSERT INTO {} (id, descriptor) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET descriptor = $2",
+                Self::WALLET_TABLE_NAME,
+            ))
+                .bind(0)
+                .bind(descriptor.to_string())
+                .execute(&mut **db_tx)
+                .await?;
+        }
+
+        if let Some(change_descriptor) = &self.change_descriptor {
+            chain::sqlx::query(&format!(
+                "INSERT INTO {} (id, change_descriptor) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET change_descriptor = $2",
+                Self::WALLET_TABLE_NAME,
+            ))
+                .bind(0)
+                .bind(change_descriptor.to_string())
+                .execute(&mut **db_tx)
+                .await?;
+        }
+
+        if let Some(network) = self.network {
+            chain::sqlx::query(&format!(
+                "INSERT INTO {} (id, network) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET network = $2",
+                Self::WALLET_TABLE_NAME,
+            ))
+                .bind(0)
+                .bind(network.to_string())
+                .execute(&mut **db_tx)
+                .await?;
+        }
+
+        self.local_chain.persist_to_postgres(db_tx).await?;
+        self.tx_graph.persist_to_postgres(db_tx).await?;
+        self.indexer.persist_to_postgres(db_tx).await?;
+        Ok(())
     }
 }
 

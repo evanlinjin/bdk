@@ -45,7 +45,7 @@ pub trait PersistWith<Db>: Staged + Sized {
     ) -> Result<(), Self::PersistError>;
 }
 
-type FutureResult<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+pub type FutureResult<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
 /// Trait that persists the type with an async `Db`.
 pub trait PersistAsyncWith<Db>: Staged + Sized {
