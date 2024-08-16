@@ -36,7 +36,10 @@ pub trait WalletPersister {
     /// data, return an empty changeset (using [`ChangeSet::default()`]).
     ///
     /// Error should only occur on database failure. Multiple calls to `initialize` should not
-    /// error. Calling [`persist`] before calling `initialize` should not error either.
+    /// error. Calling `initialize` inbetween calls to `persist` should not error.
+    ///
+    /// Calling [`persist`] before the `persister` is `initialize`d may error. However, some
+    /// persister implementations may NOT require initialization at all (and not error).
     ///
     /// [`persist`]: WalletPersister::persist
     fn initialize(persister: &mut Self) -> Result<ChangeSet, Self::Error>;
@@ -76,7 +79,10 @@ pub trait AsyncWalletPersister {
     /// data, return an empty changeset (using [`ChangeSet::default()`]).
     ///
     /// Error should only occur on database failure. Multiple calls to `initialize` should not
-    /// error. Calling [`persist`] before calling `initialize` should not error either.
+    /// error. Calling `initialize` inbetween calls to `persist` should not error.
+    ///
+    /// Calling [`persist`] before the `persister` is `initialize`d may error. However, some
+    /// persister implementations may NOT require initialization at all (and not error).
     ///
     /// [`persist`]: AsyncWalletPersister::persist
     fn initialize<'a>(persister: &'a mut Self) -> FutureResult<'a, ChangeSet, Self::Error>
@@ -171,6 +177,8 @@ impl<P: WalletPersister> PersistedWallet<P> {
 
     /// Persist staged changes of wallet into `persister`.
     ///
+    /// Returns whether any new changes were persisted.
+    ///
     /// If the `persister` errors, the staged changes will not be cleared.
     pub fn persist(&mut self, persister: &mut P) -> Result<bool, P::Error> {
         match self.inner.staged_mut() {
@@ -186,7 +194,7 @@ impl<P: WalletPersister> PersistedWallet<P> {
 
 /// Methods when `P` is an [`AsyncWalletPersister`].
 impl<P: AsyncWalletPersister> PersistedWallet<P> {
-    /// Create a new [`PersistedWallet`] witht the given async `persister` and `params`.
+    /// Create a new [`PersistedWallet`] with the given async `persister` and `params`.
     pub async fn create_async(
         persister: &mut P,
         params: CreateParams,
@@ -229,6 +237,8 @@ impl<P: AsyncWalletPersister> PersistedWallet<P> {
     }
 
     /// Persist staged changes of wallet into an async `persister`.
+    ///
+    /// Returns whether any new changes were persisted.
     ///
     /// If the `persister` errors, the staged changes will not be cleared.
     pub async fn persist_async<'a>(&'a mut self, persister: &mut P) -> Result<bool, P::Error> {
