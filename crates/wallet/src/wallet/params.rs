@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use std::prelude::rust_2021::String;
 use bdk_chain::keychain_txout::DEFAULT_LOOKAHEAD;
 use bitcoin::{BlockHash, Network};
 use miniscript::descriptor::KeyMap;
@@ -124,11 +125,12 @@ impl CreateParams {
     pub async fn create_wallet_async<P>(
         self,
         persister: &mut P,
+        wallet_name: String,
     ) -> Result<PersistedWallet<P>, CreateWithPersistError<P::Error>>
     where
         P: AsyncWalletPersister,
     {
-        PersistedWallet::create_async(persister, self).await
+        PersistedWallet::create_async(persister, self, wallet_name).await
     }
 
     /// Create [`Wallet`] without persistence.
@@ -235,11 +237,12 @@ impl LoadParams {
     pub async fn load_wallet_async<P>(
         self,
         persister: &mut P,
+        wallet_name:String,
     ) -> Result<Option<PersistedWallet<P>>, LoadWithPersistError<P::Error>>
     where
         P: AsyncWalletPersister,
     {
-        PersistedWallet::load_async(persister, self).await
+        PersistedWallet::load_async(persister, self, wallet_name).await
     }
 
     /// Load [`Wallet`] without persistence.
