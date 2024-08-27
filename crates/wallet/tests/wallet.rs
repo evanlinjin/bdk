@@ -1393,6 +1393,62 @@ fn test_create_tx_global_xpubs_with_origin() {
 }
 
 #[test]
+fn test_create_tx_increment_change_index() {
+    // Check that a change address is marked used after `create_tx`.
+    // Failing to create a tx should not mark a change address used.
+    // Specifying a drain_to should mark the address used if it's
+    // owned by the wallet.
+    use coin_selection::Error;
+
+    let (desc, change_desc) = get_test_tr_single_sig_xprv_with_change_desc();
+    let (mut wallet, _) = get_funded_wallet_with_change(desc, change_desc);
+    let addr = wallet.next_unused_address(KeychainKind::External);
+    let internal_addr0 = wallet.next_unused_address(KeychainKind::Internal);
+    assert_eq!(internal_addr0.index, 0);
+
+    // try to send an amount that results in `InsufficientFunds` error
+    let amount = wallet.balance().total();
+    let mut builder = wallet.build_tx();
+    builder.add_recipient(addr.script_pubkey(), amount);
+    let err = builder.finish().unwrap_err();
+    assert!(matches!(
+        err,
+        CreateTxError::CoinSelection(Error::InsufficientFunds { .. }),
+    ));
+    assert_eq!(
+        wallet.next_unused_address(KeychainKind::Internal),
+        internal_addr0,
+    );
+
+    // send all (no change) should not increment index
+    let fee = Amount::from_sat(150);
+    let mut builder = wallet.build_tx();
+    builder.add_recipient(addr.script_pubkey(), amount - fee);
+    let psbt = builder.finish().unwrap();
+    assert_eq!(psbt.unsigned_tx.output.len(), 1);
+    assert_eq!(
+        wallet.next_unused_address(KeychainKind::Internal),
+        internal_addr0,
+    );
+
+    // create tx with change should increment index
+    let mut builder = wallet.build_tx();
+    builder.add_recipient(addr.script_pubkey(), amount / 2);
+    let psbt = builder.finish().unwrap();
+    assert_eq!(psbt.unsigned_tx.output.len(), 2);
+    let internal_addr1 = wallet.next_unused_address(KeychainKind::Internal);
+    assert_eq!(internal_addr1.index, 1);
+
+    // specifying drain_to should increment index
+    let mut builder = wallet.build_tx();
+    builder
+        .drain_to(internal_addr1.script_pubkey())
+        .drain_wallet();
+    let _ = builder.finish().unwrap();
+    assert_eq!(wallet.next_unused_address(KeychainKind::Internal).index, 2);
+}
+
+#[test]
 fn test_add_foreign_utxo() {
     let (mut wallet1, _) = get_funded_wallet_wpkh();
     let (wallet2, _) =
