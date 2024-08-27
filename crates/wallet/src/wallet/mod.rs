@@ -1452,12 +1452,11 @@ impl Wallet {
             Some(ref drain_recipient) => drain_recipient.clone(),
             None => {
                 let change_keychain = self.map_keychain(KeychainKind::Internal);
-                let ((index, spk), index_changeset) = self
+                let ((_index, spk), index_changeset) = self
                     .indexed_graph
                     .index
                     .next_unused_spk(change_keychain)
                     .expect("keychain must exist");
-                self.indexed_graph.index.mark_used(change_keychain, index);
                 self.stage.merge(index_changeset.into());
                 spk
             }
@@ -1543,7 +1542,7 @@ impl Wallet {
                 // create drain output
                 let drain_output = TxOut {
                     value: Amount::from_sat(*amount),
-                    script_pubkey: drain_script,
+                    script_pubkey: drain_script.clone(),
                 };
 
                 // TODO: We should pay attention when adding a new output: this might increase
@@ -1557,6 +1556,19 @@ impl Wallet {
         params.ordering.sort_tx_with_aux_rand(&mut tx, rng);
 
         let psbt = self.complete_transaction(tx, coin_selection.selected, params)?;
+
+        if psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .any(|txout| txout.script_pubkey == drain_script)
+        {
+            // mark our change address used to prevent other callers from using it
+            if let Some((keychain, index)) = self.derivation_of_spk(drain_script) {
+                self.mark_used(keychain, index);
+            }
+        }
+
         Ok(psbt)
     }
 
