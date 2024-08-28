@@ -1448,6 +1448,7 @@ impl Wallet {
             self.preselect_utxos(&params, Some(current_height.to_consensus_u32()));
 
         // get drain script
+        let mut drain_keychain_index = Option::<(KeychainKind, u32)>::None;
         let drain_script = match params.drain_to {
             Some(ref drain_recipient) => drain_recipient.clone(),
             None => {
@@ -1534,7 +1535,8 @@ impl Wallet {
                 remaining_amount, ..
             } => fee_amount += remaining_amount,
             Change { amount, fee } => {
-                if self.is_mine(drain_script.clone()) {
+                if let Some(index) = self.spk_index().index_of_spk(drain_script.clone()).cloned() {
+                    drain_keychain_index = Some(index);
                     received += Amount::from_sat(*amount);
                 }
                 fee_amount += fee;
@@ -1542,7 +1544,7 @@ impl Wallet {
                 // create drain output
                 let drain_output = TxOut {
                     value: Amount::from_sat(*amount),
-                    script_pubkey: drain_script.clone(),
+                    script_pubkey: drain_script,
                 };
 
                 // TODO: We should pay attention when adding a new output: this might increase
@@ -1557,16 +1559,9 @@ impl Wallet {
 
         let psbt = self.complete_transaction(tx, coin_selection.selected, params)?;
 
-        if psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .any(|txout| txout.script_pubkey == drain_script)
-        {
-            // mark our change address used to prevent other callers from using it
-            if let Some((keychain, index)) = self.derivation_of_spk(drain_script) {
-                self.mark_used(keychain, index);
-            }
+        // marking our change address used to prevent other callers from using it
+        if let Some((keychain, index)) = drain_keychain_index {
+            self.mark_used(keychain, index);
         }
 
         Ok(psbt)
