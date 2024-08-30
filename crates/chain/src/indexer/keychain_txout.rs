@@ -721,6 +721,24 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
         next_unused.or_else(|| self.reveal_next_spk(keychain))
     }
 
+    /// Get the next unused derivation index in `keychain`. I.e., the lowest derivation index that
+    /// has not been used yet.
+    ///
+    /// The second field in the returned tuple represents whether the next derivation index is new
+    /// (returns `true` when the derivation index has not been revealed).
+    ///
+    /// If the descriptor has no wildcard and already has a used script pubkey or if a descriptor
+    /// has used all scripts up to the derivation bounds, then the last derived index will be
+    /// returned.
+    ///
+    /// Returns `None` if the provided `keychain` does not exist.
+    pub fn next_unused_index(&self, keychain: K) -> Option<(u32, bool)> {
+        self.unused_keychain_spks(keychain.clone())
+            .next()
+            .map(|(i, _)| (i, false))
+            .or_else(|| self.next_index(keychain))
+    }
+
     /// Iterate over all [`OutPoint`]s that have `TxOut`s with script pubkeys derived from
     /// `keychain`.
     pub fn keychain_outpoints(
