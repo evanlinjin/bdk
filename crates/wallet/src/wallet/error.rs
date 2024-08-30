@@ -16,7 +16,7 @@ use crate::descriptor::DescriptorError;
 use crate::wallet::coin_selection;
 use crate::{descriptor, KeychainKind};
 use alloc::string::String;
-use bitcoin::{absolute, psbt, Amount, OutPoint, Sequence, Txid};
+use bitcoin::{absolute, psbt, Amount, OutPoint, Sequence, TxOut, Txid};
 use core::fmt;
 
 /// Errors returned by miniscript when updating inconsistent PSBTs
@@ -87,7 +87,7 @@ pub enum CreateTxError {
     /// `manually_selected_only` option is selected but no utxo has been passed
     NoUtxosSelected,
     /// Output created is under the dust limit, 546 satoshis
-    OutputBelowDustLimit(usize),
+    OutputBelowDustLimit { txout: TxOut, dust_limit: Amount },
     /// There was an error with coin selection
     CoinSelection(coin_selection::Error),
     /// Cannot build a tx without recipients
@@ -156,8 +156,12 @@ impl fmt::Display for CreateTxError {
             CreateTxError::NoUtxosSelected => {
                 write!(f, "No UTXO selected")
             }
-            CreateTxError::OutputBelowDustLimit(limit) => {
-                write!(f, "Output below the dust limit: {}", limit)
+            CreateTxError::OutputBelowDustLimit { txout, dust_limit } => {
+                write!(
+                    f,
+                    "Output '{:?}' is below dust limit '{}'",
+                    txout, dust_limit
+                )
             }
             CreateTxError::CoinSelection(e) => e.fmt(f),
             CreateTxError::NoRecipients => {

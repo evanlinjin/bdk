@@ -53,7 +53,7 @@ use rand_core::RngCore;
 use descriptor::error::Error as DescriptorError;
 use miniscript::{
     descriptor::KeyMap,
-    psbt::{PsbtExt, PsbtInputExt, PsbtInputSatisfier},
+    psbt::{PsbtExt, PsbtInputExt, PsbtInputSatisfier, PsbtOutputExt},
 };
 
 use bdk_chain::tx_graph::CalculateFeeError;
@@ -1379,7 +1379,7 @@ impl Wallet {
             (Some(rbf), _) => rbf.get_value(),
         };
 
-        let (fee_rate, mut fee_amount) = match params.fee_policy.unwrap_or_default() {
+        let (fee_rate, base_fee_amount) = match params.fee_policy.unwrap_or_default() {
             //FIXME: see https://github.com/bitcoindevkit/bdk/issues/256
             FeePolicy::FeeAmount(fee) => {
                 if let Some(previous_fee) = params.bumping_fee {
@@ -1418,60 +1418,43 @@ impl Wallet {
             return Err(CreateTxError::NoUtxosSelected);
         }
 
-        let mut outgoing = Amount::ZERO;
-        let mut received = Amount::ZERO;
-
-        let recipients = params.recipients.iter().map(|(r, v)| (r, *v));
-
-        for (index, (script_pubkey, value)) in recipients.enumerate() {
-            if !params.allow_dust && value.is_dust(script_pubkey) && !script_pubkey.is_op_return() {
-                return Err(CreateTxError::OutputBelowDustLimit(index));
+        for (script_pubkey, value) in params.recipients.iter().cloned() {
+            let value = Amount::from_sat(value);
+            let dust_limit = script_pubkey.minimal_non_dust();
+            if !params.allow_dust && value < dust_limit && !script_pubkey.is_op_return() {
+                return Err(CreateTxError::OutputBelowDustLimit {
+                    txout: TxOut {
+                        value,
+                        script_pubkey,
+                    },
+                    dust_limit,
+                });
             }
 
-            if self.is_mine(script_pubkey.clone()) {
-                received += Amount::from_sat(value);
-            }
-
-            let new_out = TxOut {
-                script_pubkey: script_pubkey.clone(),
-                value: Amount::from_sat(value),
-            };
-
-            tx.output.push(new_out);
-
-            outgoing += Amount::from_sat(value);
+            tx.output.push(TxOut {
+                script_pubkey,
+                value,
+            });
         }
-
-        fee_amount += (fee_rate * tx.weight()).to_sat();
 
         let (required_utxos, optional_utxos) =
             self.preselect_utxos(&params, Some(current_height.to_consensus_u32()));
-
-        // get drain script
-        let mut drain_keychain_index = Option::<(KeychainKind, u32)>::None;
-        let drain_script = match params.drain_to {
-            Some(ref drain_recipient) => drain_recipient.clone(),
-            None => {
-                let change_keychain = self.map_keychain(KeychainKind::Internal);
-                let ((_index, spk), index_changeset) = self
-                    .indexed_graph
-                    .index
-                    .next_unused_spk(change_keychain)
-                    .expect("keychain must exist");
-                self.stage.merge(index_changeset.into());
-                spk
-            }
-        };
-
         let (required_utxos, optional_utxos) =
             coin_selection::filter_duplicates(required_utxos, optional_utxos);
+
+        let coin_selection_target = params.recipients.iter().map(|(_, v)| *v).sum::<u64>()
+            + base_fee_amount
+            + (fee_rate * tx.weight()).to_sat();
+
+        let drain_keychain = self.map_keychain(KeychainKind::Internal);
+        let drain_descriptor = self.public_descriptor(KeychainKind::Internal).clone();
 
         let coin_selection = match coin_selection.coin_select(
             required_utxos.clone(),
             optional_utxos.clone(),
             fee_rate,
-            outgoing.to_sat() + fee_amount,
-            &drain_script,
+            coin_selection_target,
+            &drain_descriptor,
         ) {
             Ok(res) => res,
             Err(e) => match e {
@@ -1483,16 +1466,14 @@ impl Wallet {
                     coin_selection::single_random_draw(
                         required_utxos,
                         optional_utxos,
-                        outgoing.to_sat() + fee_amount,
-                        &drain_script,
+                        coin_selection_target,
+                        &drain_descriptor,
                         fee_rate,
                         rng,
                     )
                 }
             },
         };
-        fee_amount += coin_selection.fee_amount;
-        let excess = &coin_selection.excess;
 
         tx.input = coin_selection
             .selected
@@ -1518,7 +1499,7 @@ impl Wallet {
                     dust_threshold,
                     remaining_amount,
                     change_fee,
-                } = excess
+                } = &coin_selection.excess
                 {
                     return Err(CreateTxError::CoinSelection(Error::InsufficientFunds {
                         needed: *dust_threshold,
@@ -1530,38 +1511,47 @@ impl Wallet {
             }
         }
 
-        match excess {
-            NoChange {
-                remaining_amount, ..
-            } => fee_amount += remaining_amount,
-            Change { amount, fee } => {
-                if let Some(index) = self.spk_index().index_of_spk(drain_script.clone()).cloned() {
-                    drain_keychain_index = Some(index);
-                    received += Amount::from_sat(*amount);
-                }
-                fee_amount += fee;
-
-                // create drain output
-                let drain_output = TxOut {
-                    value: Amount::from_sat(*amount),
-                    script_pubkey: drain_script,
-                };
-
-                // TODO: We should pay attention when adding a new output: this might increase
-                // the length of the "number of vouts" parameter by 2 bytes, potentially making
-                // our feerate too low
-                tx.output.push(drain_output);
-            }
-        };
-
         // sort input/outputs according to the chosen algorithm
         params.ordering.sort_tx_with_aux_rand(&mut tx, rng);
 
-        let psbt = self.complete_transaction(tx, coin_selection.selected, params)?;
+        let mut psbt = self.complete_transaction(tx, coin_selection.selected, &params)?;
 
-        // marking our change address used to prevent other callers from using it
-        if let Some((keychain, index)) = drain_keychain_index {
-            self.mark_used(keychain, index);
+        if let &Change { amount, .. } = &coin_selection.excess {
+            let mut drain_psbt_txo = psbt::Output::default();
+            if params.drain_to.is_none() {
+                let (drain_keychain_index, _) = self
+                    .indexed_graph
+                    .index
+                    .next_unused_index(drain_keychain)
+                    .expect("keychain must exist");
+                let definite_descriptor = drain_descriptor
+                    .at_derivation_index(drain_keychain_index)
+                    .expect("derivation index must be valid");
+                drain_psbt_txo
+                    .update_with_descriptor_unchecked(&definite_descriptor)
+                    .map_err(|e| {
+                        CreateTxError::MiniscriptPsbt(MiniscriptPsbtError::Conversion(e))
+                    })?;
+            }
+
+            let drain_txo = TxOut {
+                value: Amount::from_sat(amount),
+                script_pubkey: match &params.drain_to {
+                    Some(ref drain_recipient) => drain_recipient.clone(),
+                    None => {
+                        let indexer = &mut self.indexed_graph.index;
+                        let ((index, spk), index_changeset) = indexer
+                            .next_unused_spk(drain_keychain)
+                            .expect("keychain must exist");
+                        indexer.mark_used(drain_keychain, index);
+                        self.stage.merge(index_changeset.into());
+                        spk
+                    }
+                },
+            };
+
+            psbt.outputs.push(drain_psbt_txo);
+            psbt.unsigned_tx.output.push(drain_txo);
         }
 
         Ok(psbt)
@@ -2110,7 +2100,7 @@ impl Wallet {
         &self,
         tx: Transaction,
         selected: Vec<Utxo>,
-        params: TxParams,
+        params: &TxParams,
     ) -> Result<Psbt, CreateTxError> {
         let mut psbt = Psbt::from_unsigned_tx(tx)?;
 
@@ -2242,8 +2232,10 @@ impl Wallet {
 
         // Try to figure out the keychain and derivation for every input and output
         for (is_input, index, out) in utxos.into_iter() {
-            if let Some(&(keychain, child)) =
-                self.indexed_graph.index.index_of_spk(out.script_pubkey)
+            if let Some(&(keychain, child)) = self
+                .indexed_graph
+                .index
+                .index_of_spk(out.script_pubkey.clone())
             {
                 let desc = self.public_descriptor(keychain);
                 let desc = desc

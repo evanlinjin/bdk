@@ -803,28 +803,38 @@ impl TxOrdering {
     ///
     /// Uses the thread-local random number generator (rng).
     #[cfg(feature = "std")]
-    pub fn sort_tx(&self, tx: &mut Transaction) {
+    pub fn sort_tx(&self, tx: &mut Transaction) -> (Vec<usize>, Vec<usize>) {
         self.sort_tx_with_aux_rand(tx, &mut bitcoin::key::rand::thread_rng())
     }
 
     /// Sort transaction inputs and outputs by [`TxOrdering`] variant.
     ///
     /// Uses a provided random number generator (rng).
-    pub fn sort_tx_with_aux_rand(&self, tx: &mut Transaction, rng: &mut impl RngCore) {
+    pub fn sort_tx_with_aux_rand(
+        &self,
+        tx: &mut Transaction,
+        rng: &mut impl RngCore,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let mut indexed_inputs = tx.input.iter().cloned().enumerate().collect::<Vec<_>>();
+        let mut indexed_outputs = tx.output.iter().cloned().enumerate().collect::<Vec<_>>();
         match self {
             TxOrdering::Untouched => {}
             TxOrdering::Shuffle => {
-                shuffle_slice(&mut tx.input, rng);
-                shuffle_slice(&mut tx.output, rng);
+                shuffle_slice(&mut indexed_inputs, rng);
+                shuffle_slice(&mut indexed_outputs, rng);
             }
             TxOrdering::Custom {
                 input_sort,
                 output_sort,
             } => {
-                tx.input.sort_unstable_by(|a, b| input_sort(a, b));
-                tx.output.sort_unstable_by(|a, b| output_sort(a, b));
+                indexed_inputs.sort_unstable_by(|(_, a), (_, b)| input_sort(a, b));
+                indexed_outputs.sort_unstable_by(|(_, a), (_, b)| output_sort(a, b));
             }
         }
+        let (input_indices, output_indices);
+        (input_indices, tx.input) = indexed_inputs.into_iter().unzip();
+        (output_indices, tx.output) = indexed_outputs.into_iter().unzip();
+        (input_indices, output_indices)
     }
 }
 

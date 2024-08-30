@@ -3935,7 +3935,7 @@ fn test_allow_dust_limit() {
 
     assert_matches!(
         builder.finish(),
-        Err(CreateTxError::OutputBelowDustLimit(0))
+        Err(CreateTxError::OutputBelowDustLimit { .. })
     );
 
     let mut builder = wallet.build_tx();
