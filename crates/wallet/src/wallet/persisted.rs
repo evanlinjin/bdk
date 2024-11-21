@@ -7,6 +7,7 @@ use core::{
 };
 
 use alloc::boxed::Box;
+use std::prelude::rust_2021::String;
 use chain::Merge;
 
 use crate::{descriptor::DescriptorError, ChangeSet, CreateParams, LoadParams, Wallet};
@@ -85,7 +86,7 @@ pub trait AsyncWalletPersister {
     /// persister implementations may NOT require initialization at all (and not error).
     ///
     /// [`persist`]: AsyncWalletPersister::persist
-    fn initialize<'a>(persister: &'a mut Self) -> FutureResult<'a, ChangeSet, Self::Error>
+    fn initialize<'a>(persister: &'a mut Self, wallet_name: String) -> FutureResult<'a, ChangeSet, Self::Error>
     where
         Self: 'a;
 
@@ -97,6 +98,7 @@ pub trait AsyncWalletPersister {
     fn persist<'a>(
         persister: &'a mut Self,
         changeset: &'a ChangeSet,
+        wallet_name:String,
     ) -> FutureResult<'a, (), Self::Error>
     where
         Self: 'a;
@@ -198,8 +200,9 @@ impl<P: AsyncWalletPersister> PersistedWallet<P> {
     pub async fn create_async(
         persister: &mut P,
         params: CreateParams,
+        wallet_name:String,
     ) -> Result<Self, CreateWithPersistError<P::Error>> {
-        let existing = P::initialize(persister)
+        let existing = P::initialize(persister, wallet_name.clone())
             .await
             .map_err(CreateWithPersistError::Persist)?;
         if !existing.is_empty() {
@@ -208,7 +211,7 @@ impl<P: AsyncWalletPersister> PersistedWallet<P> {
         let mut inner =
             Wallet::create_with_params(params).map_err(CreateWithPersistError::Descriptor)?;
         if let Some(changeset) = inner.take_staged() {
-            P::persist(persister, &changeset)
+            P::persist(persister, &changeset, wallet_name)
                 .await
                 .map_err(CreateWithPersistError::Persist)?;
         }
@@ -222,8 +225,9 @@ impl<P: AsyncWalletPersister> PersistedWallet<P> {
     pub async fn load_async(
         persister: &mut P,
         params: LoadParams,
+        wallet_name: String,
     ) -> Result<Option<Self>, LoadWithPersistError<P::Error>> {
-        let changeset = P::initialize(persister)
+        let changeset = P::initialize(persister, wallet_name)
             .await
             .map_err(LoadWithPersistError::Persist)?;
         Wallet::load_with_params(changeset, params)
@@ -241,10 +245,10 @@ impl<P: AsyncWalletPersister> PersistedWallet<P> {
     /// Returns whether any new changes were persisted.
     ///
     /// If the `persister` errors, the staged changes will not be cleared.
-    pub async fn persist_async<'a>(&'a mut self, persister: &mut P) -> Result<bool, P::Error> {
+    pub async fn persist_async<'a>(&'a mut self, persister: &mut P, wallet_name:String) -> Result<bool, P::Error> {
         match self.inner.staged_mut() {
             Some(stage) => {
-                P::persist(persister, &*stage).await?;
+                P::persist(persister, &*stage, wallet_name).await?;
                 let _ = stage.take();
                 Ok(true)
             }
