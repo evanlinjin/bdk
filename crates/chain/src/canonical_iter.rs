@@ -16,7 +16,8 @@ pub struct CanonicalIter<'g, A, C> {
     unprocessed_txs_with_anchors:
         Box<dyn Iterator<Item = (Txid, Arc<Transaction>, &'g BTreeSet<A>)> + 'g>,
     unprocessed_txs_with_last_seens: Box<dyn Iterator<Item = (Txid, Arc<Transaction>, u64)> + 'g>,
-    unprocessed_txs_left_over: VecDeque<(Txid, Arc<Transaction>, u32)>,
+    unprocessed_txs_without_last_seens: Box<dyn Iterator<Item = (Txid, Arc<Transaction>)> + 'g>,
+    unprocessed_txs_with_floating_anchors: VecDeque<(Txid, Arc<Transaction>, u32)>,
 
     canonical: HashMap<Txid, (Arc<Transaction>, CanonicalReason<A>)>,
     not_canonical: HashSet<Txid>,
@@ -28,23 +29,30 @@ impl<'g, A: Anchor, C: ChainOracle> CanonicalIter<'g, A, C> {
     /// Constructs [`CanonicalIter`].
     pub fn new(tx_graph: &'g TxGraph<A>, chain: &'g C, chain_tip: BlockId) -> Self {
         let anchors = tx_graph.all_anchors();
-        let pending_anchored = Box::new(
+        let unprocessed_txs_with_anchors = Box::new(
             tx_graph
                 .txids_by_descending_anchor_height()
                 .filter_map(|(_, txid)| Some((txid, tx_graph.get_tx(txid)?, anchors.get(&txid)?))),
         );
-        let pending_last_seen = Box::new(
+        let unprocessed_txs_with_last_seens = Box::new(
             tx_graph
                 .txids_by_descending_last_seen()
                 .filter_map(|(last_seen, txid)| Some((txid, tx_graph.get_tx(txid)?, last_seen))),
         );
+        let unprocessed_txs_without_last_seens = Box::new(
+            tx_graph
+                .txids_without_anchors_or_last_seens()
+                .filter_map(|txid| Some((txid, tx_graph.get_tx(txid)?))),
+        );
+
         Self {
             tx_graph,
             chain,
             chain_tip,
-            unprocessed_txs_with_anchors: pending_anchored,
-            unprocessed_txs_with_last_seens: pending_last_seen,
-            unprocessed_txs_left_over: VecDeque::new(),
+            unprocessed_txs_with_anchors,
+            unprocessed_txs_with_last_seens,
+            unprocessed_txs_without_last_seens,
+            unprocessed_txs_with_floating_anchors: VecDeque::new(),
             canonical: HashMap::new(),
             not_canonical: HashSet::new(),
             queue: VecDeque::new(),
@@ -73,7 +81,7 @@ impl<'g, A: Anchor, C: ChainOracle> CanonicalIter<'g, A, C> {
             }
         }
         // cannot determine
-        self.unprocessed_txs_left_over.push_back((
+        self.unprocessed_txs_with_floating_anchors.push_back((
             txid,
             tx,
             anchors
@@ -164,10 +172,18 @@ impl<A: Anchor, C: ChainOracle> Iterator for CanonicalIter<'_, A, C> {
                 continue;
             }
 
-            if let Some((txid, tx, height)) = self.unprocessed_txs_left_over.pop_front() {
+            if let Some((txid, tx, height)) = self.unprocessed_txs_with_floating_anchors.pop_front()
+            {
                 if !self.is_canonicalized(txid) {
                     let observed_in = ObservedIn::Block(height);
                     self.mark_canonical(txid, tx, CanonicalReason::from_observed_in(observed_in));
+                }
+                continue;
+            }
+
+            if let Some((txid, tx)) = self.unprocessed_txs_without_last_seens.next() {
+                if !self.is_canonicalized(txid) {
+                    self.mark_canonical(txid, tx, CanonicalReason::NoConflict);
                 }
                 continue;
             }
@@ -180,7 +196,7 @@ impl<A: Anchor, C: ChainOracle> Iterator for CanonicalIter<'_, A, C> {
 /// Represents when and where a transaction was last observed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ObservedIn {
-    /// The transaction was last observed in a block of height.
+    /// The transaction was last observed in an orphaned block of height.
     Block(u32),
     /// The transaction was last observed in the mempool at the given unix timestamp.
     Mempool(u64),
@@ -204,6 +220,8 @@ pub enum CanonicalReason<A> {
         /// Whether the [`ObservedIn`] value is of the transaction's descendant.
         descendant: Option<Txid>,
     },
+    /// This transaction does not conflict with any other transaction already deemed canonical.
+    NoConflict,
 }
 
 impl<A: Clone> CanonicalReason<A> {
@@ -237,15 +255,17 @@ impl<A: Clone> CanonicalReason<A> {
                 observed_in: *observed_in,
                 descendant: Some(descendant),
             },
+            CanonicalReason::NoConflict => Self::NoConflict,
         }
     }
 
     /// This signals that either the [`ObservedIn`] or [`Anchor`] value belongs to the transaction's
     /// descendant.
-    pub fn descendant(&self) -> &Option<Txid> {
+    pub fn descendant(&self) -> Option<&Txid> {
         match self {
-            CanonicalReason::Anchor { descendant, .. } => descendant,
-            CanonicalReason::ObservedIn { descendant, .. } => descendant,
+            CanonicalReason::Anchor { descendant, .. } => descendant.as_ref(),
+            CanonicalReason::ObservedIn { descendant, .. } => descendant.as_ref(),
+            CanonicalReason::NoConflict => None,
         }
     }
 }

@@ -864,6 +864,7 @@ impl<A: Anchor> TxGraph<A> {
                         },
                         ObservedIn::Block(_) => ChainPosition::Unconfirmed { last_seen: None },
                     },
+                    CanonicalReason::NoConflict => ChainPosition::Unconfirmed { last_seen: None },
                 };
                 Ok(CanonicalTx {
                     chain_position,
