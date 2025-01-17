@@ -101,6 +101,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bdk_core::ConfirmationBlockTime;
 pub use bdk_core::TxUpdate;
+use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, SignedAmount, Transaction, TxOut, Txid};
 use core::fmt::{self, Formatter};
 use core::{
@@ -147,7 +148,7 @@ pub struct TxGraph<A = ConfirmationBlockTime> {
     last_seen: HashMap<Txid, u64>,
 
     txs_by_highest_conf_heights: BTreeSet<(u32, Txid)>,
-    txs_by_last_seen: BTreeSet<(u64, Txid)>,
+    txs_by_last_seen: BTreeSet<(Option<u64>, Txid)>,
 
     // The following fields exist so that methods can return references to empty sets.
     // FIXME: This can be removed once `HashSet::new` and `BTreeSet::new` are const fns.
@@ -612,6 +613,11 @@ impl<A: Anchor> TxGraph<A> {
             }
         }
 
+        if !changeset.is_empty() {
+            let last_seen = self.last_seen.get(&txid).copied();
+            self.txs_by_last_seen.insert((last_seen, txid));
+        }
+
         changeset
     }
 
@@ -687,14 +693,14 @@ impl<A: Anchor> TxGraph<A> {
     ///
     /// Note that [`TxGraph`] only keeps track of the latest `seen_at`.
     pub fn insert_seen_at(&mut self, txid: Txid, seen_at: u64) -> ChangeSet<A> {
-        let mut old_last_seen = None;
+        let mut old_last_seen_opt = None;
         let is_changed = match self.last_seen.entry(txid) {
             hash_map::Entry::Occupied(mut e) => {
-                let last_seen = e.get_mut();
-                old_last_seen = Some(*last_seen);
-                let change = *last_seen < seen_at;
+                let old_last_seen = e.get_mut();
+                old_last_seen_opt = Some(*old_last_seen);
+                let change = *old_last_seen < seen_at;
                 if change {
-                    *last_seen = seen_at;
+                    *old_last_seen = seen_at;
                 }
                 change
             }
@@ -706,10 +712,8 @@ impl<A: Anchor> TxGraph<A> {
 
         let mut changeset = ChangeSet::<A>::default();
         if is_changed {
-            if let Some(old_last_seen) = old_last_seen {
-                self.txs_by_last_seen.remove(&(old_last_seen, txid));
-            }
-            self.txs_by_last_seen.insert((seen_at, txid));
+            self.txs_by_last_seen.remove(&(old_last_seen_opt, txid));
+            self.txs_by_last_seen.insert((Some(seen_at), txid));
             changeset.last_seen.insert(txid, seen_at);
         }
         changeset
@@ -970,8 +974,24 @@ impl<A: Anchor> TxGraph<A> {
     /// List txids by descending last-seen order.
     ///
     /// Transactions without last-seens are excluded.
-    pub fn txids_by_descending_last_seen(&self) -> impl ExactSizeIterator<Item = (u64, Txid)> + '_ {
-        self.txs_by_last_seen.iter().copied().rev()
+    pub fn txids_by_descending_last_seen(&self) -> impl Iterator<Item = (u64, Txid)> + '_ {
+        self.txs_by_last_seen
+            .range((Some(0), Txid::all_zeros())..)
+            .rev()
+            .map(|&(last_seen_opt, txid)| {
+                (
+                    last_seen_opt.expect("already filtered out empty last seens"),
+                    txid,
+                )
+            })
+    }
+
+    /// List txids of transactions with no anchors or last-seen values.
+    pub fn txids_without_anchors_or_last_seens(&self) -> impl Iterator<Item = Txid> + '_ {
+        self.txs_by_last_seen
+            .range(..(Some(0), Txid::all_zeros()))
+            .filter(|&(_, txid)| self.anchors.contains_key(txid))
+            .map(|&(_, txid)| txid)
     }
 
     /// Returns a [`CanonicalIter`].
