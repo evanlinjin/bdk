@@ -76,13 +76,8 @@ fn insert_txouts() {
     let mut graph = {
         let mut graph = TxGraph::<BlockId>::default();
         for (outpoint, txout) in &original_ops {
-            assert_eq!(
-                graph.insert_txout(*outpoint, txout.clone()),
-                ChangeSet {
-                    txouts: [(*outpoint, txout.clone())].into(),
-                    ..Default::default()
-                }
-            );
+            let changeset = graph.insert_txout(*outpoint, txout.clone());
+            assert_eq!(changeset.txouts, [(*outpoint, txout.clone())].into());
         }
         graph
     };
@@ -108,16 +103,13 @@ fn insert_txouts() {
 
     // Check the resulting addition.
     let changeset = graph.apply_update(update);
-
+    assert_eq!(changeset.txs, [Arc::new(update_tx.clone())].into());
+    assert_eq!(changeset.txouts, update_ops.clone().into());
     assert_eq!(
-        changeset,
-        ChangeSet {
-            txs: [Arc::new(update_tx.clone())].into(),
-            txouts: update_ops.clone().into(),
-            anchors: [(conf_anchor, update_tx.compute_txid()),].into(),
-            last_seen: [(hash!("tx2"), 1000000)].into()
-        }
+        changeset.anchors,
+        [(conf_anchor, update_tx.compute_txid())].into()
     );
+    assert_eq!(changeset.last_seen, [(hash!("tx2"), unconf_seen_at)].into());
 
     // Apply changeset and check the new graph counts.
     graph.apply_changeset(changeset);
@@ -162,15 +154,17 @@ fn insert_txouts() {
     );
 
     // Check that the initial_changeset is correct
+    let changeset = graph.initial_changeset();
+    assert_eq!(changeset.txs, [Arc::new(update_tx.clone())].into());
     assert_eq!(
-        graph.initial_changeset(),
-        ChangeSet {
-            txs: [Arc::new(update_tx.clone())].into(),
-            txouts: update_ops.into_iter().chain(original_ops).collect(),
-            anchors: [(conf_anchor, update_tx.compute_txid()),].into(),
-            last_seen: [(hash!("tx2"), 1000000)].into()
-        }
+        changeset.txouts,
+        update_ops.into_iter().chain(original_ops).collect()
     );
+    assert_eq!(
+        changeset.anchors,
+        [(conf_anchor, update_tx.compute_txid()),].into()
+    );
+    assert_eq!(changeset.last_seen, [(hash!("tx2"), 1000000)].into());
 }
 
 #[test]

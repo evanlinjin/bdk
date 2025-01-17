@@ -135,6 +135,35 @@ impl<A: Anchor> From<TxUpdate<A>> for TxGraph<A> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub(crate) struct LastSeenAndSequence {
+    /// Order by last-seen-in-mempool value. Higher last-seen values have higher priority.
+    pub last_seen: Option<u64>,
+    /// Tiebreak by [`TxGraph`]'s added-sequence. Higher added-sequence values have higher
+    /// priority.
+    ///
+    /// Do not confuse this with [`bitcoin::Sequence`].
+    pub sequence: u64,
+}
+
+impl LastSeenAndSequence {
+    // fn new(last_seen: Option<u64>, sequence: u64) -> Self {
+    //     Self {
+    //         last_seen,
+    //         sequence,
+    //     }
+    // }
+}
+
+impl From<(Option<u64>, u64)> for LastSeenAndSequence {
+    fn from((last_seen, sequence): (Option<u64>, u64)) -> Self {
+        Self {
+            last_seen,
+            sequence,
+        }
+    }
+}
+
 /// A graph of transactions and spends.
 ///
 /// See the [module-level documentation] for more.
@@ -146,9 +175,11 @@ pub struct TxGraph<A = ConfirmationBlockTime> {
     spends: BTreeMap<OutPoint, HashSet<Txid>>,
     anchors: HashMap<Txid, BTreeSet<A>>,
     last_seen: HashMap<Txid, u64>,
+    sequence: HashMap<Txid, u64>,
 
     txs_by_highest_conf_heights: BTreeSet<(u32, Txid)>,
-    txs_by_last_seen: BTreeSet<(Option<u64>, Txid)>,
+    txs_by_last_seen_and_sequence: BTreeSet<(LastSeenAndSequence, Txid)>,
+    next_sequence: u64,
 
     // The following fields exist so that methods can return references to empty sets.
     // FIXME: This can be removed once `HashSet::new` and `BTreeSet::new` are const fns.
@@ -163,8 +194,10 @@ impl<A> Default for TxGraph<A> {
             spends: Default::default(),
             anchors: Default::default(),
             last_seen: Default::default(),
+            sequence: Default::default(),
             txs_by_highest_conf_heights: Default::default(),
-            txs_by_last_seen: Default::default(),
+            txs_by_last_seen_and_sequence: Default::default(),
+            next_sequence: 0,
             empty_outspends: Default::default(),
             empty_anchors: Default::default(),
         }
@@ -577,6 +610,10 @@ impl<A: Anchor> TxGraph<A> {
                 }
             }
         }
+        let txid = outpoint.txid;
+        if !changeset.is_empty() {
+            changeset.merge(self._insert_next_sequence_if_empty(txid).1);
+        }
         changeset
     }
 
@@ -614,8 +651,11 @@ impl<A: Anchor> TxGraph<A> {
         }
 
         if !changeset.is_empty() {
+            let (seq, seq_changeset) = self._insert_next_sequence_if_empty(txid);
+            changeset.merge(seq_changeset);
             let last_seen = self.last_seen.get(&txid).copied();
-            self.txs_by_last_seen.insert((last_seen, txid));
+            self.txs_by_last_seen_and_sequence
+                .insert(((last_seen, seq).into(), txid));
         }
 
         changeset
@@ -684,6 +724,7 @@ impl<A: Anchor> TxGraph<A> {
                 }
                 self.txs_by_highest_conf_heights.insert((new_top_h, txid));
             }
+            changeset.merge(self._insert_next_sequence_if_empty(txid).1);
             changeset.anchors.insert((anchor, txid));
         }
         changeset
@@ -712,9 +753,64 @@ impl<A: Anchor> TxGraph<A> {
 
         let mut changeset = ChangeSet::<A>::default();
         if is_changed {
-            self.txs_by_last_seen.remove(&(old_last_seen_opt, txid));
-            self.txs_by_last_seen.insert((Some(seen_at), txid));
+            let (seq, seq_changeset) = self._insert_next_sequence_if_empty(txid);
+            let already_had_sequence = !seq_changeset.is_empty();
+            if already_had_sequence {
+                self.txs_by_last_seen_and_sequence
+                    .remove(&((old_last_seen_opt, seq).into(), txid));
+                changeset.merge(seq_changeset);
+            }
+            self.txs_by_last_seen_and_sequence
+                .insert(((Some(seen_at), seq).into(), txid));
             changeset.last_seen.insert(txid, seen_at);
+        }
+        changeset
+    }
+
+    /// TODO: Rename to `_insert_next_sequence_if_empty`.
+    fn _insert_next_sequence_if_empty(&mut self, txid: Txid) -> (u64, ChangeSet<A>) {
+        let mut changeset = ChangeSet::<A>::default();
+        match self.sequence.entry(txid) {
+            hash_map::Entry::Occupied(e) => (*e.get(), changeset),
+            hash_map::Entry::Vacant(e) => {
+                let seq = *e.insert(self.next_sequence);
+                changeset.sequence.insert(txid, seq);
+                self.next_sequence += 1;
+                (seq, changeset)
+            }
+        }
+    }
+
+    /// Inserts the added-sequence value to `seq`
+    fn _insert_sequence(&mut self, txid: Txid, seq: u64) -> ChangeSet<A> {
+        let mut changeset = ChangeSet::<A>::default();
+        match self.sequence.entry(txid) {
+            hash_map::Entry::Occupied(mut e) => {
+                let current_seq = e.get_mut();
+                let old_seq = *current_seq;
+                if seq > old_seq {
+                    changeset.sequence.insert(txid, seq);
+                    *current_seq = seq;
+
+                    // Update the index.
+                    let last_seen = self.last_seen.get(&txid).copied();
+                    let _is_removed = self
+                        .txs_by_last_seen_and_sequence
+                        .remove(&((last_seen, old_seq).into(), txid));
+                    debug_assert!(_is_removed);
+                    let _is_inserted = self
+                        .txs_by_last_seen_and_sequence
+                        .insert(((last_seen, seq).into(), txid));
+                    debug_assert!(_is_inserted);
+                }
+            }
+            hash_map::Entry::Vacant(e) => {
+                changeset.sequence.insert(txid, *e.insert(seq));
+            }
+        }
+        // TODO: Maybe move this to another method?
+        if seq >= self.next_sequence {
+            self.next_sequence = seq + 1;
         }
         changeset
     }
@@ -786,11 +882,16 @@ impl<A: Anchor> TxGraph<A> {
                 .flat_map(|(txid, anchors)| anchors.iter().map(|a| (a.clone(), *txid)))
                 .collect(),
             last_seen: self.last_seen.iter().map(|(&k, &v)| (k, v)).collect(),
+            sequence: self.sequence.iter().map(|(&k, &v)| (k, v)).collect(),
         }
     }
 
     /// Applies [`ChangeSet`] to [`TxGraph`].
     pub fn apply_changeset(&mut self, changeset: ChangeSet<A>) {
+        // Sequence needs to be added first otherwise other methods will change it later on.
+        for (txid, seq) in changeset.sequence {
+            let _ = self._insert_sequence(txid, seq);
+        }
         for tx in changeset.txs {
             let _ = self.insert_tx(tx);
         }
@@ -972,25 +1073,29 @@ impl<A: Anchor> TxGraph<A> {
         self.txs_by_highest_conf_heights.iter().copied().rev()
     }
 
-    /// List txids by descending last-seen order.
+    /// List txids by descending last-seen order, tie-breaked by added-sequence.
     ///
     /// Transactions without last-seens are excluded.
     pub fn txids_by_descending_last_seen(&self) -> impl Iterator<Item = (u64, Txid)> + '_ {
-        self.txs_by_last_seen
-            .range((Some(0), Txid::all_zeros())..)
+        self.txs_by_last_seen_and_sequence
+            .range(((Some(0), 0).into(), Txid::all_zeros())..)
             .rev()
-            .map(|&(last_seen_opt, txid)| {
+            .map(|&(last_seen_and_sequence, txid)| {
                 (
-                    last_seen_opt.expect("already filtered out empty last seens"),
+                    last_seen_and_sequence
+                        .last_seen
+                        .expect("already filtered out empty last seens"),
                     txid,
                 )
             })
     }
 
-    /// List txids of transactions with no anchors or last-seen values.
+    /// List txids of transactions with no anchors or last-seen values, ordered by descending
+    /// added-sequence values.
     pub fn txids_without_anchors_or_last_seens(&self) -> impl Iterator<Item = Txid> + '_ {
-        self.txs_by_last_seen
-            .range(..(Some(0), Txid::all_zeros()))
+        self.txs_by_last_seen_and_sequence
+            .range(..((Some(0), 0).into(), Txid::all_zeros()))
+            .rev()
             .filter(|&(_, txid)| self.anchors.contains_key(txid))
             .map(|&(_, txid)| txid)
     }
@@ -1160,6 +1265,8 @@ pub struct ChangeSet<A = ()> {
     pub anchors: BTreeSet<(A, Txid)>,
     /// Added last-seen unix timestamps of transactions.
     pub last_seen: BTreeMap<Txid, u64>,
+    /// Added sequence of transactions.
+    pub sequence: BTreeMap<Txid, u64>,
 }
 
 impl<A> Default for ChangeSet<A> {
@@ -1169,6 +1276,7 @@ impl<A> Default for ChangeSet<A> {
             txouts: Default::default(),
             anchors: Default::default(),
             last_seen: Default::default(),
+            sequence: Default::default(),
         }
     }
 }
@@ -1223,6 +1331,14 @@ impl<A: Ord> Merge for ChangeSet<A> {
                 .filter(|(txid, update_ls)| self.last_seen.get(txid) < Some(update_ls))
                 .collect::<Vec<_>>(),
         );
+        // sequence values should only increase
+        self.sequence.extend(
+            other
+                .sequence
+                .into_iter()
+                .filter(|(txid, update_seq)| self.sequence.get(txid) < Some(update_seq))
+                .collect::<Vec<_>>(),
+        );
     }
 
     fn is_empty(&self) -> bool {
@@ -1230,6 +1346,7 @@ impl<A: Ord> Merge for ChangeSet<A> {
             && self.txouts.is_empty()
             && self.anchors.is_empty()
             && self.last_seen.is_empty()
+            && self.sequence.is_empty()
     }
 }
 
@@ -1249,6 +1366,7 @@ impl<A: Ord> ChangeSet<A> {
                 self.anchors.into_iter().map(|(a, txid)| (f(a), txid)),
             ),
             last_seen: self.last_seen,
+            sequence: self.sequence,
         }
     }
 }

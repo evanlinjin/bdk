@@ -76,6 +76,11 @@ fn insert_relevant_txs() {
     let changeset = indexed_tx_graph::ChangeSet {
         tx_graph: tx_graph::ChangeSet {
             txs: txs.iter().cloned().map(Arc::new).collect(),
+            sequence: txs
+                .iter()
+                .enumerate()
+                .map(|(seq, tx)| (tx.compute_txid(), seq as u64))
+                .collect(),
             ..Default::default()
         },
         indexer: keychain_txout::ChangeSet {
