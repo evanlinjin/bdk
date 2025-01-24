@@ -145,6 +145,7 @@ pub struct TxGraph<A = ConfirmationBlockTime> {
     spends: BTreeMap<OutPoint, HashSet<Txid>>,
     anchors: HashMap<Txid, BTreeSet<A>>,
     last_seen: HashMap<Txid, u64>,
+    last_missing: HashMap<Txid, u64>,
 
     txs_by_highest_conf_heights: BTreeSet<(u32, Txid)>,
     txs_by_last_seen: BTreeSet<(u64, Txid)>,
@@ -162,6 +163,7 @@ impl<A> Default for TxGraph<A> {
             spends: Default::default(),
             anchors: Default::default(),
             last_seen: Default::default(),
+            last_missing: Default::default(),
             txs_by_highest_conf_heights: Default::default(),
             txs_by_last_seen: Default::default(),
             empty_outspends: Default::default(),
@@ -715,6 +717,30 @@ impl<A: Anchor> TxGraph<A> {
         changeset
     }
 
+    /// Inserts the given `missing_at` for `txid`
+    pub fn insert_missing_at(&mut self, txid: Txid, missing_at: u64) -> ChangeSet<A> {
+        let is_changed = match self.last_missing.entry(txid) {
+            hash_map::Entry::Occupied(mut e) => {
+                let last_missing = e.get_mut();
+                let change = *last_missing < missing_at;
+                if change {
+                    *last_missing = missing_at;
+                }
+                change
+            }
+            hash_map::Entry::Vacant(e) => {
+                e.insert(missing_at);
+                true
+            }
+        };
+
+        let mut changeset = ChangeSet::<A>::default();
+        if is_changed {
+            changeset.last_missing.insert(txid, missing_at);
+        }
+        changeset
+    }
+
     /// Extends this graph with the given `update`.
     ///
     /// The returned [`ChangeSet`] is the set difference between `update` and `self` (transactions that
@@ -765,6 +791,14 @@ impl<A: Anchor> TxGraph<A> {
                 changeset.merge(self.insert_seen_at(txid, seen_at));
             }
         }
+        for txid in update.missing {
+            // We want the `missing_at` value to override the `last_seen` value of the transaction.
+            // If there is no `last_seen`, there is no need for the `missing_at` value since the
+            // transaction will not be canonical anyway.
+            if let Some(&missing_at) = self.last_seen.get(&txid) {
+                changeset.merge(self.insert_missing_at(txid, missing_at));
+            }
+        }
         changeset
     }
 
@@ -782,6 +816,7 @@ impl<A: Anchor> TxGraph<A> {
                 .flat_map(|(txid, anchors)| anchors.iter().map(|a| (a.clone(), *txid)))
                 .collect(),
             last_seen: self.last_seen.iter().map(|(&k, &v)| (k, v)).collect(),
+            last_missing: self.last_missing.iter().map(|(&k, &v)| (k, v)).collect(),
         }
     }
 
@@ -798,6 +833,9 @@ impl<A: Anchor> TxGraph<A> {
         }
         for (txid, seen_at) in changeset.last_seen {
             let _ = self.insert_seen_at(txid, seen_at);
+        }
+        for (txid, missing_at) in changeset.last_missing {
+            let _ = self.insert_missing_at(txid, missing_at);
         }
     }
 }
@@ -969,9 +1007,14 @@ impl<A: Anchor> TxGraph<A> {
 
     /// List txids by descending last-seen order.
     ///
-    /// Transactions without last-seens are excluded.
-    pub fn txids_by_descending_last_seen(&self) -> impl ExactSizeIterator<Item = (u64, Txid)> + '_ {
-        self.txs_by_last_seen.iter().copied().rev()
+    /// Transactions without last-seens are excluded. Transactions with a last-missing timestamp
+    /// equal or higher than it's last-seen timestamp are excluded.
+    pub fn txids_by_descending_last_seen(&self) -> impl Iterator<Item = (u64, Txid)> + '_ {
+        self.txs_by_last_seen
+            .iter()
+            .copied()
+            .rev()
+            .filter(|(last_seen, txid)| !matches!(self.last_missing.get(txid), Some(last_missing) if last_missing >= last_seen))
     }
 
     /// Returns a [`CanonicalIter`].
@@ -1139,6 +1182,8 @@ pub struct ChangeSet<A = ()> {
     pub anchors: BTreeSet<(A, Txid)>,
     /// Added last-seen unix timestamps of transactions.
     pub last_seen: BTreeMap<Txid, u64>,
+    /// Added timestamps of when a transaction is last missing from the mempool.
+    pub last_missing: BTreeMap<Txid, u64>,
 }
 
 impl<A> Default for ChangeSet<A> {
@@ -1148,6 +1193,7 @@ impl<A> Default for ChangeSet<A> {
             txouts: Default::default(),
             anchors: Default::default(),
             last_seen: Default::default(),
+            last_missing: Default::default(),
         }
     }
 }
@@ -1202,6 +1248,14 @@ impl<A: Ord> Merge for ChangeSet<A> {
                 .filter(|(txid, update_ls)| self.last_seen.get(txid) < Some(update_ls))
                 .collect::<Vec<_>>(),
         );
+        // last_missing timestamps should only increase
+        self.last_missing.extend(
+            other
+                .last_missing
+                .into_iter()
+                .filter(|(txid, update_lm)| self.last_missing.get(txid) < Some(update_lm))
+                .collect::<Vec<_>>(),
+        );
     }
 
     fn is_empty(&self) -> bool {
@@ -1209,6 +1263,7 @@ impl<A: Ord> Merge for ChangeSet<A> {
             && self.txouts.is_empty()
             && self.anchors.is_empty()
             && self.last_seen.is_empty()
+            && self.last_missing.is_empty()
     }
 }
 
@@ -1228,6 +1283,7 @@ impl<A: Ord> ChangeSet<A> {
                 self.anchors.into_iter().map(|(a, txid)| (f(a), txid)),
             ),
             last_seen: self.last_seen,
+            last_missing: self.last_missing,
         }
     }
 }
