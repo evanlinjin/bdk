@@ -135,7 +135,7 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     let sync_request = SyncRequest::builder()
         .chain_tip(chain.tip())
         .revealed_spks_from_indexer(&graph.index, ..)
-        .check_unconfirmed_statuses(
+        .check_for_missing_txs(
             &graph.index,
             graph.graph().canonical_iter(&chain, chain.tip().block_id()),
         );
@@ -163,7 +163,7 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     let sync_request = SyncRequest::builder()
         .chain_tip(chain.tip())
         .revealed_spks_from_indexer(&graph.index, ..)
-        .check_unconfirmed_statuses(
+        .check_for_missing_txs(
             &graph.index,
             graph.graph().canonical_iter(&chain, chain.tip().block_id()),
         );

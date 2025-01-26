@@ -882,12 +882,15 @@ pub trait SyncRequestBuilderExt<K> {
     /// Add [`Script`](bitcoin::Script)s that are revealed by the `indexer` but currently unused.
     fn unused_spks_from_indexer(self, indexer: &KeychainTxOutIndex<K>) -> Self;
 
-    /// Add unconfirmed txids and their associated spks.
+    /// Add txids of unconfirmed transactions and their associated spks to the request to check
+    /// whether they are missing from the mempool.
     ///
-    /// We expect that the chain source should include these txids in their spk histories. If not,
-    /// the transaction has been evicted for some reason and we will inform the receiving
-    /// structures in the response.
-    fn check_unconfirmed_statuses<A, C>(
+    /// We expect that the chain source should include these txids in their spk history response. If
+    /// not, it means the transaction has been evicted from the mempool. The chain
+    /// source crate should include the missing transaction's txid in
+    /// [`TxUpdate::missing`](bdk_core::TxUpdate::missing) of
+    /// [`SyncResponse`](bdk_core::spk_client::SyncResponse).
+    fn check_for_missing_txs<A, C>(
         self,
         indexer: &KeychainTxOutIndex<K>,
         canonical_iter: CanonicalIter<A, C>,
@@ -909,7 +912,7 @@ impl<K: Clone + Ord + core::fmt::Debug> SyncRequestBuilderExt<K> for SyncRequest
         self.spks_with_indexes(indexer.unused_spks())
     }
 
-    fn check_unconfirmed_statuses<A, C>(
+    fn check_for_missing_txs<A, C>(
         self,
         indexer: &KeychainTxOutIndex<K>,
         canonical_iter: CanonicalIter<A, C>,
