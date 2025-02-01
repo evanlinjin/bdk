@@ -731,3 +731,101 @@ fn no_agreement_point() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_expect_tx_missing() -> anyhow::Result<()> {
+    use bdk_bitcoind_rpc::bitcoincore_rpc::bitcoin;
+    use bdk_bitcoind_rpc::bitcoincore_rpc::bitcoincore_rpc_json::CreateRawTransactionInput;
+    use bdk_chain::miniscript;
+    use bdk_chain::spk_txout::SpkTxOutIndex;
+    use bdk_chain::ConfirmationBlockTime;
+    use bitcoin::constants::genesis_block;
+    use bitcoin::secp256k1::Secp256k1;
+    use bitcoin::Network;
+    use std::collections::HashMap;
+    let env = TestEnv::new()?;
+
+    let s = bdk_testenv::utils::DESCRIPTORS[0];
+    let desc = miniscript::Descriptor::parse_descriptor(&Secp256k1::new(), s)
+        .unwrap()
+        .0;
+    let spk = desc.at_derivation_index(0)?.script_pubkey();
+
+    let chain = LocalChain::from_genesis_hash(genesis_block(Network::Regtest).block_hash()).0;
+    let chain_tip = chain.tip().block_id();
+
+    let mut index = SpkTxOutIndex::default();
+    index.insert_spk(("external", 0u32), spk.clone());
+    let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new(index);
+
+    // receive tx1
+    let _ = env.mine_blocks(100, None)?;
+    let txid_1 = env.send(
+        &Address::from_script(&spk, Network::Regtest)?,
+        Amount::ONE_BTC,
+    )?;
+
+    let mut emitter = Emitter::new(env.rpc_client(), chain.tip(), 1);
+    let changeset = graph.batch_insert_unconfirmed(emitter.mempool()?);
+    assert!(changeset
+        .tx_graph
+        .txs
+        .iter()
+        .any(|tx| tx.compute_txid() == txid_1));
+    let seen_at = graph
+        .graph()
+        .get_tx_node(txid_1)
+        .unwrap()
+        .last_seen_unconfirmed
+        .unwrap();
+
+    /* Now double spend tx1 */
+
+    // get prevout from core
+    let core = env.rpc_client();
+    let tx1 = &core.get_raw_transaction(&txid_1, None)?;
+    let txin = &tx1.input[0];
+    let op = txin.previous_output;
+
+    // create `tx1b` using the previous output from tx1
+    let utxo = CreateRawTransactionInput {
+        txid: op.txid,
+        vout: op.vout,
+        sequence: None,
+    };
+    let addr = core.get_new_address(None, None)?.assume_checked();
+    let tx = core.create_raw_transaction(
+        &[utxo],
+        &HashMap::from([(addr.to_string(), Amount::from_btc(49.99)?)]),
+        None,
+        None,
+    )?;
+    let res = core.sign_raw_transaction_with_wallet(&tx, None, None)?;
+    let tx1b = res.transaction()?;
+
+    // send it
+    let txid_2 = core.send_raw_transaction(&tx1b)?;
+
+    // We evict the expected txs that are missing from mempool
+    let exp_txids = graph.expected_spk_txs(&chain, ..).collect::<Vec<_>>();
+    assert_eq!(exp_txids, vec![(txid_1, spk)]);
+    let mempool = emitter
+        .mempool()?
+        .into_iter()
+        .map(|(tx, _)| tx.compute_txid())
+        .collect::<Vec<_>>();
+    assert!(mempool.contains(&txid_2));
+    for (txid, _) in exp_txids {
+        if !mempool.contains(&txid) {
+            let _ = graph.insert_missing_at(txid, seen_at + 1);
+        }
+    }
+
+    assert!(graph
+        .graph()
+        .list_canonical_txs(&chain, chain_tip)
+        .next()
+        .is_none());
+
+    Ok(())
+}
