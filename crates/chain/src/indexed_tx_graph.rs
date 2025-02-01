@@ -1,13 +1,16 @@
 //! Contains the [`IndexedTxGraph`] and associated types. Refer to the
 //! [`IndexedTxGraph`] documentation for more.
-use core::fmt::Debug;
+
+use core::fmt;
+use core::ops::RangeBounds;
 
 use alloc::{sync::Arc, vec::Vec};
-use bitcoin::{Block, OutPoint, Transaction, TxOut, Txid};
+use bitcoin::{Block, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 
 use crate::{
+    spk_txout::SpkTxOutIndex,
     tx_graph::{self, TxGraph},
-    Anchor, BlockId, Indexer, Merge, TxPosInBlock,
+    Anchor, BlockId, ChainOracle, Indexer, Merge, TxPosInBlock,
 };
 
 /// The [`IndexedTxGraph`] combines a [`TxGraph`] and an [`Indexer`] implementation.
@@ -323,6 +326,59 @@ where
             tx_graph: graph,
             indexer,
         }
+    }
+
+    /// Evict a tx at the given timestamp
+    pub fn insert_missing_at(&mut self, txid: Txid, missing_at: u64) -> ChangeSet<A, I::ChangeSet> {
+        let tx_graph = self.graph.insert_missing_at(txid, missing_at);
+        ChangeSet {
+            tx_graph,
+            ..Default::default()
+        }
+    }
+}
+
+impl<A, I> IndexedTxGraph<A, SpkTxOutIndex<I>>
+where
+    A: Anchor,
+    I: fmt::Debug + Clone + Ord,
+{
+    /// Expected unconfirmed txs in a spk index range
+    pub fn expected_spk_txs<'a, O>(
+        &'a self,
+        chain: &'a O,
+        range: impl RangeBounds<I> + 'a,
+    ) -> impl Iterator<Item = (Txid, ScriptBuf)> + 'a
+    where
+        O: ChainOracle<Error = core::convert::Infallible>,
+    {
+        let chain_tip = chain.get_chain_tip().unwrap();
+
+        self.graph
+            .list_canonical_txs(chain, chain_tip)
+            .filter(|c| !c.chain_position.is_confirmed() && self.index.is_tx_relevant(&c.tx_node))
+            .flat_map(move |c| {
+                let txid = c.tx_node.txid;
+                let spks = c
+                    .tx_node
+                    .input
+                    .iter()
+                    .map(|txin| txin.previous_output)
+                    .chain(
+                        c.tx_node
+                            .output
+                            .iter()
+                            .enumerate()
+                            .map(move |(vout, _)| OutPoint::new(txid, vout as u32)),
+                    )
+                    .flat_map(|op| match self.index.txout(op) {
+                        Some((i, txo)) if range.contains(i) => Some(txo.script_pubkey.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                core::iter::repeat(txid).zip(spks)
+            })
     }
 }
 
