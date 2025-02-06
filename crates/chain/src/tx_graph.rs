@@ -1164,23 +1164,24 @@ impl<A: Anchor> TxGraph<A> {
             .expect("oracle is infallible")
     }
 
-    /// Returns an iterator over unconfirmed transactions and their associated script pubkeys,
-    /// filtered within the specified `range`.
+    /// Iterate over unconfirmed txids that we expect to exist in a chain source's spk history
+    /// response.
     ///
-    /// This function scans the transaction graph for unconfirmed transactions relevant to the
-    /// provided [`SpkTxOutIndex`], determining which transactions should be considered based on
-    /// indexed outputs.
-    pub fn iter_spks_with_expected_txids<'a, C, I>(
+    /// This is used to fill [`SyncRequestBuilder::expected_unconfirmed_spk_txids`](bdk_core::spk_client::SyncRequestBuilder::expected_unconfirmed_spk_txids).
+    ///
+    /// The spk range can be contrained with `range`.
+    pub fn expected_unconfirmed_spk_txids<'a, C, I>(
         &'a self,
         chain: &'a C,
-        indexer: &'a SpkTxOutIndex<I>,
+        indexer: &'a impl AsRef<SpkTxOutIndex<I>>,
         range: impl RangeBounds<I> + 'a,
     ) -> impl Iterator<Item = (Txid, ScriptBuf)> + 'a
     where
         C: ChainOracle<Error = core::convert::Infallible>,
-        I: fmt::Debug + Clone + Ord,
+        I: fmt::Debug + Clone + Ord + 'a,
     {
         let chain_tip = chain.get_chain_tip().unwrap();
+        let indexer = indexer.as_ref();
 
         self.list_canonical_txs(chain, chain_tip)
             .filter(|c| !c.chain_position.is_confirmed() && indexer.is_tx_relevant(&c.tx_node))

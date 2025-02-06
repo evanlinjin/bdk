@@ -808,7 +808,7 @@ fn test_expect_tx_missing() -> anyhow::Result<()> {
 
     // We evict the expected txs that are missing from mempool
     let exp_txids = graph
-        .iter_spks_with_expected_txids(&chain, ..)
+        .expected_unconfirmed_spk_txids(&chain, ..)
         .collect::<Vec<_>>();
     assert_eq!(exp_txids, vec![(txid_1, spk)]);
     let mempool = emitter
