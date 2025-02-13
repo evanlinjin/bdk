@@ -65,6 +65,7 @@ where
         parallel_requests: usize,
     ) -> Result<FullScanResponse<K>, Error> {
         let mut request = request.into();
+        let start_time = request.start_time();
         let keychains = request.keychains();
 
         let chain_tip = request.chain_tip();
@@ -92,6 +93,7 @@ where
                 self,
                 &mut inserted_txs,
                 spks_with_history,
+                start_time,
                 stop_gap,
                 parallel_requests,
             )
@@ -109,6 +111,7 @@ where
             _ => None,
         };
 
+        tx_update.insert_seen_at_for_all_unanchored_txs(start_time);
         Ok(FullScanResponse {
             chain_update,
             tx_update,
@@ -122,6 +125,7 @@ where
         parallel_requests: usize,
     ) -> Result<SyncResponse, Error> {
         let mut request = request.into();
+        let start_time = request.start_time();
 
         let chain_tip = request.chain_tip();
         let latest_blocks = if chain_tip.is_some() {
@@ -137,6 +141,7 @@ where
                 self,
                 &mut inserted_txs,
                 request.iter_spks_with_expected_txids(),
+                start_time,
                 parallel_requests,
             )
             .await?,
@@ -167,6 +172,7 @@ where
             _ => None,
         };
 
+        tx_update.insert_seen_at_for_all_unanchored_txs(start_time);
         Ok(SyncResponse {
             chain_update,
             tx_update,
@@ -291,6 +297,7 @@ async fn fetch_txs_with_keychain_spks<I, S>(
     client: &esplora_client::AsyncClient<S>,
     inserted_txs: &mut HashSet<Txid>,
     mut spks_with_history: I,
+    start_time: u64,
     stop_gap: usize,
     parallel_requests: usize,
 ) -> Result<(TxUpdate<ConfirmationBlockTime>, Option<u32>), Error>
@@ -359,9 +366,11 @@ where
         }
     }
 
-    update
-        .evicted
-        .extend(spk_txids.difference(inserted_txs).cloned());
+    update.evicted_ats.extend(
+        spk_txids
+            .difference(inserted_txs)
+            .map(|&txid| (txid, start_time)),
+    );
 
     Ok((update, last_active_index))
 }
@@ -378,6 +387,7 @@ async fn fetch_txs_with_spks<I, S>(
     client: &esplora_client::AsyncClient<S>,
     inserted_txs: &mut HashSet<Txid>,
     spks_with_history: I,
+    start_time: u64,
     parallel_requests: usize,
 ) -> Result<TxUpdate<ConfirmationBlockTime>, Error>
 where
@@ -392,6 +402,7 @@ where
             .into_iter()
             .enumerate()
             .map(|(i, spk)| (i as u32, spk)),
+        start_time,
         usize::MAX,
         parallel_requests,
     )

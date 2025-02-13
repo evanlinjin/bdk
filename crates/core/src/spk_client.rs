@@ -95,17 +95,11 @@ pub struct SpkWithExpectedTxids {
 }
 
 /// Builds a [`SyncRequest`].
+///
+/// Construct with [`SyncRequest::builder`].
 #[must_use]
 pub struct SyncRequestBuilder<I = ()> {
     inner: SyncRequest<I>,
-}
-
-impl<I> Default for SyncRequestBuilder<I> {
-    fn default() -> Self {
-        Self {
-            inner: Default::default(),
-        }
-    }
 }
 
 impl SyncRequestBuilder<()> {
@@ -176,7 +170,7 @@ impl<I> SyncRequestBuilder<I> {
     ) -> Self {
         for (txid, spk) in txs {
             self.inner
-                .spk_histories
+                .expected_spk_txids
                 .entry(spk)
                 .or_default()
                 .insert(txid);
@@ -235,31 +229,16 @@ impl<I> SyncRequestBuilder<I> {
 /// ```
 #[must_use]
 pub struct SyncRequest<I = ()> {
+    start_time: u64,
     chain_tip: Option<CheckPoint>,
     spks: VecDeque<(I, ScriptBuf)>,
     spks_consumed: usize,
-    spk_histories: HashMap<ScriptBuf, HashSet<Txid>>,
+    expected_spk_txids: HashMap<ScriptBuf, HashSet<Txid>>,
     txids: VecDeque<Txid>,
     txids_consumed: usize,
     outpoints: VecDeque<OutPoint>,
     outpoints_consumed: usize,
     inspect: Box<InspectSync<I>>,
-}
-
-impl<I> Default for SyncRequest<I> {
-    fn default() -> Self {
-        Self {
-            chain_tip: None,
-            spks: VecDeque::new(),
-            spks_consumed: 0,
-            spk_histories: HashMap::new(),
-            txids: VecDeque::new(),
-            txids_consumed: 0,
-            outpoints: VecDeque::new(),
-            outpoints_consumed: 0,
-            inspect: Box::new(|_, _| {}),
-        }
-    }
 }
 
 impl<I> From<SyncRequestBuilder<I>> for SyncRequest<I> {
@@ -269,11 +248,37 @@ impl<I> From<SyncRequestBuilder<I>> for SyncRequest<I> {
 }
 
 impl<I> SyncRequest<I> {
-    /// Start building a [`SyncRequest`].
-    pub fn builder() -> SyncRequestBuilder<I> {
+    /// Start building [`SyncRequest`] with a given `start_time`.
+    pub fn builder(start_time: u64) -> SyncRequestBuilder<I> {
         SyncRequestBuilder {
-            inner: Default::default(),
+            inner: Self {
+                start_time,
+                chain_tip: None,
+                spks: VecDeque::new(),
+                spks_consumed: 0,
+                expected_spk_txids: HashMap::new(),
+                txids: VecDeque::new(),
+                txids_consumed: 0,
+                outpoints: VecDeque::new(),
+                outpoints_consumed: 0,
+                inspect: Box::new(|_, _| ()),
+            },
         }
+    }
+
+    /// Start building [`SyncRequest`] with the current timestamp as the `start_time`.
+    #[cfg(feature = "std")]
+    pub fn builder_now() -> SyncRequestBuilder<I> {
+        let start_time = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("failed to get current timestamp")
+            .as_secs();
+        Self::builder(start_time)
+    }
+
+    /// When the sync-request was initiated.
+    pub fn start_time(&self) -> u64 {
+        self.start_time
     }
 
     /// Get the [`SyncProgress`] of this request.
@@ -310,7 +315,7 @@ impl<I> SyncRequest<I> {
     pub fn next_spk_with_history(&mut self) -> Option<SpkWithExpectedTxids> {
         let next_spk = self.next_spk()?;
         let spk_history = self
-            .spk_histories
+            .expected_spk_txids
             .get(&next_spk)
             .cloned()
             .unwrap_or_default();
@@ -390,17 +395,11 @@ impl<A> Default for SyncResponse<A> {
 }
 
 /// Builds a [`FullScanRequest`].
+///
+/// Construct with [`FullScanRequest::builder`].
 #[must_use]
 pub struct FullScanRequestBuilder<K> {
     inner: FullScanRequest<K>,
-}
-
-impl<K> Default for FullScanRequestBuilder<K> {
-    fn default() -> Self {
-        Self {
-            inner: Default::default(),
-        }
-    }
 }
 
 impl<K: Ord> FullScanRequestBuilder<K> {
@@ -448,6 +447,7 @@ impl<K: Ord> FullScanRequestBuilder<K> {
 /// [`chain_tip`](FullScanRequestBuilder::chain_tip) (if provided).
 #[must_use]
 pub struct FullScanRequest<K> {
+    start_time: u64,
     chain_tip: Option<CheckPoint>,
     spks_by_keychain: BTreeMap<K, Box<dyn Iterator<Item = Indexed<ScriptBuf>> + Send>>,
     inspect: Box<InspectFullScan<K>>,
@@ -459,22 +459,32 @@ impl<K> From<FullScanRequestBuilder<K>> for FullScanRequest<K> {
     }
 }
 
-impl<K> Default for FullScanRequest<K> {
-    fn default() -> Self {
-        Self {
-            chain_tip: None,
-            spks_by_keychain: Default::default(),
-            inspect: Box::new(|_, _, _| {}),
+impl<K: Ord + Clone> FullScanRequest<K> {
+    /// Start building a [`FullScanRequest`] with a given `start_time`.
+    pub fn builder(start_time: u64) -> FullScanRequestBuilder<K> {
+        FullScanRequestBuilder {
+            inner: Self {
+                start_time,
+                chain_tip: None,
+                spks_by_keychain: BTreeMap::new(),
+                inspect: Box::new(|_, _, _| ()),
+            },
         }
     }
-}
 
-impl<K: Ord + Clone> FullScanRequest<K> {
-    /// Start building a [`FullScanRequest`].
-    pub fn builder() -> FullScanRequestBuilder<K> {
-        FullScanRequestBuilder {
-            inner: Self::default(),
-        }
+    /// Start building a [`FullScanRequest`] with the current timestamp as the `start_time`.
+    #[cfg(feature = "std")]
+    pub fn builder_now() -> FullScanRequestBuilder<K> {
+        let start_time = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("failed to get current timestamp")
+            .as_secs();
+        Self::builder(start_time)
+    }
+
+    /// When the full-scan-request was initiated.
+    pub fn start_time(&self) -> u64 {
+        self.start_time
     }
 
     /// Get the chain tip [`CheckPoint`] of this request (if any).

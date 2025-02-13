@@ -152,6 +152,7 @@ impl<A: Ord> From<TxGraph<A>> for TxUpdate<A> {
             .flat_map(|(txid, anchors)| anchors.into_iter().map(move |a| (a, txid)))
             .collect();
         tx_update.seen_ats = graph.last_seen.into_iter().collect();
+        tx_update.evicted_ats = graph.last_evicted.into_iter().collect();
         tx_update
     }
 }
@@ -159,7 +160,7 @@ impl<A: Ord> From<TxGraph<A>> for TxUpdate<A> {
 impl<A: Anchor> From<TxUpdate<A>> for TxGraph<A> {
     fn from(update: TxUpdate<A>) -> Self {
         let mut graph = TxGraph::<A>::default();
-        let _ = graph.apply_update_at(update, None);
+        let _ = graph.apply_update(update);
         graph
     }
 }
@@ -779,63 +780,22 @@ impl<A: Anchor> TxGraph<A> {
     ///
     /// The returned [`ChangeSet`] is the set difference between `update` and `self` (transactions that
     /// exist in `update` but not in `self`).
-    #[cfg(feature = "std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     pub fn apply_update(&mut self, update: TxUpdate<A>) -> ChangeSet<A> {
-        use std::time::*;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("current time must be greater than epoch anchor");
-        self.apply_update_at(update, Some(now.as_secs()))
-    }
-
-    /// Extends this graph with the given `update` alongside an optional `seen_at` timestamp.
-    ///
-    /// `seen_at` represents when the update is seen (in unix seconds). It is used to determine the
-    /// `last_seen`s for all transactions in the update which have no corresponding anchor(s). The
-    /// `last_seen` value is used internally to determine precedence of conflicting unconfirmed
-    /// transactions (where the transaction with the lower `last_seen` value is omitted from the
-    /// canonical history).
-    ///
-    /// `evicted_at` is used to track when a transaction was last observed in the mempool before
-    /// disappearing. It helps determine whether a transaction was potentially replaced, allowing
-    /// the graph to filter out missing transactions that should no longer be considered valid.
-    ///
-    /// Not setting a `seen_at` value means unconfirmed transactions introduced by this update will
-    /// not be part of the canonical history of transactions.
-    ///
-    /// Use [`apply_update`](TxGraph::apply_update) to have the `seen_at` value automatically set
-    /// to the current time.
-    pub fn apply_update_at(&mut self, update: TxUpdate<A>, seen_at: Option<u64>) -> ChangeSet<A> {
         let mut changeset = ChangeSet::<A>::default();
-        let mut unanchored_txs = HashSet::<Txid>::new();
         for tx in update.txs {
-            if unanchored_txs.insert(tx.compute_txid()) {
-                changeset.merge(self.insert_tx(tx));
-            }
+            changeset.merge(self.insert_tx(tx));
         }
         for (outpoint, txout) in update.txouts {
             changeset.merge(self.insert_txout(outpoint, txout));
         }
         for (anchor, txid) in update.anchors {
-            unanchored_txs.remove(&txid);
             changeset.merge(self.insert_anchor(txid, anchor));
         }
         for (txid, seen_at) in update.seen_ats {
             changeset.merge(self.insert_seen_at(txid, seen_at));
         }
-        if let Some(seen_at) = seen_at {
-            for txid in unanchored_txs {
-                changeset.merge(self.insert_seen_at(txid, seen_at));
-            }
-        }
-        for txid in update.evicted {
-            // We want the `evicted_at` value to override the `last_seen` value of the transaction.
-            // If there is no `last_seen`, there is no need for the `evicted_at` value since the
-            // transaction will not be canonical anyway.
-            if let Some(&evicted_at) = self.last_seen.get(&txid) {
-                changeset.merge(self.insert_evicted_at(txid, evicted_at));
-            }
+        for (txid, evicted_at) in update.evicted_ats {
+            changeset.merge(self.insert_evicted_at(txid, evicted_at));
         }
         changeset
     }

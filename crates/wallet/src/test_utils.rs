@@ -316,6 +316,8 @@ pub fn insert_checkpoint(wallet: &mut Wallet, block: BlockId) {
 pub fn insert_tx(wallet: &mut Wallet, tx: Transaction) {
     let mut tx_update = bdk_chain::TxUpdate::default();
     tx_update.txs.push(Arc::new(tx));
+    tx_update
+        .insert_seen_at_for_all_unanchored_txs(std::time::UNIX_EPOCH.elapsed().unwrap().as_secs());
     wallet
         .apply_update(Update {
             tx_update,
@@ -341,7 +343,7 @@ pub fn insert_anchor(wallet: &mut Wallet, txid: Txid, anchor: ConfirmationBlockT
 /// Marks the given `txid` seen as unconfirmed at `seen_at`
 pub fn insert_seen_at(wallet: &mut Wallet, txid: Txid, seen_at: u64) {
     let mut tx_update = bdk_chain::TxUpdate::default();
-    tx_update.seen_ats.insert(txid, seen_at);
+    tx_update.seen_ats.insert((txid, seen_at));
     wallet
         .apply_update(crate::Update {
             tx_update,

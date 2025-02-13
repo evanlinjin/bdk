@@ -56,6 +56,7 @@ impl EsploraExt for esplora_client::BlockingClient {
         parallel_requests: usize,
     ) -> Result<FullScanResponse<K>, Error> {
         let mut request = request.into();
+        let start_time = request.start_time();
 
         let chain_tip = request.chain_tip();
         let latest_blocks = if chain_tip.is_some() {
@@ -82,6 +83,7 @@ impl EsploraExt for esplora_client::BlockingClient {
                 self,
                 &mut inserted_txs,
                 spks_with_history,
+                start_time,
                 stop_gap,
                 parallel_requests,
             )?;
@@ -101,6 +103,7 @@ impl EsploraExt for esplora_client::BlockingClient {
             _ => None,
         };
 
+        tx_update.insert_seen_at_for_all_unanchored_txs(start_time);
         Ok(FullScanResponse {
             chain_update,
             tx_update,
@@ -114,6 +117,7 @@ impl EsploraExt for esplora_client::BlockingClient {
         parallel_requests: usize,
     ) -> Result<SyncResponse, Error> {
         let mut request: SyncRequest<I> = request.into();
+        let start_time = request.start_time();
 
         let chain_tip = request.chain_tip();
         let latest_blocks = if chain_tip.is_some() {
@@ -128,6 +132,7 @@ impl EsploraExt for esplora_client::BlockingClient {
             self,
             &mut inserted_txs,
             request.iter_spks_with_expected_txids(),
+            start_time,
             parallel_requests,
         )?);
         tx_update.extend(fetch_txs_with_txids(
@@ -153,6 +158,7 @@ impl EsploraExt for esplora_client::BlockingClient {
             _ => None,
         };
 
+        tx_update.insert_seen_at_for_all_unanchored_txs(start_time);
         Ok(SyncResponse {
             chain_update,
             tx_update,
@@ -263,6 +269,7 @@ fn fetch_txs_with_keychain_spks<I: Iterator<Item = Indexed<SpkWithExpectedTxids>
     client: &esplora_client::BlockingClient,
     inserted_txs: &mut HashSet<Txid>,
     mut spks_with_history: I,
+    start_time: u64,
     stop_gap: usize,
     parallel_requests: usize,
 ) -> Result<(TxUpdate<ConfirmationBlockTime>, Option<u32>), Error> {
@@ -271,21 +278,22 @@ fn fetch_txs_with_keychain_spks<I: Iterator<Item = Indexed<SpkWithExpectedTxids>
     let mut update = TxUpdate::<ConfirmationBlockTime>::default();
     let mut last_index = Option::<u32>::None;
     let mut last_active_index = Option::<u32>::None;
-    let mut spk_txids = HashSet::new();
+    let mut expected_txids = HashSet::new();
 
     loop {
         let handles = spks_with_history
             .by_ref()
             .take(parallel_requests)
-            .map(|(spk_index, spk_with_history)| {
-                spk_txids.extend(&spk_with_history.txids);
+            .map(|(spk_index, spk_with_expected_txids)| {
+                expected_txids.extend(&spk_with_expected_txids.txids);
                 std::thread::spawn({
                     let client = client.clone();
                     move || -> Result<TxsOfSpkIndex, Error> {
                         let mut last_seen = None;
                         let mut spk_txs = Vec::new();
                         loop {
-                            let txs = client.scripthash_txs(&spk_with_history.spk, last_seen)?;
+                            let txs =
+                                client.scripthash_txs(&spk_with_expected_txids.spk, last_seen)?;
                             let tx_count = txs.len();
                             last_seen = txs.last().map(|tx| tx.txid);
                             spk_txs.extend(txs);
@@ -328,9 +336,11 @@ fn fetch_txs_with_keychain_spks<I: Iterator<Item = Indexed<SpkWithExpectedTxids>
         }
     }
 
-    update
-        .evicted
-        .extend(spk_txids.difference(inserted_txs).cloned());
+    update.evicted_ats.extend(
+        expected_txids
+            .difference(inserted_txs)
+            .map(|&txid| (txid, start_time)),
+    );
 
     Ok((update, last_active_index))
 }
@@ -347,6 +357,7 @@ fn fetch_txs_with_spks<I: IntoIterator<Item = SpkWithExpectedTxids>>(
     client: &esplora_client::BlockingClient,
     inserted_txs: &mut HashSet<Txid>,
     spks_with_history: I,
+    start_time: u64,
     parallel_requests: usize,
 ) -> Result<TxUpdate<ConfirmationBlockTime>, Error> {
     fetch_txs_with_keychain_spks(
@@ -356,6 +367,7 @@ fn fetch_txs_with_spks<I: IntoIterator<Item = SpkWithExpectedTxids>>(
             .into_iter()
             .enumerate()
             .map(|(i, spk_with_history)| (i as u32, spk_with_history)),
+        start_time,
         usize::MAX,
         parallel_requests,
     )

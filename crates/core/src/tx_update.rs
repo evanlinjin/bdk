@@ -1,4 +1,4 @@
-use crate::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use crate::collections::{BTreeMap, BTreeSet, HashSet};
 use alloc::{sync::Arc, vec::Vec};
 use bitcoin::{OutPoint, Transaction, TxOut, Txid};
 
@@ -24,18 +24,32 @@ pub struct TxUpdate<A = ()> {
     /// Full transactions. These are transactions that were determined to be relevant to the wallet
     /// given the request.
     pub txs: Vec<Arc<Transaction>>,
+
     /// Floating txouts. These are `TxOut`s that exist but the whole transaction wasn't included in
     /// `txs` since only knowing about the output is important. These are often used to help determine
     /// the fee of a wallet transaction.
     pub txouts: BTreeMap<OutPoint, TxOut>,
+
     /// Transaction anchors. Anchors tells us a position in the chain where a transaction was
     /// confirmed.
     pub anchors: BTreeSet<(A, Txid)>,
-    /// Seen at times for transactions. This records when a transaction was most recently seen in
-    /// the user's mempool for the sake of tie-breaking other conflicting transactions.
-    pub seen_ats: HashMap<Txid, u64>,
-    /// A set of txids missing from the mempool.
-    pub evicted: HashSet<Txid>,
+
+    /// When transactions were seen in the mempool.
+    ///
+    /// An unconfirmed transaction can only be canonical with a `seen_at` value. It is the
+    /// responsibility of the chain-source to include the `seen_at` values for unconfirmed
+    /// (unanchored) transactions.
+    ///
+    /// [`FullScanRequest::start_time`](crate::spk_client::FullScanRequest::start_time) or
+    /// [`SyncRequest::start_time`](crate::spk_client::SyncRequest::start_time) can be used to
+    /// provide the `seen_at` value.
+    pub seen_ats: HashSet<(Txid, u64)>,
+
+    /// When transactions were seen to be missing from the mempool.
+    ///
+    /// [`SyncRequest::start_time`](crate::spk_client::SyncRequest::start_time) can be used to
+    /// provide the `evicted_at` value.
+    pub evicted_ats: HashSet<(Txid, u64)>,
 }
 
 impl<A> Default for TxUpdate<A> {
@@ -45,7 +59,7 @@ impl<A> Default for TxUpdate<A> {
             txouts: Default::default(),
             anchors: Default::default(),
             seen_ats: Default::default(),
-            evicted: Default::default(),
+            evicted_ats: Default::default(),
         }
     }
 }
@@ -65,8 +79,33 @@ impl<A: Ord> TxUpdate<A> {
                 .map(|(a, txid)| (map(a), txid))
                 .collect(),
             seen_ats: self.seen_ats,
-            evicted: self.evicted,
+            evicted_ats: self.evicted_ats,
         }
+    }
+
+    /// List transactions in [`txs`](Self::txs) that do not have corresponding anchors in
+    /// [`anchors`](Self::anchors).
+    pub fn unanchored_txs(&self) -> impl Iterator<Item = Txid> + '_ {
+        let anchored_txs = self
+            .anchors
+            .iter()
+            .map(|(_, txid)| *txid)
+            .collect::<HashSet<_>>();
+        self.txs
+            .iter()
+            .map(|tx| tx.compute_txid())
+            .filter(move |txid| !anchored_txs.contains(txid))
+    }
+
+    /// Extend the [`seen_ats`](Self::seen_ats) fields to add `seen_at` values for all
+    /// [`unanchored_txs`](Self::unanchored_txs).
+    pub fn insert_seen_at_for_all_unanchored_txs(&mut self, seen_at: u64) {
+        let unanchored_txs = self
+            .unanchored_txs()
+            .map(|txid| (txid, seen_at))
+            .collect::<Vec<_>>();
+        println!("unanchored_txs: {unanchored_txs:?}");
+        self.seen_ats.extend(unanchored_txs);
     }
 
     /// Extend this update with `other`.
@@ -75,6 +114,6 @@ impl<A: Ord> TxUpdate<A> {
         self.txouts.extend(other.txouts);
         self.anchors.extend(other.anchors);
         self.seen_ats.extend(other.seen_ats);
-        self.evicted.extend(other.evicted);
+        self.evicted_ats.extend(other.evicted_ats);
     }
 }

@@ -127,6 +127,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
         fetch_prev_txouts: bool,
     ) -> Result<FullScanResponse<K>, Error> {
         let mut request: FullScanRequest<K> = request.into();
+        let start_time = request.start_time();
 
         let tip_and_latest_blocks = match request.chain_tip() {
             Some(chain_tip) => Some(fetch_tip_and_latest_blocks(&self.inner, chain_tip)?),
@@ -146,9 +147,13 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
                     },
                 )
             });
-            if let Some(last_active_index) =
-                self.populate_with_spks(&mut tx_update, spks_with_history, stop_gap, batch_size)?
-            {
+            if let Some(last_active_index) = self.populate_with_spks(
+                start_time,
+                &mut tx_update,
+                spks_with_history,
+                stop_gap,
+                batch_size,
+            )? {
                 last_active_indices.insert(keychain, last_active_index);
             }
         }
@@ -167,6 +172,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
             _ => None,
         };
 
+        tx_update.insert_seen_at_for_all_unanchored_txs(start_time);
         Ok(FullScanResponse {
             tx_update,
             chain_update,
@@ -204,6 +210,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
         fetch_prev_txouts: bool,
     ) -> Result<SyncResponse, Error> {
         let mut request: SyncRequest<I> = request.into();
+        let start_time = request.start_time();
 
         let tip_and_latest_blocks = match request.chain_tip() {
             Some(chain_tip) => Some(fetch_tip_and_latest_blocks(&self.inner, chain_tip)?),
@@ -212,6 +219,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
 
         let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
         self.populate_with_spks(
+            request.start_time(),
             &mut tx_update,
             request
                 .iter_spks_with_expected_txids()
@@ -237,6 +245,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
             None => None,
         };
 
+        tx_update.insert_seen_at_for_all_unanchored_txs(start_time);
         Ok(SyncResponse {
             tx_update,
             chain_update,
@@ -250,8 +259,9 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
     /// also included.
     fn populate_with_spks(
         &self,
+        start_time: u64,
         tx_update: &mut TxUpdate<ConfirmationBlockTime>,
-        mut spks_with_history: impl Iterator<Item = (u32, SpkWithExpectedTxids)>,
+        mut spks_with_expected_txids: impl Iterator<Item = (u32, SpkWithExpectedTxids)>,
         stop_gap: usize,
         batch_size: usize,
     ) -> Result<Option<u32>, Error> {
@@ -259,46 +269,55 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
         let mut last_active_index = Option::<u32>::None;
 
         loop {
-            let spks_with_history = (0..batch_size)
-                .map_while(|_| spks_with_history.next())
+            let spks_with_expected_txids = (0..batch_size)
+                .map_while(|_| spks_with_expected_txids.next())
                 .collect::<Vec<_>>();
-            if spks_with_history.is_empty() {
+            if spks_with_expected_txids.is_empty() {
                 return Ok(last_active_index);
             }
 
-            let spk_histories = self.inner.batch_script_get_history(
-                spks_with_history.iter().map(|(_, s)| s.spk.as_script()),
+            let spk_history_results = self.inner.batch_script_get_history(
+                spks_with_expected_txids
+                    .iter()
+                    .map(|(_, s)| s.spk.as_script()),
             )?;
 
-            for ((spk_index, spk_with_history), history_res) in
-                spks_with_history.into_iter().zip(spk_histories)
+            for ((spk_index, spk_with_expected_txids), history_res) in spks_with_expected_txids
+                .into_iter()
+                .zip(spk_history_results)
             {
                 if history_res.is_empty() {
                     unused_spk_count = unused_spk_count.saturating_add(1);
                     if unused_spk_count >= stop_gap {
                         return Ok(last_active_index);
                     }
-                    tx_update.evicted.extend(spk_with_history.txids);
-                    continue;
+
+                    tx_update.evicted_ats.extend(
+                        spk_with_expected_txids
+                            .txids
+                            .into_iter()
+                            .map(|txid| (txid, start_time)),
+                    );
                 } else {
                     last_active_index = Some(spk_index);
                     unused_spk_count = 0;
+
+                    for tx_res in history_res {
+                        tx_update.txs.push(self.fetch_tx(tx_res.tx_hash)?);
+                        self.validate_merkle_for_anchor(tx_update, tx_res.tx_hash, tx_res.height)?;
+                    }
+                    let fetched_txids = tx_update
+                        .txs
+                        .iter()
+                        .map(|tx| tx.compute_txid())
+                        .collect::<HashSet<_>>();
+                    tx_update.evicted_ats.extend(
+                        spk_with_expected_txids
+                            .txids
+                            .difference(&fetched_txids)
+                            .map(|&txid| (txid, start_time)),
+                    );
                 }
-
-                for tx_res in history_res {
-                    tx_update.txs.push(self.fetch_tx(tx_res.tx_hash)?);
-                    self.validate_merkle_for_anchor(tx_update, tx_res.tx_hash, tx_res.height)?;
-                }
-
-                let fetched_txids = tx_update
-                    .txs
-                    .iter()
-                    .map(|tx| tx.compute_txid())
-                    .collect::<HashSet<_>>();
-
-                tx_update
-                    .evicted
-                    .extend(spk_with_history.txids.difference(&fetched_txids).cloned());
             }
         }
     }
