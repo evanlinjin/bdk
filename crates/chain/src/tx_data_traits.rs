@@ -97,32 +97,3 @@ impl Anchor for ConfirmationBlockTime {
         self.block_id.height
     }
 }
-
-/// Set of parameters sufficient to construct an [`Anchor`].
-///
-/// Typically used as an additional constraint on anchor:
-/// `for<'b> A: Anchor + From<TxPosInBlock<'b>>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TxPosInBlock<'b> {
-    /// Block in which the transaction appeared.
-    pub block: &'b bitcoin::Block,
-    /// Block's [`BlockId`].
-    pub block_id: BlockId,
-    /// Position in the block on which the transaction appeared.
-    pub tx_pos: usize,
-}
-
-impl From<TxPosInBlock<'_>> for BlockId {
-    fn from(pos: TxPosInBlock) -> Self {
-        pos.block_id
-    }
-}
-
-impl From<TxPosInBlock<'_>> for ConfirmationBlockTime {
-    fn from(pos: TxPosInBlock) -> Self {
-        Self {
-            block_id: pos.block_id,
-            confirmation_time: pos.block.header.time as _,
-        }
-    }
-}

@@ -1,3 +1,4 @@
+use bdk_chain::TxUpdate;
 use serde_json::json;
 use std::cmp;
 use std::collections::HashMap;
@@ -309,16 +310,20 @@ where
     }];
 
     let (change_keychain, _) = graph
-        .index
+        .indexer()
         .keychains()
         .last()
         .expect("must have a keychain");
 
-    let ((change_index, change_script), index_changeset) = graph
-        .index
-        .next_unused_spk(change_keychain)
-        .expect("Must exist");
-    changeset.merge(index_changeset);
+    let ((change_index, change_script), index_changeset) =
+        graph.mutate_indexer(|indexer, changeset| {
+            let (spk, c) = indexer
+                .next_unused_spk(change_keychain)
+                .expect("must exist");
+            changeset.merge(c);
+            spk
+        });
+    changeset.merge(index_changeset.indexer);
 
     let mut change_output = TxOut {
         value: Amount::ZERO,
@@ -326,7 +331,7 @@ where
     };
 
     let change_desc = graph
-        .index
+        .indexer()
         .keychains()
         .find(|(k, _)| k == &change_keychain)
         .expect("must exist")
@@ -429,7 +434,7 @@ pub fn planned_utxos<O: ChainOracle>(
     assets: &Assets,
 ) -> Result<Vec<PlanUtxo>, O::Error> {
     let chain_tip = chain.get_chain_tip()?;
-    let outpoints = graph.index.outpoints();
+    let outpoints = graph.indexer().outpoints();
     graph
         .graph()
         .try_filter_chain_unspents(
@@ -440,7 +445,7 @@ pub fn planned_utxos<O: ChainOracle>(
         )?
         .filter_map(|((k, i), full_txo)| -> Option<Result<PlanUtxo, _>> {
             let desc = graph
-                .index
+                .indexer()
                 .keychains()
                 .find(|(keychain, _)| *keychain == k)
                 .expect("keychain must exist")
@@ -460,7 +465,7 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
     chain: &Mutex<LocalChain>,
     db: &Mutex<Store<ChangeSet>>,
     network: Network,
-    broadcast_fn: impl FnOnce(S, &Transaction) -> anyhow::Result<()>,
+    broadcast_fn: impl FnOnce(S, &Transaction) -> anyhow::Result<TxUpdate<ConfirmationBlockTime>>,
     cmd: Commands<CS, S>,
 ) -> anyhow::Result<()> {
     match cmd {
@@ -469,7 +474,7 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
         Commands::ChainSpecific(_) => unreachable!("example code should handle this!"),
         Commands::Address { addr_cmd } => {
             let graph = &mut *graph.lock().unwrap();
-            let index = &mut graph.index;
+            // let index = &mut graph.index;
 
             match addr_cmd {
                 AddressCmd::Next | AddressCmd::New => {
@@ -479,11 +484,14 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
                         _ => unreachable!("only these two variants exist in match arm"),
                     };
 
-                    let ((spk_i, spk), index_changeset) =
-                        spk_chooser(index, Keychain::External).expect("Must exist");
+                    let ((spk_i, spk), changeset) = graph.mutate_indexer(|index, changeset| {
+                        let (spk, c) = spk_chooser(index, Keychain::External).expect("Must exist");
+                        changeset.merge(c);
+                        spk
+                    });
                     let db = &mut *db.lock().unwrap();
                     db.append(&ChangeSet {
-                        indexer: index_changeset,
+                        indexer: changeset.indexer,
                         ..Default::default()
                     })?;
                     let addr = Address::from_script(spk.as_script(), network)?;
@@ -491,7 +499,7 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
                     Ok(())
                 }
                 AddressCmd::Index => {
-                    for (keychain, derivation_index) in index.last_revealed_indices() {
+                    for (keychain, derivation_index) in graph.indexer().last_revealed_indices() {
                         println!("{:?}: {}", keychain, derivation_index);
                     }
                     Ok(())
@@ -501,14 +509,14 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
                         true => Keychain::Internal,
                         false => Keychain::External,
                     };
-                    for (spk_i, spk) in index.revealed_keychain_spks(target_keychain) {
+                    for (spk_i, spk) in graph.indexer().revealed_keychain_spks(target_keychain) {
                         let address = Address::from_script(spk.as_script(), network)
                             .expect("should always be able to derive address");
                         println!(
                             "{:?} {} used:{}",
                             spk_i,
                             address,
-                            index.is_used(target_keychain, spk_i)
+                            graph.indexer().is_used(target_keychain, spk_i)
                         );
                     }
                     Ok(())
@@ -532,7 +540,7 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
                 chain,
                 chain.get_chain_tip()?,
                 CanonicalizationParams::default(),
-                graph.index.outpoints().iter().cloned(),
+                graph.indexer().outpoints().iter().cloned(),
                 |(k, _), _| k == &Keychain::Internal,
             )?;
 
@@ -562,7 +570,7 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
             let graph = &*graph.lock().unwrap();
             let chain = &*chain.lock().unwrap();
             let chain_tip = chain.get_chain_tip()?;
-            let outpoints = graph.index.outpoints();
+            let outpoints = graph.indexer().outpoints();
 
             match txout_cmd {
                 TxOutCmd::List {
@@ -620,7 +628,7 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
 
                     // collect assets we can sign for
                     let mut pks = vec![];
-                    for (_, desc) in graph.index.keychains() {
+                    for (_, desc) in graph.indexer().keychains() {
                         desc.for_each_key(|k| {
                             pks.push(k.clone());
                             true
@@ -665,11 +673,10 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
                     // We don't want other callers/threads to use this address while we're using it
                     // but we also don't want to scan the tx we just created because it's not
                     // technically in the blockchain yet.
-                    graph
+                    let _ = graph
                         .lock()
                         .unwrap()
-                        .index
-                        .mark_used(change_keychain, index);
+                        .mutate_indexer(|indexer, _| indexer.mark_used(change_keychain, index));
                 }
 
                 if debug {
@@ -738,10 +745,10 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
                     let mut graph = graph.lock().unwrap();
 
                     match broadcast_fn(chain_specific, &tx) {
-                        Ok(_) => {
-                            println!("Broadcasted Tx: {}", tx.compute_txid());
+                        Ok(tx_update) => {
+                            println!("Broadcasted: {}", tx.compute_txid());
 
-                            let changeset = graph.insert_tx(tx);
+                            let changeset = graph.apply_update(tx_update);
 
                             // We know the tx is at least unconfirmed now. Note if persisting here fails,
                             // it's not a big deal since we can always find it again from the
@@ -755,13 +762,13 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
                         Err(e) => {
                             // We failed to broadcast, so allow our change address to be used in the future
                             let (change_keychain, _) = graph
-                                .index
+                                .indexer()
                                 .keychains()
                                 .last()
                                 .expect("must have a keychain");
                             let change_index = tx.output.iter().find_map(|txout| {
                                 let spk = txout.script_pubkey.clone();
-                                match graph.index.index_of_spk(spk) {
+                                match graph.indexer().index_of_spk(spk) {
                                     Some(&(keychain, index)) if keychain == change_keychain => {
                                         Some((keychain, index))
                                     }
@@ -769,7 +776,9 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
                                 }
                             });
                             if let Some((keychain, index)) = change_index {
-                                graph.index.unmark_used(keychain, index);
+                                let _ = graph.mutate_indexer(|indexer, _| {
+                                    indexer.unmark_used(keychain, index)
+                                });
                             }
                             bail!(e);
                         }

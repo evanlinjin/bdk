@@ -7,9 +7,10 @@ use crate::{
     spk_client::{FullScanRequestBuilder, SyncRequestBuilder},
     spk_iter::BIP32_MAX_INDEX,
     spk_txout::SpkTxOutIndex,
-    DescriptorExt, DescriptorId, Indexed, Indexer, KeychainIndexed, SpkIterator,
+    Anchor, DescriptorExt, DescriptorId, Indexed, KeychainIndexed, SpkIterator,
 };
 use alloc::{borrow::ToOwned, vec::Vec};
+use bdk_core::{BlockUpdate, MempoolUpdate, TxPosInBlock, TxUpdate};
 use bitcoin::{Amount, OutPoint, ScriptBuf, SignedAmount, Transaction, TxOut, Txid};
 use core::{
     fmt::Debug,
@@ -17,6 +18,8 @@ use core::{
 };
 
 use crate::Merge;
+
+use super::{FilteringIndexer, Index, Indexer};
 
 /// The default lookahead for a [`KeychainTxOutIndex`]
 pub const DEFAULT_LOOKAHEAD: u32 = 25;
@@ -142,10 +145,8 @@ impl<K> AsRef<SpkTxOutIndex<(K, u32)>> for KeychainTxOutIndex<K> {
     }
 }
 
-impl<K: Clone + Ord + Debug> Indexer for KeychainTxOutIndex<K> {
-    type ChangeSet = ChangeSet;
-
-    fn index_txout(&mut self, outpoint: OutPoint, txout: &TxOut) -> Self::ChangeSet {
+impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
+    fn index_txout(&mut self, outpoint: OutPoint, txout: &TxOut) -> ChangeSet {
         let mut changeset = ChangeSet::default();
         if let Some((keychain, index)) = self.inner.scan_txout(outpoint, txout).cloned() {
             let did = self
@@ -161,7 +162,7 @@ impl<K: Clone + Ord + Debug> Indexer for KeychainTxOutIndex<K> {
         changeset
     }
 
-    fn index_tx(&mut self, tx: &bitcoin::Transaction) -> Self::ChangeSet {
+    fn index_tx(&mut self, tx: &bitcoin::Transaction) -> ChangeSet {
         let mut changeset = ChangeSet::default();
         let txid = tx.compute_txid();
         for (op, txout) in tx.output.iter().enumerate() {
@@ -170,18 +171,112 @@ impl<K: Clone + Ord + Debug> Indexer for KeychainTxOutIndex<K> {
         changeset
     }
 
-    fn initial_changeset(&self) -> Self::ChangeSet {
+    fn initial_changeset(&self) -> ChangeSet {
         ChangeSet {
             last_revealed: self.last_revealed.clone().into_iter().collect(),
         }
     }
 
-    fn apply_changeset(&mut self, changeset: Self::ChangeSet) {
-        self.apply_changeset(changeset)
-    }
-
     fn is_tx_relevant(&self, tx: &bitcoin::Transaction) -> bool {
         self.inner.is_relevant(tx)
+    }
+}
+
+impl<K, A> Index<A> for KeychainTxOutIndex<K>
+where
+    K: Clone + Ord + Debug,
+    A: Anchor,
+{
+    type ChangeSet = ChangeSet;
+
+    fn reindex(&mut self, tx_update: &TxUpdate<A>) {
+        for tx in &tx_update.txs {
+            let _ = self.index_tx(&tx);
+        }
+        for (op, txout) in &tx_update.txouts {
+            let _ = self.index_txout(*op, txout);
+        }
+    }
+
+    fn apply_changeset(&mut self, changeset: Self::ChangeSet) {
+        self.apply_changeset(changeset);
+    }
+
+    fn initial_changeset(&self) -> Self::ChangeSet {
+        ChangeSet {
+            last_revealed: self.last_revealed.clone().into_iter().collect(),
+        }
+    }
+}
+
+impl<K, A> Indexer<A> for KeychainTxOutIndex<K>
+where
+    K: Clone + Ord + Debug,
+    A: Anchor,
+{
+    fn index(&mut self, changeset: &mut Self::ChangeSet, update: &TxUpdate<A>) {
+        for tx in &update.txs {
+            changeset.merge(self.index_tx(tx));
+        }
+        for (op, txout) in &update.txouts {
+            changeset.merge(self.index_txout(*op, txout));
+        }
+    }
+}
+
+impl<K, A> FilteringIndexer<A, MempoolUpdate> for KeychainTxOutIndex<K>
+where
+    K: Clone + Ord + Debug,
+    A: Anchor,
+{
+    fn index_and_filter(
+        &mut self,
+        changeset: &mut Self::ChangeSet,
+        update: &MempoolUpdate,
+    ) -> TxUpdate<A> {
+        let mut tx_update = TxUpdate::<A>::default();
+        if update.chronological {
+            for (tx, seen_at) in &update.txs {
+                changeset.merge(self.index_tx(tx));
+                if self.inner.is_relevant(tx) {
+                    tx_update.txs.push(tx.clone());
+                    tx_update.seen_ats.insert((tx.compute_txid(), *seen_at));
+                }
+            }
+        } else {
+            for (tx, _) in &update.txs {
+                changeset.merge(self.index_tx(tx));
+            }
+            for (tx, seen_at) in &update.txs {
+                if self.inner.is_relevant(tx) {
+                    tx_update.txs.push(tx.clone());
+                    tx_update.seen_ats.insert((tx.compute_txid(), *seen_at));
+                }
+            }
+        }
+        tx_update
+    }
+}
+
+impl<'b, K, A> FilteringIndexer<A, BlockUpdate<'b>> for KeychainTxOutIndex<K>
+where
+    K: Clone + Ord + Debug,
+    A: Anchor + From<TxPosInBlock<'b>>,
+{
+    fn index_and_filter(
+        &mut self,
+        changeset: &mut Self::ChangeSet,
+        update: &BlockUpdate<'b>,
+    ) -> TxUpdate<A> {
+        let mut tx_update = TxUpdate::<A>::default();
+        for (tx, anchor) in update.txs::<A>() {
+            changeset.merge(self.index_tx(tx));
+            if self.inner.is_relevant(tx) {
+                tx_update.txs.push(tx.clone().into());
+                tx_update.anchors.insert((anchor, tx.compute_txid()));
+            }
+        }
+        tx_update
     }
 }
 

@@ -8,7 +8,7 @@ use bdk_chain::{
     bitcoin::Network,
     keychain_txout::FullScanRequestBuilderExt,
     spk_client::{FullScanRequest, SyncRequest},
-    CanonicalizationParams, Merge,
+    CanonicalizationParams, Merge, TxUpdate,
 };
 use bdk_esplora::{esplora_client, EsploraExt};
 use example_cli::{
@@ -115,10 +115,12 @@ fn main() -> anyhow::Result<()> {
                 network,
                 |esplora_args, tx| {
                     let client = esplora_args.client(network)?;
-                    client
-                        .broadcast(tx)
-                        .map(|_| ())
-                        .map_err(anyhow::Error::from)
+                    client.broadcast(tx).map_err(anyhow::Error::from)?;
+                    let now = std::time::UNIX_EPOCH.elapsed()?.as_secs();
+                    let mut update = TxUpdate::default();
+                    update.txs.push(tx.clone().into());
+                    update.seen_ats.insert((tx.compute_txid(), now));
+                    Ok(update)
                 },
                 general_cmd.clone(),
             );
@@ -148,7 +150,7 @@ fn main() -> anyhow::Result<()> {
                 let indexed_graph = &*graph.lock().expect("mutex must not be poisoned");
                 FullScanRequest::builder()
                     .chain_tip(chain_tip)
-                    .spks_from_indexer(&indexed_graph.index)
+                    .spks_from_indexer(indexed_graph.indexer())
                     .inspect({
                         let mut once = BTreeSet::<Keychain>::new();
                         move |keychain, spk_i, _| {
@@ -180,11 +182,11 @@ fn main() -> anyhow::Result<()> {
             (
                 chain.apply_update(update.chain_update.expect("request included chain tip"))?,
                 {
-                    let index_changeset = graph
-                        .index
-                        .reveal_to_target_multi(&update.last_active_indices);
+                    let (_, index_changeset) = graph.mutate_indexer(|indexer, changeset| {
+                        changeset.merge(indexer.reveal_to_target_multi(&update.last_active_indices))
+                    });
                     let mut indexed_tx_graph_changeset = graph.apply_update(update.tx_update);
-                    indexed_tx_graph_changeset.merge(index_changeset.into());
+                    indexed_tx_graph_changeset.merge(index_changeset);
                     indexed_tx_graph_changeset
                 },
             )
@@ -231,16 +233,16 @@ fn main() -> anyhow::Result<()> {
                     ..,
                 ));
                 if *all_spks {
-                    request = request.spks_with_indexes(graph.index.revealed_spks(..));
+                    request = request.spks_with_indexes(graph.indexer().revealed_spks(..));
                 }
                 if unused_spks {
-                    request = request.spks_with_indexes(graph.index.unused_spks());
+                    request = request.spks_with_indexes(graph.indexer().unused_spks());
                 }
                 if utxos {
                     // We want to search for whether the UTXO is spent, and spent by which
                     // transaction. We provide the outpoint of the UTXO to
                     // `EsploraExt::update_tx_graph_without_keychain`.
-                    let init_outpoints = graph.index.outpoints();
+                    let init_outpoints = graph.indexer().outpoints();
                     request = request.outpoints(
                         graph
                             .graph()

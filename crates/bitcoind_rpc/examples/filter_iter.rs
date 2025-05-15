@@ -8,6 +8,7 @@ use bdk_chain::indexer::keychain_txout::KeychainTxOutIndex;
 use bdk_chain::local_chain::LocalChain;
 use bdk_chain::miniscript::Descriptor;
 use bdk_chain::{BlockId, ConfirmationBlockTime, IndexedTxGraph, SpkIterator};
+use bdk_core::Merge;
 use bdk_testenv::anyhow;
 use bitcoin::Address;
 
@@ -55,7 +56,7 @@ fn main() -> anyhow::Result<()> {
     let cp = chain.tip();
     let start_height = cp.height();
     let mut emitter = FilterIter::new_with_checkpoint(&rpc_client, cp);
-    for (_, desc) in graph.index.keychains() {
+    for (_, desc) in graph.indexer().keychains() {
         let spks = SpkIterator::new_with_range(desc, 0..SPK_COUNT).map(|(_, spk)| spk);
         emitter.add_spks(spks);
     }
@@ -71,7 +72,7 @@ fn main() -> anyhow::Result<()> {
             let curr = event.height();
             // apply relevant blocks
             if let Event::Block(EventInner { height, ref block }) = event {
-                let _ = graph.apply_block_relevant(block, height);
+                let _ = graph.apply_block(block, height);
                 println!("Matched block {}", curr);
             }
             if curr % 1000 == 0 {
@@ -93,7 +94,7 @@ fn main() -> anyhow::Result<()> {
             &chain,
             chain.tip().block_id(),
             Default::default(),
-            graph.index.outpoints().clone(),
+            graph.indexer().outpoints().clone(),
         )
         .collect();
     if !unspent.is_empty() {
@@ -104,7 +105,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let unused_spk = graph.index.reveal_next_spk("external").unwrap().0 .1;
+    let (unused_spk, _) = graph.mutate_indexer(|indexer, changeset| {
+        let ((_, spk), c) = indexer.reveal_next_spk("external").expect("must exist");
+        changeset.merge(c);
+        spk
+    });
     let unused_address = Address::from_script(&unused_spk, NETWORK)?;
     println!("Next external address: {}", unused_address);
 

@@ -11,7 +11,9 @@ use bdk_bitcoind_rpc::{
     bitcoincore_rpc::{Auth, Client, RpcApi},
     Emitter,
 };
-use bdk_chain::{bitcoin::Block, local_chain, CanonicalizationParams, Merge};
+use bdk_chain::{
+    bitcoin::Block, indexed_tx_graph, local_chain, CanonicalizationParams, Merge, TxUpdate,
+};
 use example_cli::{
     anyhow,
     clap::{self, Args, Subcommand},
@@ -122,8 +124,12 @@ fn main() -> anyhow::Result<()> {
                 network,
                 |rpc_args, tx| {
                     let client = rpc_args.new_client()?;
-                    client.send_raw_transaction(tx)?;
-                    Ok(())
+                    let txid = client.send_raw_transaction(tx)?;
+                    let mut update = TxUpdate::default();
+                    update.txs.push(Arc::new(tx.clone()));
+                    let now = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs();
+                    update.seen_ats.insert((txid, now));
+                    Ok(update)
                 },
                 general_cmd,
             );
@@ -168,7 +174,7 @@ fn main() -> anyhow::Result<()> {
                 let chain_changeset = chain
                     .apply_update(emission.checkpoint)
                     .expect("must always apply as we receive blocks in order from emitter");
-                let graph_changeset = graph.apply_block_relevant(&emission.block, height);
+                let graph_changeset = graph.apply_block(&emission.block, height);
                 db_stage.merge(ChangeSet {
                     local_chain: chain_changeset,
                     tx_graph: graph_changeset.tx_graph,
@@ -199,7 +205,7 @@ fn main() -> anyhow::Result<()> {
                             &*chain,
                             synced_to.block_id(),
                             CanonicalizationParams::default(),
-                            graph.index.outpoints().iter().cloned(),
+                            graph.indexer().outpoints().iter().cloned(),
                             |(k, _), _| k == &Keychain::Internal,
                         )
                     };
@@ -214,10 +220,13 @@ fn main() -> anyhow::Result<()> {
             }
 
             let mempool_txs = emitter.mempool()?;
-            let graph_changeset = graph
-                .lock()
-                .unwrap()
-                .batch_insert_relevant_unconfirmed(mempool_txs.new_txs);
+            let mut graph_changeset = indexed_tx_graph::ChangeSet::default();
+            {
+                let mut graph = graph.lock().unwrap();
+                graph_changeset.merge(graph.filter_and_apply_update(mempool_txs.update));
+                graph_changeset.merge(graph.batch_insert_relevant_evicted_at(mempool_txs.evicted));
+            }
+
             {
                 let db = &mut *db.lock().unwrap();
                 db_stage.merge(ChangeSet {
@@ -309,16 +318,13 @@ fn main() -> anyhow::Result<()> {
                         let chain_changeset = chain
                             .apply_update(block_emission.checkpoint)
                             .expect("must always apply as we receive blocks in order from emitter");
-                        let graph_changeset =
-                            graph.apply_block_relevant(&block_emission.block, height);
+                        let graph_changeset = graph.apply_block(&block_emission.block, height);
                         (chain_changeset, graph_changeset)
                     }
                     Emission::Mempool(mempool_txs) => {
-                        let mut graph_changeset =
-                            graph.batch_insert_relevant_unconfirmed(mempool_txs.new_txs.clone());
-                        graph_changeset.merge(
-                            graph.batch_insert_relevant_evicted_at(mempool_txs.evicted_ats()),
-                        );
+                        let mut graph_changeset = graph.filter_and_apply_update(mempool_txs.update);
+                        graph_changeset
+                            .merge(graph.batch_insert_relevant_evicted_at(mempool_txs.evicted));
                         (local_chain::ChangeSet::default(), graph_changeset)
                     }
                     Emission::Tip(h) => {
@@ -355,7 +361,7 @@ fn main() -> anyhow::Result<()> {
                             &*chain,
                             synced_to.block_id(),
                             CanonicalizationParams::default(),
-                            graph.index.outpoints().iter().cloned(),
+                            graph.indexer().outpoints().iter().cloned(),
                             |(k, _), _| k == &Keychain::Internal,
                         )
                     };

@@ -1,6 +1,66 @@
-use crate::collections::{BTreeMap, BTreeSet, HashSet};
+use crate::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    BlockId,
+};
 use alloc::{sync::Arc, vec::Vec};
 use bitcoin::{OutPoint, Transaction, TxOut, Txid};
+
+/// Set of parameters sufficient to construct an [`Anchor`].
+///
+/// Typically used as an additional constraint on anchor:
+/// `for<'b> A: Anchor + From<TxPosInBlock<'b>>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxPosInBlock<'b> {
+    /// Block in which the transaction appeared.
+    pub block: &'b bitcoin::Block,
+    /// Block's [`BlockId`].
+    pub block_id: BlockId,
+    /// Position in the block on which the transaction appeared.
+    pub tx_pos: usize,
+}
+
+/// Block update.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockUpdate<'b> {
+    block: &'b bitcoin::Block,
+    height: u32,
+}
+
+impl<'b> BlockUpdate<'b> {
+    /// Construct.
+    pub fn new(block: &'b bitcoin::Block, height: u32) -> Self {
+        Self { block, height }
+    }
+    /// Consume update and iterate transactions.
+    pub fn txs<A>(self) -> impl Iterator<Item = (&'b Transaction, A)> + 'b
+    where
+        A: From<TxPosInBlock<'b>>,
+    {
+        let block = self.block;
+        let block_id = BlockId {
+            height: self.height,
+            hash: self.block.block_hash(),
+        };
+        block.txdata.iter().enumerate().map(move |(tx_pos, tx)| {
+            let anchor = A::from(TxPosInBlock {
+                block,
+                block_id,
+                tx_pos,
+            });
+            (tx, anchor)
+        })
+    }
+}
+
+/// Mempool update.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct MempoolUpdate {
+    /// Whether the transactions are ordered chronologically.
+    pub chronological: bool,
+    /// Transactions of the mempool.
+    pub txs: Vec<(Arc<Transaction>, u64)>,
+}
 
 /// Data object used to communicate updates about relevant transactions from some chain data source
 /// to the core model (usually a `bdk_chain::TxGraph`).
@@ -61,6 +121,14 @@ impl<A> Default for TxUpdate<A> {
             seen_ats: Default::default(),
             evicted_ats: Default::default(),
         }
+    }
+}
+
+impl<A> From<Transaction> for TxUpdate<A> {
+    fn from(tx: Transaction) -> Self {
+        let mut update = Self::default();
+        update.txs.push(Arc::new(tx));
+        update
     }
 }
 

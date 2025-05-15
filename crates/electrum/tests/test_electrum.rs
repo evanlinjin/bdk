@@ -1,10 +1,10 @@
 use bdk_chain::{
     bitcoin::{hashes::Hash, Address, Amount, ScriptBuf, WScriptHash},
+    indexer::Indexer,
     local_chain::LocalChain,
     spk_client::{FullScanRequest, SyncRequest, SyncResponse},
     spk_txout::SpkTxOutIndex,
-    Balance, CanonicalizationParams, ConfirmationBlockTime, IndexedTxGraph, Indexer, Merge,
-    TxGraph,
+    Balance, CanonicalizationParams, ConfirmationBlockTime, IndexedTxGraph, Merge, TxGraph,
 };
 use bdk_core::bitcoin::{
     key::{Secp256k1, UntweakedPublicKey},
@@ -39,7 +39,7 @@ fn get_balance(
     recv_graph: &IndexedTxGraph<ConfirmationBlockTime, SpkTxOutIndex<()>>,
 ) -> anyhow::Result<Balance> {
     let chain_tip = recv_chain.tip().block_id();
-    let outpoints = recv_graph.index.outpoints().clone();
+    let outpoints = recv_graph.indexer().outpoints().clone();
     let balance = recv_graph.graph().balance(
         recv_chain,
         chain_tip,
@@ -57,7 +57,7 @@ fn sync_with_electrum<I, Spks>(
     graph: &mut IndexedTxGraph<ConfirmationBlockTime, I>,
 ) -> anyhow::Result<SyncResponse>
 where
-    I: Indexer,
+    I: Indexer<ConfirmationBlockTime>,
     I::ChangeSet: Default + Merge,
     Spks: IntoIterator<Item = ScriptBuf>,
     Spks::IntoIter: ExactSizeIterator + Send + 'static,
@@ -98,7 +98,7 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     // Get receiving address.
     let receiver_spk = get_test_spk();
     let receiver_addr = Address::from_script(&receiver_spk, bdk_chain::bitcoin::Network::Regtest)?;
-    graph.index.insert_spk((), receiver_spk);
+    let _ = graph.mutate_indexer(|indexer, _| indexer.insert_spk((), receiver_spk.clone()));
 
     env.mine_blocks(101, None)?;
 
@@ -149,7 +149,7 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     env.wait_until_electrum_sees_txid(send_txid, Duration::from_secs(6))?;
     let sync_request = SyncRequest::builder()
         .chain_tip(chain.tip())
-        .spks_with_indexes(graph.index.all_spks().clone())
+        .spks_with_indexes(graph.indexer().all_spks().clone())
         .expected_spk_txids(graph.list_expected_spk_txids(&chain, chain.tip().block_id(), ..));
     let sync_response = client.sync(sync_request, BATCH_SIZE, true)?;
     assert!(
@@ -174,7 +174,7 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     env.wait_until_electrum_sees_txid(undo_send_txid, Duration::from_secs(6))?;
     let sync_request = SyncRequest::builder()
         .chain_tip(chain.tip())
-        .spks_with_indexes(graph.index.all_spks().clone())
+        .spks_with_indexes(graph.indexer().all_spks().clone())
         .expected_spk_txids(graph.list_expected_spk_txids(&chain, chain.tip().block_id(), ..));
     let sync_response = client.sync(sync_request, BATCH_SIZE, true)?;
     assert!(

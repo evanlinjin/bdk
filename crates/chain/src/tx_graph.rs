@@ -226,6 +226,15 @@ impl<T, A> Deref for TxNode<'_, T, A> {
     }
 }
 
+impl<'a, T, A> AsRef<Transaction> for TxNode<'a, T, A>
+where
+    T: AsRef<Transaction>,
+{
+    fn as_ref(&self) -> &Transaction {
+        self.tx.as_ref()
+    }
+}
+
 /// Internal representation of a transaction node of a [`TxGraph`].
 ///
 /// This can either be a whole transaction, or a partial transaction (where we only have select
@@ -887,6 +896,36 @@ impl<A: Anchor> TxGraph<A> {
         }
         for (txid, evicted_at) in update.evicted_ats {
             changeset.merge(self.insert_evicted_at(txid, evicted_at));
+        }
+        changeset
+    }
+
+    /// Just like [`apply_update`](Self::apply_update) expect this prunes out data that is
+    /// unassociated with known transactions.
+    pub fn apply_update_prune_unassociated(&mut self, update: TxUpdate<A>) -> ChangeSet<A> {
+        let mut changeset = ChangeSet::<A>::default();
+        for tx in update.txs {
+            changeset.merge(self.insert_tx(tx));
+        }
+        for (outpoint, txout) in update.txouts {
+            if self.spends.contains_key(&outpoint) {
+                changeset.merge(self.insert_txout(outpoint, txout));
+            }
+        }
+        for (anchor, txid) in update.anchors {
+            if self.txs.contains_key(&txid) {
+                changeset.merge(self.insert_anchor(txid, anchor));
+            }
+        }
+        for (txid, seen_at) in update.seen_ats {
+            if self.txs.contains_key(&txid) {
+                changeset.merge(self.insert_seen_at(txid, seen_at));
+            }
+        }
+        for (txid, evicted_at) in update.evicted_ats {
+            if self.txs.contains_key(&txid) {
+                changeset.merge(self.insert_evicted_at(txid, evicted_at));
+            }
         }
         changeset
     }

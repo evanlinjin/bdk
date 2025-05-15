@@ -1,5 +1,7 @@
 use bitcoin::{hashes::Hash, BlockHash};
 
+use crate::TxPosInBlock;
+
 /// A reference to a block in the canonical chain.
 #[derive(Debug, Clone, PartialEq, Eq, Copy, PartialOrd, Ord, core::hash::Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -40,6 +42,12 @@ impl From<(&u32, &BlockHash)> for BlockId {
     }
 }
 
+impl From<TxPosInBlock<'_>> for BlockId {
+    fn from(pos: TxPosInBlock) -> Self {
+        pos.block_id
+    }
+}
+
 /// Represents the confirmation block and time of a transaction.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Copy, PartialOrd, Ord, core::hash::Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -48,4 +56,13 @@ pub struct ConfirmationBlockTime {
     pub block_id: BlockId,
     /// The confirmation time of the transaction being anchored.
     pub confirmation_time: u64,
+}
+
+impl From<TxPosInBlock<'_>> for ConfirmationBlockTime {
+    fn from(pos: TxPosInBlock) -> Self {
+        Self {
+            block_id: pos.block_id,
+            confirmation_time: pos.block.header.time as _,
+        }
+    }
 }

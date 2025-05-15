@@ -5,7 +5,7 @@ use bdk_chain::{
     collections::BTreeSet,
     indexed_tx_graph,
     spk_client::{FullScanRequest, SyncRequest},
-    CanonicalizationParams, ConfirmationBlockTime, Merge,
+    CanonicalizationParams, ConfirmationBlockTime, Merge, TxUpdate,
 };
 use bdk_electrum::{
     electrum_client::{self, Client, ElectrumApi},
@@ -116,8 +116,12 @@ fn main() -> anyhow::Result<()> {
                 network,
                 |electrum_args, tx| {
                     let client = electrum_args.client(network)?;
-                    client.transaction_broadcast(tx)?;
-                    Ok(())
+                    let txid = client.transaction_broadcast(tx)?;
+                    let now = std::time::UNIX_EPOCH.elapsed()?.as_secs();
+                    let mut update = TxUpdate::default();
+                    update.txs.push(tx.clone().into());
+                    update.seen_ats.insert((txid, now));
+                    Ok(update)
                 },
                 general_cmd.clone(),
             );
@@ -151,7 +155,7 @@ fn main() -> anyhow::Result<()> {
                     .spks_for_keychain(
                         Keychain::External,
                         graph
-                            .index
+                            .indexer()
                             .unbounded_spk_iter(Keychain::External)
                             .into_iter()
                             .flatten(),
@@ -159,7 +163,7 @@ fn main() -> anyhow::Result<()> {
                     .spks_for_keychain(
                         Keychain::Internal,
                         graph
-                            .index
+                            .indexer()
                             .unbounded_spk_iter(Keychain::Internal)
                             .into_iter()
                             .flatten(),
@@ -221,13 +225,13 @@ fn main() -> anyhow::Result<()> {
                 ..,
             ));
             if all_spks {
-                request = request.spks_with_indexes(graph.index.revealed_spks(..));
+                request = request.spks_with_indexes(graph.indexer().revealed_spks(..));
             }
             if unused_spks {
-                request = request.spks_with_indexes(graph.index.unused_spks());
+                request = request.spks_with_indexes(graph.indexer().unused_spks());
             }
             if utxos {
-                let init_outpoints = graph.index.outpoints();
+                let init_outpoints = graph.indexer().outpoints();
                 request = request.outpoints(
                     graph
                         .graph()
@@ -274,8 +278,13 @@ fn main() -> anyhow::Result<()> {
         let mut indexed_tx_graph_changeset =
             indexed_tx_graph::ChangeSet::<ConfirmationBlockTime, _>::default();
         if let Some(keychain_update) = keychain_update {
-            let keychain_changeset = graph.index.reveal_to_target_multi(&keychain_update);
-            indexed_tx_graph_changeset.merge(keychain_changeset.into());
+            indexed_tx_graph_changeset.merge(
+                graph
+                    .mutate_indexer(|indexer, changeset| {
+                        changeset.merge(indexer.reveal_to_target_multi(&keychain_update))
+                    })
+                    .1,
+            );
         }
         indexed_tx_graph_changeset.merge(graph.apply_update(tx_update));
 

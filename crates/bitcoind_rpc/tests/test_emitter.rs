@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet},
     ops::Deref,
 };
 
@@ -169,7 +169,7 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
     while let Some(emission) = emitter.next_block()? {
         let height = emission.block_height();
         let _ = chain.apply_update(emission.checkpoint)?;
-        let indexed_additions = indexed_tx_graph.apply_block_relevant(&emission.block, height);
+        let indexed_additions = indexed_tx_graph.apply_block(&emission.block, height);
         assert!(indexed_additions.is_empty());
     }
 
@@ -197,7 +197,7 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
         assert!(emitter.next_block()?.is_none());
 
         let mempool_txs = emitter.mempool()?;
-        let indexed_additions = indexed_tx_graph.batch_insert_unconfirmed(mempool_txs.new_txs);
+        let indexed_additions = indexed_tx_graph.filter_and_apply_update(mempool_txs.update);
         assert_eq!(
             indexed_additions
                 .tx_graph
@@ -230,7 +230,7 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
         let emission = emitter.next_block()?.expect("must get mined block");
         let height = emission.block_height();
         let _ = chain.apply_update(emission.checkpoint)?;
-        let indexed_additions = indexed_tx_graph.apply_block_relevant(&emission.block, height);
+        let indexed_additions = indexed_tx_graph.apply_block(&emission.block, height);
         assert!(indexed_additions.tx_graph.txs.is_empty());
         assert!(indexed_additions.tx_graph.txouts.is_empty());
         assert_eq!(indexed_additions.tx_graph.anchors, exp_anchors);
@@ -290,7 +290,7 @@ fn process_block(
     block_height: u32,
 ) -> anyhow::Result<()> {
     recv_chain.apply_update(CheckPoint::from_header(&block.header, block_height))?;
-    let _ = recv_graph.apply_block(block, block_height);
+    let _ = recv_graph.apply_block(&block, block_height);
     Ok(())
 }
 
@@ -315,7 +315,7 @@ fn get_balance(
     recv_graph: &IndexedTxGraph<BlockId, SpkTxOutIndex<()>>,
 ) -> anyhow::Result<Balance> {
     let chain_tip = recv_chain.tip().block_id();
-    let outpoints = recv_graph.index.outpoints().clone();
+    let outpoints = recv_graph.indexer().outpoints().clone();
     let balance = recv_graph.graph().balance(
         recv_chain,
         chain_tip,
@@ -453,7 +453,8 @@ fn mempool_avoids_re_emission() -> anyhow::Result<()> {
     // the first emission should include all transactions
     let emitted_txids = emitter
         .mempool()?
-        .new_txs
+        .update
+        .txs
         .into_iter()
         .map(|(tx, _)| tx.compute_txid())
         .collect::<BTreeSet<Txid>>();
@@ -464,7 +465,7 @@ fn mempool_avoids_re_emission() -> anyhow::Result<()> {
 
     // second emission should be empty
     assert!(
-        emitter.mempool()?.new_txs.is_empty(),
+        emitter.mempool()?.update.txs.is_empty(),
         "second emission should be empty"
     );
 
@@ -474,7 +475,7 @@ fn mempool_avoids_re_emission() -> anyhow::Result<()> {
     }
     while emitter.next_block()?.is_some() {}
     assert!(
-        emitter.mempool()?.new_txs.is_empty(),
+        emitter.mempool()?.update.txs.is_empty(),
         "third emission, after chain tip is extended, should also be empty"
     );
 
@@ -524,7 +525,8 @@ fn mempool_re_emits_if_tx_introduction_height_not_reached() -> anyhow::Result<()
     assert_eq!(
         emitter
             .mempool()?
-            .new_txs
+            .update
+            .txs
             .into_iter()
             .map(|(tx, _)| tx.compute_txid())
             .collect::<BTreeSet<_>>(),
@@ -534,7 +536,8 @@ fn mempool_re_emits_if_tx_introduction_height_not_reached() -> anyhow::Result<()
     assert_eq!(
         emitter
             .mempool()?
-            .new_txs
+            .update
+            .txs
             .into_iter()
             .map(|(tx, _)| tx.compute_txid())
             .collect::<BTreeSet<_>>(),
@@ -555,7 +558,8 @@ fn mempool_re_emits_if_tx_introduction_height_not_reached() -> anyhow::Result<()
                 .collect::<BTreeSet<_>>();
             let emitted_txids = emitter
                 .mempool()?
-                .new_txs
+                .update
+                .txs
                 .into_iter()
                 .map(|(tx, _)| tx.compute_txid())
                 .collect::<BTreeSet<_>>();
@@ -615,7 +619,8 @@ fn mempool_during_reorg() -> anyhow::Result<()> {
     assert_eq!(
         emitter
             .mempool()?
-            .new_txs
+            .update
+            .txs
             .into_iter()
             .map(|(tx, _)| tx.compute_txid())
             .collect::<BTreeSet<_>>(),
@@ -651,7 +656,8 @@ fn mempool_during_reorg() -> anyhow::Result<()> {
             // include mempool txs introduced at reorg height or greater
             let mempool = emitter
                 .mempool()?
-                .new_txs
+                .update
+                .txs
                 .into_iter()
                 .map(|(tx, _)| tx.compute_txid())
                 .collect::<BTreeSet<_>>();
@@ -667,7 +673,8 @@ fn mempool_during_reorg() -> anyhow::Result<()> {
 
             let mempool = emitter
                 .mempool()?
-                .new_txs
+                .update
+                .txs
                 .into_iter()
                 .map(|(tx, _)| tx.compute_txid())
                 .collect::<BTreeSet<_>>();
@@ -804,14 +811,15 @@ fn test_expect_tx_evicted() -> anyhow::Result<()> {
         &Address::from_script(&spk, Network::Regtest)?,
         Amount::ONE_BTC,
     )?;
+    let tx_1 = env.rpc_client().get_raw_transaction(&txid_1, None)?;
 
-    let mut emitter = Emitter::new(env.rpc_client(), chain.tip(), 1, HashSet::from([txid_1]));
+    let mut emitter = Emitter::new(env.rpc_client(), chain.tip(), 1, core::iter::once(tx_1));
     while let Some(emission) = emitter.next_block()? {
         let height = emission.block_height();
         chain.apply_update(CheckPoint::from_header(&emission.block.header, height))?;
     }
 
-    let changeset = graph.batch_insert_unconfirmed(emitter.mempool()?.new_txs);
+    let changeset = graph.filter_and_apply_update(emitter.mempool()?.update);
     assert!(changeset
         .tx_graph
         .txs
@@ -853,10 +861,13 @@ fn test_expect_tx_evicted() -> anyhow::Result<()> {
 
     // Check that mempool emission contains evicted txid.
     let mempool_event = emitter.mempool()?;
-    assert!(mempool_event.evicted_txids.contains(&txid_1));
+    assert!(mempool_event
+        .evicted
+        .iter()
+        .any(|(txid, _)| txid == &txid_1));
 
     // Update graph with evicted tx.
-    let _ = graph.batch_insert_relevant_evicted_at(mempool_event.evicted_ats());
+    let _ = graph.batch_insert_relevant_evicted_at(mempool_event.evicted);
 
     let canonical_txids = graph
         .graph()

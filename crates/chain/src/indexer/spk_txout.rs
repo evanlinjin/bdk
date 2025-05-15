@@ -4,9 +4,12 @@ use core::ops::RangeBounds;
 
 use crate::{
     collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap},
-    Indexer,
+    Anchor, TxPosInBlock,
 };
+use bdk_core::{BlockUpdate, MempoolUpdate, TxUpdate};
 use bitcoin::{Amount, OutPoint, ScriptBuf, SignedAmount, Transaction, TxOut, Txid};
+
+use super::{FilteringIndexer, Index, Indexer};
 
 /// An index storing [`TxOut`]s that have a script pubkey that matches those in a list.
 ///
@@ -60,27 +63,87 @@ impl<I> AsRef<SpkTxOutIndex<I>> for SpkTxOutIndex<I> {
     }
 }
 
-impl<I: Clone + Ord + core::fmt::Debug> Indexer for SpkTxOutIndex<I> {
+impl<I: Clone + Ord + core::fmt::Debug, A: Anchor> Index<A> for SpkTxOutIndex<I> {
     type ChangeSet = ();
 
-    fn index_txout(&mut self, outpoint: OutPoint, txout: &TxOut) -> Self::ChangeSet {
-        self.scan_txout(outpoint, txout);
-        Default::default()
+    fn reindex(&mut self, tx_update: &TxUpdate<A>) {
+        for tx in &tx_update.txs {
+            self.scan(tx);
+        }
+        for (op, txout) in &tx_update.txouts {
+            self.scan_txout(*op, txout);
+        }
     }
 
-    fn index_tx(&mut self, tx: &Transaction) -> Self::ChangeSet {
-        self.scan(tx);
-        Default::default()
-    }
+    fn apply_changeset(&mut self, _changeset: Self::ChangeSet) {}
 
     fn initial_changeset(&self) -> Self::ChangeSet {}
+}
 
-    fn apply_changeset(&mut self, _changeset: Self::ChangeSet) {
-        // This applies nothing.
+impl<I, A> Indexer<A> for SpkTxOutIndex<I>
+where
+    I: Clone + Ord + core::fmt::Debug,
+    A: Anchor,
+{
+    fn index(&mut self, _: &mut Self::ChangeSet, update: &TxUpdate<A>) {
+        for tx in &update.txs {
+            self.scan(tx);
+        }
+        for (op, txout) in &update.txouts {
+            self.scan_txout(*op, txout);
+        }
     }
+}
 
-    fn is_tx_relevant(&self, tx: &Transaction) -> bool {
-        self.is_relevant(tx)
+impl<I, A> FilteringIndexer<A, MempoolUpdate> for SpkTxOutIndex<I>
+where
+    I: Clone + Ord + core::fmt::Debug,
+    A: Anchor,
+{
+    fn index_and_filter(&mut self, _: &mut Self::ChangeSet, update: &MempoolUpdate) -> TxUpdate<A> {
+        let mut tx_update = TxUpdate::<A>::default();
+        if update.chronological {
+            for (tx, seen_at) in &update.txs {
+                self.scan(tx);
+                if self.is_relevant(tx) {
+                    tx_update.txs.push(tx.clone());
+                    tx_update.seen_ats.insert((tx.compute_txid(), *seen_at));
+                }
+            }
+        } else {
+            for (tx, _) in &update.txs {
+                self.scan(tx);
+            }
+            for (tx, seen_at) in &update.txs {
+                if self.is_relevant(tx) {
+                    tx_update.txs.push(tx.clone());
+                    tx_update.seen_ats.insert((tx.compute_txid(), *seen_at));
+                }
+            }
+        }
+        tx_update
+    }
+}
+
+impl<'b, I, A> FilteringIndexer<A, BlockUpdate<'b>> for SpkTxOutIndex<I>
+where
+    I: Clone + Ord + core::fmt::Debug,
+    A: Anchor + From<TxPosInBlock<'b>>,
+{
+    fn index_and_filter(
+        &mut self,
+        _: &mut Self::ChangeSet,
+        update: &BlockUpdate<'b>,
+    ) -> TxUpdate<A> {
+        let mut tx_update = TxUpdate::<A>::default();
+        for (tx, anchor) in update.txs::<A>() {
+            self.scan(tx);
+            if self.is_relevant(tx) {
+                tx_update.txs.push(tx.clone().into());
+                tx_update.anchors.insert((anchor, tx.compute_txid()));
+            }
+        }
+        tx_update
     }
 }
 
