@@ -164,8 +164,7 @@ fn filter_iter_handles_reorg() -> anyhow::Result<()> {
     assert_eq!(
         client.get_block_count()?,
         expected_initial_height,
-        "Block count should be {} after initial mine",
-        expected_initial_height
+        "Block count should be {expected_initial_height} after initial mine"
     );
 
     // 2. Create watched script
@@ -274,7 +273,7 @@ fn filter_iter_handles_reorg() -> anyhow::Result<()> {
 
     // 7. Simulate Reorg (Invalidate blocks B and A)
     println!("STEP: Invalidating original blocks B and A");
-    println!("Invalidating blocks B ({}) and A ({})", hash_105, hash_104);
+    println!("Invalidating blocks B ({hash_105}) and A ({hash_104})");
     client.invalidate_block(&hash_105)?;
     client.invalidate_block(&hash_104)?;
     // We should see 2 unconfirmed txs in mempool
@@ -291,7 +290,7 @@ fn filter_iter_handles_reorg() -> anyhow::Result<()> {
     println!("STEP: Mining replacement block A' (with send tx x2)");
     let hash_104_prime = env.mine_blocks(1, None)?[0];
     let height = client.get_block_count()?;
-    println!("Block {} (A') hash: {}", height, hash_104_prime);
+    println!("Block {height} (A') hash: {hash_104_prime}");
     assert_eq!(height, 104);
     assert_ne!(hash_104, hash_104_prime);
 
@@ -299,7 +298,7 @@ fn filter_iter_handles_reorg() -> anyhow::Result<()> {
     println!("STEP: Mining replacement block B' (no send tx)");
     let hash_105_prime = env.mine_blocks(1, None)?[0];
     let height = client.get_block_count()?;
-    println!("Block {} (B') hash: {}", height, hash_105_prime);
+    println!("Block {height} (B') hash: {hash_105_prime}");
     assert_eq!(height, 105);
     assert_ne!(hash_105, hash_105_prime);
 
@@ -407,8 +406,7 @@ fn filter_iter_handles_reorg_between_next_calls() -> anyhow::Result<()> {
     assert_eq!(
         client.get_block_count()?,
         expected_initial_height,
-        "Block count should be {} after initial mine",
-        expected_initial_height
+        "Block count should be {expected_initial_height} after initial mine"
     );
 
     // 2. Create watched script
