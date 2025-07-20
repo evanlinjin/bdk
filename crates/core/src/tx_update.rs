@@ -26,8 +26,8 @@ pub struct TxUpdate<A = ()> {
     pub txs: Vec<Arc<Transaction>>,
 
     /// Floating txouts. These are `TxOut`s that exist but the whole transaction wasn't included in
-    /// `txs` since only knowing about the output is important. These are often used to help determine
-    /// the fee of a wallet transaction.
+    /// `txs` since only knowing about the output is important. These are often used to help
+    /// determine the fee of a wallet transaction.
     pub txouts: BTreeMap<OutPoint, TxOut>,
 
     /// Transaction anchors. Anchors tells us a position in the chain where a transaction was
@@ -61,6 +61,17 @@ impl<A> Default for TxUpdate<A> {
             seen_ats: Default::default(),
             evicted_ats: Default::default(),
         }
+    }
+}
+
+impl<A> TxUpdate<A> {
+    /// Returns true if the `TxUpdate` contains no elements in any of its fields.
+    pub fn is_empty(&self) -> bool {
+        self.txs.is_empty()
+            && self.txouts.is_empty()
+            && self.anchors.is_empty()
+            && self.seen_ats.is_empty()
+            && self.evicted_ats.is_empty()
     }
 }
 

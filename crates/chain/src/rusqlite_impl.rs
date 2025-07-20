@@ -22,17 +22,14 @@ pub const SCHEMAS_TABLE_NAME: &str = "bdk_schemas";
 
 /// Initialize the schema table.
 fn init_schemas_table(db_tx: &Transaction) -> rusqlite::Result<()> {
-    let sql = format!("CREATE TABLE IF NOT EXISTS {}( name TEXT PRIMARY KEY NOT NULL, version INTEGER NOT NULL ) STRICT", SCHEMAS_TABLE_NAME);
+    let sql = format!("CREATE TABLE IF NOT EXISTS {SCHEMAS_TABLE_NAME}( name TEXT PRIMARY KEY NOT NULL, version INTEGER NOT NULL ) STRICT");
     db_tx.execute(&sql, ())?;
     Ok(())
 }
 
 /// Get schema version of `schema_name`.
 fn schema_version(db_tx: &Transaction, schema_name: &str) -> rusqlite::Result<Option<u32>> {
-    let sql = format!(
-        "SELECT version FROM {} WHERE name=:name",
-        SCHEMAS_TABLE_NAME
-    );
+    let sql = format!("SELECT version FROM {SCHEMAS_TABLE_NAME} WHERE name=:name");
     db_tx
         .query_row(&sql, named_params! { ":name": schema_name }, |row| {
             row.get::<_, u32>("version")
@@ -46,10 +43,7 @@ fn set_schema_version(
     schema_name: &str,
     schema_version: u32,
 ) -> rusqlite::Result<()> {
-    let sql = format!(
-        "REPLACE INTO {}(name, version) VALUES(:name, :version)",
-        SCHEMAS_TABLE_NAME,
-    );
+    let sql = format!("REPLACE INTO {SCHEMAS_TABLE_NAME}(name, version) VALUES(:name, :version)");
     db_tx.execute(
         &sql,
         named_params! { ":name": schema_name, ":version": schema_version },
@@ -272,12 +266,25 @@ impl tx_graph::ChangeSet<ConfirmationBlockTime> {
         )
     }
 
+    /// Get v3 of sqlite [tx_graph::ChangeSet] schema
+    pub fn schema_v3() -> String {
+        format!(
+            "ALTER TABLE {} ADD COLUMN first_seen INTEGER",
+            Self::TXS_TABLE_NAME,
+        )
+    }
+
     /// Initialize sqlite tables.
     pub fn init_sqlite_tables(db_tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
         migrate_schema(
             db_tx,
             Self::SCHEMA_NAME,
-            &[&Self::schema_v0(), &Self::schema_v1(), &Self::schema_v2()],
+            &[
+                &Self::schema_v0(),
+                &Self::schema_v1(),
+                &Self::schema_v2(),
+                &Self::schema_v3(),
+            ],
         )
     }
 
@@ -288,21 +295,25 @@ impl tx_graph::ChangeSet<ConfirmationBlockTime> {
         let mut changeset = Self::default();
 
         let mut statement = db_tx.prepare(&format!(
-            "SELECT txid, raw_tx, last_seen, last_evicted FROM {}",
+            "SELECT txid, raw_tx, first_seen, last_seen, last_evicted FROM {}",
             Self::TXS_TABLE_NAME,
         ))?;
         let row_iter = statement.query_map([], |row| {
             Ok((
                 row.get::<_, Impl<bitcoin::Txid>>("txid")?,
                 row.get::<_, Option<Impl<bitcoin::Transaction>>>("raw_tx")?,
+                row.get::<_, Option<u64>>("first_seen")?,
                 row.get::<_, Option<u64>>("last_seen")?,
                 row.get::<_, Option<u64>>("last_evicted")?,
             ))
         })?;
         for row in row_iter {
-            let (Impl(txid), tx, last_seen, last_evicted) = row?;
+            let (Impl(txid), tx, first_seen, last_seen, last_evicted) = row?;
             if let Some(Impl(tx)) = tx {
                 changeset.txs.insert(Arc::new(tx));
+            }
+            if let Some(first_seen) = first_seen {
+                changeset.first_seen.insert(txid, first_seen);
             }
             if let Some(last_seen) = last_seen {
                 changeset.last_seen.insert(txid, last_seen);
@@ -373,6 +384,18 @@ impl tx_graph::ChangeSet<ConfirmationBlockTime> {
             statement.execute(named_params! {
                 ":txid": Impl(tx.compute_txid()),
                 ":raw_tx": Impl(tx.as_ref().clone()),
+            })?;
+        }
+
+        let mut statement = db_tx.prepare_cached(&format!(
+            "INSERT INTO {}(txid, first_seen) VALUES(:txid, :first_seen) ON CONFLICT(txid) DO UPDATE SET first_seen=:first_seen",
+            Self::TXS_TABLE_NAME,
+        ))?;
+        for (&txid, &first_seen) in &self.first_seen {
+            let checked_time = first_seen.to_sql()?;
+            statement.execute(named_params! {
+                ":txid": Impl(txid),
+                ":first_seen": Some(checked_time),
             })?;
         }
 
@@ -521,6 +544,8 @@ impl keychain_txout::ChangeSet {
     pub const SCHEMA_NAME: &'static str = "bdk_keychaintxout";
     /// Name for table that stores last revealed indices per descriptor id.
     pub const LAST_REVEALED_TABLE_NAME: &'static str = "bdk_descriptor_last_revealed";
+    /// Name for table that stores derived spks.
+    pub const DERIVED_SPKS_TABLE_NAME: &'static str = "bdk_descriptor_derived_spks";
 
     /// Get v0 of sqlite [keychain_txout::ChangeSet] schema
     pub fn schema_v0() -> String {
@@ -533,10 +558,27 @@ impl keychain_txout::ChangeSet {
         )
     }
 
+    /// Get v1 of sqlite [keychain_txout::ChangeSet] schema
+    pub fn schema_v1() -> String {
+        format!(
+            "CREATE TABLE {} ( \
+            descriptor_id TEXT NOT NULL, \
+            spk_index INTEGER NOT NULL, \
+            spk BLOB NOT NULL, \
+            PRIMARY KEY (descriptor_id, spk_index) \
+            ) STRICT",
+            Self::DERIVED_SPKS_TABLE_NAME,
+        )
+    }
+
     /// Initialize sqlite tables for persisting
     /// [`KeychainTxOutIndex`](keychain_txout::KeychainTxOutIndex).
     pub fn init_sqlite_tables(db_tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
-        migrate_schema(db_tx, Self::SCHEMA_NAME, &[&Self::schema_v0()])
+        migrate_schema(
+            db_tx,
+            Self::SCHEMA_NAME,
+            &[&Self::schema_v0(), &Self::schema_v1()],
+        )
     }
 
     /// Construct [`KeychainTxOutIndex`](keychain_txout::KeychainTxOutIndex) from sqlite database
@@ -561,6 +603,26 @@ impl keychain_txout::ChangeSet {
             changeset.last_revealed.insert(descriptor_id, last_revealed);
         }
 
+        let mut statement = db_tx.prepare(&format!(
+            "SELECT descriptor_id, spk_index, spk FROM {}",
+            Self::DERIVED_SPKS_TABLE_NAME
+        ))?;
+        let row_iter = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Impl<DescriptorId>>("descriptor_id")?,
+                row.get::<_, u32>("spk_index")?,
+                row.get::<_, Impl<bitcoin::ScriptBuf>>("spk")?,
+            ))
+        })?;
+        for row in row_iter {
+            let (Impl(descriptor_id), spk_index, Impl(spk)) = row?;
+            changeset
+                .spk_cache
+                .entry(descriptor_id)
+                .or_default()
+                .insert(spk_index, spk);
+        }
+
         Ok(changeset)
     }
 
@@ -577,6 +639,20 @@ impl keychain_txout::ChangeSet {
                 ":descriptor_id": Impl(descriptor_id),
                 ":last_revealed": last_revealed,
             })?;
+        }
+
+        let mut statement = db_tx.prepare_cached(&format!(
+            "REPLACE INTO {}(descriptor_id, spk_index, spk) VALUES(:descriptor_id, :spk_index, :spk)",
+            Self::DERIVED_SPKS_TABLE_NAME,
+        ))?;
+        for (&descriptor_id, spks) in &self.spk_cache {
+            for (&spk_index, spk) in spks {
+                statement.execute(named_params! {
+                    ":descriptor_id": Impl(descriptor_id),
+                    ":spk_index": spk_index,
+                    ":spk": Impl(spk.clone()),
+                })?;
+            }
         }
 
         Ok(())
@@ -653,7 +729,7 @@ mod test {
     }
 
     #[test]
-    fn v0_to_v2_schema_migration_is_backward_compatible() -> anyhow::Result<()> {
+    fn v0_to_v3_schema_migration_is_backward_compatible() -> anyhow::Result<()> {
         type ChangeSet = tx_graph::ChangeSet<ConfirmationBlockTime>;
         let mut conn = rusqlite::Connection::open_in_memory()?;
 
@@ -717,12 +793,12 @@ mod test {
                     ":block_hash": Impl(anchor_block.hash),
                 }) {
                     Ok(updated) => assert_eq!(updated, 1),
-                    Err(err) => panic!("update failed: {}", err),
+                    Err(err) => panic!("update failed: {err}"),
                 }
             }
         }
 
-        // Apply v1 & v2 sqlite schema to tables with data
+        // Apply v1, v2, v3 sqlite schema to tables with data
         {
             let db_tx = conn.transaction()?;
             migrate_schema(
@@ -732,6 +808,7 @@ mod test {
                     &ChangeSet::schema_v0(),
                     &ChangeSet::schema_v1(),
                     &ChangeSet::schema_v2(),
+                    &ChangeSet::schema_v3(),
                 ],
             )?;
             db_tx.commit()?;
@@ -743,6 +820,45 @@ mod test {
             let changeset = ChangeSet::from_sqlite(&db_tx)?;
             db_tx.commit()?;
             assert!(changeset.anchors.contains(&(anchor, txid)));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn can_persist_first_seen() -> anyhow::Result<()> {
+        use bitcoin::hashes::Hash;
+
+        type ChangeSet = tx_graph::ChangeSet<ConfirmationBlockTime>;
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+
+        // Init tables
+        {
+            let db_tx = conn.transaction()?;
+            ChangeSet::init_sqlite_tables(&db_tx)?;
+            db_tx.commit()?;
+        }
+
+        let txid = bitcoin::Txid::all_zeros();
+        let first_seen = 100;
+
+        // Persist `first_seen`
+        {
+            let changeset = ChangeSet {
+                first_seen: [(txid, first_seen)].into(),
+                ..Default::default()
+            };
+            let db_tx = conn.transaction()?;
+            changeset.persist_to_sqlite(&db_tx)?;
+            db_tx.commit()?;
+        }
+
+        // Load from sqlite should succeed
+        {
+            let db_tx = conn.transaction()?;
+            let changeset = ChangeSet::from_sqlite(&db_tx)?;
+            db_tx.commit()?;
+            assert_eq!(changeset.first_seen.get(&txid), Some(&first_seen));
         }
 
         Ok(())

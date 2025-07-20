@@ -1,3 +1,4 @@
+use bdk_chain::keychain_txout::DEFAULT_LOOKAHEAD;
 use serde_json::json;
 use std::cmp;
 use std::collections::HashMap;
@@ -19,9 +20,9 @@ use bdk_chain::miniscript::{
     psbt::PsbtExt,
     Descriptor, DescriptorPublicKey, ForEachKey,
 };
+use bdk_chain::CanonicalizationParams;
 use bdk_chain::ConfirmationBlockTime;
 use bdk_chain::{
-    indexed_tx_graph,
     indexer::keychain_txout::{self, KeychainTxOutIndex},
     local_chain::{self, LocalChain},
     tx_graph, ChainOracle, DescriptorExt, FullTxOut, IndexedTxGraph, Merge,
@@ -374,7 +375,8 @@ where
     // get the selected plan utxos
     let selected: Vec<_> = selector.apply_selection(&plan_utxos).collect();
 
-    // if the selection tells us to use change and the change value is sufficient, we add it as an output
+    // if the selection tells us to use change and the change value is sufficient, we add it as an
+    // output
     let mut change_info = Option::<ChangeInfo>::None;
     let drain = selector.drain(target, change_policy);
     if drain.value > min_drain_value {
@@ -431,7 +433,12 @@ pub fn planned_utxos<O: ChainOracle>(
     let outpoints = graph.index.outpoints();
     graph
         .graph()
-        .try_filter_chain_unspents(chain, chain_tip, outpoints.iter().cloned())?
+        .try_filter_chain_unspents(
+            chain,
+            chain_tip,
+            CanonicalizationParams::default(),
+            outpoints.iter().cloned(),
+        )?
         .filter_map(|((k, i), full_txo)| -> Option<Result<PlanUtxo, _>> {
             let desc = graph
                 .index
@@ -481,12 +488,12 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
                         ..Default::default()
                     })?;
                     let addr = Address::from_script(spk.as_script(), network)?;
-                    println!("[address @ {}] {}", spk_i, addr);
+                    println!("[address @ {spk_i}] {addr}");
                     Ok(())
                 }
                 AddressCmd::Index => {
                     for (keychain, derivation_index) in index.last_revealed_indices() {
-                        println!("{:?}: {}", keychain, derivation_index);
+                        println!("{keychain:?}: {derivation_index}");
                     }
                     Ok(())
                 }
@@ -516,7 +523,7 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
                 title_str: &'a str,
                 items: impl IntoIterator<Item = (&'a str, Amount)>,
             ) {
-                println!("{}:", title_str);
+                println!("{title_str}:");
                 for (name, amount) in items.into_iter() {
                     println!("    {:<10} {:>12} sats", name, amount.to_sat())
                 }
@@ -525,6 +532,7 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
             let balance = graph.graph().try_balance(
                 chain,
                 chain.get_chain_tip()?,
+                CanonicalizationParams::default(),
                 graph.index.outpoints().iter().cloned(),
                 |(k, _), _| k == &Keychain::Internal,
             )?;
@@ -566,7 +574,12 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
                 } => {
                     let txouts = graph
                         .graph()
-                        .try_filter_chain_txouts(chain, chain_tip, outpoints.iter().cloned())?
+                        .try_filter_chain_txouts(
+                            chain,
+                            chain_tip,
+                            CanonicalizationParams::default(),
+                            outpoints.iter().cloned(),
+                        )?
                         .filter(|(_, full_txo)| match (spent, unspent) {
                             (true, false) => full_txo.spent_by.is_some(),
                             (false, true) => full_txo.spent_by.is_none(),
@@ -731,9 +744,9 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
 
                             let changeset = graph.insert_tx(tx);
 
-                            // We know the tx is at least unconfirmed now. Note if persisting here fails,
-                            // it's not a big deal since we can always find it again from the
-                            // blockchain.
+                            // We know the tx is at least unconfirmed now. Note if persisting here
+                            // fails, it's not a big deal since we can
+                            // always find it again from the blockchain.
                             db.lock().unwrap().append(&ChangeSet {
                                 tx_graph: changeset.tx_graph,
                                 indexer: changeset.indexer,
@@ -741,7 +754,8 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args>(
                             })?;
                         }
                         Err(e) => {
-                            // We failed to broadcast, so allow our change address to be used in the future
+                            // We failed to broadcast, so allow our change address to be used in the
+                            // future
                             let (change_keychain, _) = graph
                                 .index
                                 .keychains()
@@ -804,11 +818,10 @@ pub fn init_or_load<CS: clap::Subcommand, S: clap::Args>(
         Commands::Generate { network } => generate_bip86_helper(network).map(|_| None),
         // try load
         _ => {
-            let (db, changeset) =
+            let (mut db, changeset) =
                 Store::<ChangeSet>::load(db_magic, db_path).context("could not open file store")?;
 
             let changeset = changeset.expect("should not be empty");
-
             let network = changeset.network.expect("changeset network");
 
             let chain = Mutex::new({
@@ -818,23 +831,27 @@ pub fn init_or_load<CS: clap::Subcommand, S: clap::Args>(
                 chain
             });
 
-            let graph = Mutex::new({
-                // insert descriptors and apply loaded changeset
-                let mut index = KeychainTxOutIndex::default();
-                if let Some(desc) = changeset.descriptor {
-                    index.insert_descriptor(Keychain::External, desc)?;
-                }
-                if let Some(change_desc) = changeset.change_descriptor {
-                    index.insert_descriptor(Keychain::Internal, change_desc)?;
-                }
-                let mut graph = KeychainTxGraph::new(index);
-                graph.apply_changeset(indexed_tx_graph::ChangeSet {
-                    tx_graph: changeset.tx_graph,
-                    indexer: changeset.indexer,
-                });
-                graph
-            });
+            let (graph, changeset) = IndexedTxGraph::from_changeset(
+                (changeset.tx_graph, changeset.indexer).into(),
+                |c| -> anyhow::Result<_> {
+                    let mut indexer =
+                        KeychainTxOutIndex::from_changeset(DEFAULT_LOOKAHEAD, true, c);
+                    if let Some(desc) = changeset.descriptor {
+                        indexer.insert_descriptor(Keychain::External, desc)?;
+                    }
+                    if let Some(change_desc) = changeset.change_descriptor {
+                        indexer.insert_descriptor(Keychain::Internal, change_desc)?;
+                    }
+                    Ok(indexer)
+                },
+            )?;
+            db.append(&ChangeSet {
+                indexer: changeset.indexer,
+                tx_graph: changeset.tx_graph,
+                ..Default::default()
+            })?;
 
+            let graph = Mutex::new(graph);
             let db = Mutex::new(db);
 
             Ok(Some(Init {
@@ -915,8 +932,8 @@ fn generate_bip86_helper(network: impl Into<NetworkKind>) -> anyhow::Result<()> 
     let (internal_descriptor, internal_keymap) =
         <Descriptor<DescriptorPublicKey>>::parse_descriptor(&secp, internal_desc)?;
     println!("Public");
-    println!("{}", descriptor);
-    println!("{}", internal_descriptor);
+    println!("{descriptor}");
+    println!("{internal_descriptor}");
     println!("\nPrivate");
     println!("{}", descriptor.to_string_with_secret(&keymap));
     println!(

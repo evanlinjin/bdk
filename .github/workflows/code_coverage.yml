@@ -2,6 +2,8 @@ on: [push, pull_request]
 
 name: Code Coverage
 
+permissions: {}
+
 jobs:
   Codecov:
     name: Code Coverage
@@ -26,7 +28,7 @@ jobs:
             profile: minimal
             components: llvm-tools-preview
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2.7.7
+        uses: Swatinem/rust-cache@v2.7.8
       - name: Install grcov
         run: if [[ ! -e ~/.cargo/bin/grcov ]]; then cargo install grcov; fi
       - name: Test

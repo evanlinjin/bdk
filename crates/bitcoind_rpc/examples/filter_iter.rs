@@ -31,6 +31,7 @@ fn main() -> anyhow::Result<()> {
     let (descriptor, _) = Descriptor::parse_descriptor(&secp, EXTERNAL)?;
     let (change_descriptor, _) = Descriptor::parse_descriptor(&secp, INTERNAL)?;
     let (mut chain, _) = LocalChain::from_genesis_hash(genesis_block(NETWORK).block_hash());
+
     let mut graph = IndexedTxGraph::<ConfirmationBlockTime, KeychainTxOutIndex<&str>>::new({
         let mut index = KeychainTxOutIndex::default();
         index.insert_descriptor("external", descriptor.clone())?;
@@ -72,7 +73,7 @@ fn main() -> anyhow::Result<()> {
             // apply relevant blocks
             if let Event::Block(EventInner { height, ref block }) = event {
                 let _ = graph.apply_block_relevant(block, height);
-                println!("Matched block {}", curr);
+                println!("Matched block {curr}");
             }
             if curr % 1000 == 0 {
                 let progress = (curr - start_height) as f32 / blocks_to_scan as f32;
@@ -92,6 +93,7 @@ fn main() -> anyhow::Result<()> {
         .filter_chain_unspents(
             &chain,
             chain.tip().block_id(),
+            Default::default(),
             graph.index.outpoints().clone(),
         )
         .collect();
@@ -105,7 +107,7 @@ fn main() -> anyhow::Result<()> {
 
     let unused_spk = graph.index.reveal_next_spk("external").unwrap().0 .1;
     let unused_address = Address::from_script(&unused_spk, NETWORK)?;
-    println!("Next external address: {}", unused_address);
+    println!("Next external address: {unused_address}");
 
     Ok(())
 }

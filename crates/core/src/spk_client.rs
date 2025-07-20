@@ -26,13 +26,13 @@ impl<I: core::fmt::Debug + core::any::Any> core::fmt::Display for SyncItem<'_, I
         match self {
             SyncItem::Spk(i, spk) => {
                 if (i as &dyn core::any::Any).is::<()>() {
-                    write!(f, "script '{}'", spk)
+                    write!(f, "script '{spk}'")
                 } else {
-                    write!(f, "script {:?} '{}'", i, spk)
+                    write!(f, "script {i:?} '{spk}'")
                 }
             }
-            SyncItem::Txid(txid) => write!(f, "txid '{}'", txid),
-            SyncItem::OutPoint(op) => write!(f, "outpoint '{}'", op),
+            SyncItem::Txid(txid) => write!(f, "txid '{txid}'"),
+            SyncItem::OutPoint(op) => write!(f, "outpoint '{op}'"),
         }
     }
 }
@@ -137,7 +137,8 @@ impl<I> SyncRequestBuilder<I> {
     /// # Example
     ///
     /// Sync revealed script pubkeys obtained from a
-    /// [`KeychainTxOutIndex`](../../bdk_chain/indexer/keychain_txout/struct.KeychainTxOutIndex.html).
+    /// [`KeychainTxOutIndex`](../../bdk_chain/indexer/keychain_txout/struct.KeychainTxOutIndex.
+    /// html).
     ///
     /// ```rust
     /// # use bdk_chain::spk_client::SyncRequest;
@@ -403,6 +404,13 @@ impl<A> Default for SyncResponse<A> {
     }
 }
 
+impl<A> SyncResponse<A> {
+    /// Returns true if the `SyncResponse` is empty.
+    pub fn is_empty(&self) -> bool {
+        self.tx_update.is_empty() && self.chain_update.is_none()
+    }
+}
+
 /// Builds a [`FullScanRequest`].
 ///
 /// Construct with [`FullScanRequest::builder`].
@@ -557,6 +565,15 @@ impl<K, A> Default for FullScanResponse<K, A> {
             chain_update: Default::default(),
             last_active_indices: Default::default(),
         }
+    }
+}
+
+impl<K, A> FullScanResponse<K, A> {
+    /// Returns true if the `FullScanResponse` is empty.
+    pub fn is_empty(&self) -> bool {
+        self.tx_update.is_empty()
+            && self.last_active_indices.is_empty()
+            && self.chain_update.is_none()
     }
 }
 
