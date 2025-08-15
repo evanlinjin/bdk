@@ -42,11 +42,13 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
     /// Electrum. Typically used to pre-populate the cache from an existing `TxGraph`.
     pub fn populate_anchor_cache(
         &self,
-        anchors: impl IntoIterator<Item = (Txid, ConfirmationBlockTime)>,
+        tx_anchors: impl IntoIterator<Item = (Txid, impl IntoIterator<Item = ConfirmationBlockTime>)>,
     ) {
         let mut cache = self.anchor_cache.lock().unwrap();
-        for (txid, anchor) in anchors {
-            cache.insert((txid, anchor.block_id.hash), anchor);
+        for (txid, anchors) in tx_anchors {
+            for anchor in anchors {
+                cache.insert((txid, anchor.block_id.hash), anchor);
+            }
         }
     }
 
