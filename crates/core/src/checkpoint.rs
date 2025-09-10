@@ -2,7 +2,7 @@ use core::fmt;
 use core::ops::RangeBounds;
 
 use alloc::sync::Arc;
-use bitcoin::{block::Header, BlockHash};
+use bitcoin::{block::Header, Block, BlockHash};
 
 use crate::BlockId;
 
@@ -22,10 +22,10 @@ impl<D> Clone for CheckPoint<D> {
 /// The internal contents of [`CheckPoint`].
 #[derive(Debug)]
 struct CPInner<D> {
-    /// Block id
+    /// Block id.
     block_id: BlockId,
-    /// Data.
-    data: D,
+    /// Block data.
+    data: Option<D>,
     /// Previous checkpoint (if any).
     prev: Option<Arc<CPInner<D>>>,
 }
@@ -68,17 +68,39 @@ impl<D> Drop for CPInner<D> {
 pub trait ToBlockHash {
     /// Returns the [`BlockHash`] for the associated [`CheckPoint`] `data` type.
     fn to_blockhash(&self) -> BlockHash;
+
+    /// Returns `None` if the type has no knowledge of the previous blockhash or if there is no
+    /// previous blockhash.
+    fn prev_blockhash(&self) -> Option<BlockHash>;
 }
 
 impl ToBlockHash for BlockHash {
     fn to_blockhash(&self) -> BlockHash {
         *self
     }
+
+    fn prev_blockhash(&self) -> Option<BlockHash> {
+        None
+    }
 }
 
 impl ToBlockHash for Header {
     fn to_blockhash(&self) -> BlockHash {
         self.block_hash()
+    }
+
+    fn prev_blockhash(&self) -> Option<BlockHash> {
+        Some(self.prev_blockhash)
+    }
+}
+
+impl ToBlockHash for Block {
+    fn to_blockhash(&self) -> BlockHash {
+        self.block_hash()
+    }
+
+    fn prev_blockhash(&self) -> Option<BlockHash> {
+        Some(self.header.prev_blockhash)
     }
 }
 
@@ -92,19 +114,6 @@ impl<D> PartialEq for CheckPoint<D> {
 
 // Methods for any `D`
 impl<D> CheckPoint<D> {
-    /// Get a reference of the `data` of the checkpoint.
-    pub fn data_ref(&self) -> &D {
-        &self.0.data
-    }
-
-    /// Get the `data` of a the checkpoint.
-    pub fn data(&self) -> D
-    where
-        D: Clone,
-    {
-        self.0.data.clone()
-    }
-
     /// Get the [`BlockId`] of the checkpoint.
     pub fn block_id(&self) -> BlockId {
         self.0.block_id
@@ -193,18 +202,29 @@ impl<D> CheckPoint<D> {
 // Methods where `D: ToBlockHash`
 impl<D> CheckPoint<D>
 where
-    D: ToBlockHash + fmt::Debug + Copy,
+    D: ToBlockHash,
 {
     /// Construct a new base [`CheckPoint`] from given `height` and `data` at the front of a linked
     /// list.
     pub fn new(height: u32, data: D) -> Self {
+        let prev = match data.prev_blockhash() {
+            Some(hash) if height > 0 => Some(Arc::new(CPInner::<D> {
+                block_id: BlockId {
+                    height: height - 1,
+                    hash,
+                },
+                data: None,
+                prev: None,
+            })),
+            _ => None,
+        };
         Self(Arc::new(CPInner {
             block_id: BlockId {
                 height,
                 hash: data.to_blockhash(),
             },
-            data,
-            prev: None,
+            data: Some(data),
+            prev,
         }))
     }
 
@@ -246,7 +266,10 @@ where
     ///
     /// This panics if called with a genesis block that differs from that of `self`.
     #[must_use]
-    pub fn insert(self, height: u32, data: D) -> Self {
+    pub fn insert(self, height: u32, data: D) -> Self
+    where
+        D: Clone + fmt::Debug,
+    {
         let mut cp = self.clone();
         let mut tail = vec![];
         let base = loop {
@@ -265,7 +288,10 @@ where
                 break cp;
             }
 
-            tail.push((cp.height(), cp.data()));
+            if let Some(data) = cp.data() {
+                tail.push((cp.height(), data));
+            }
+
             cp = cp.prev().expect("will break before genesis block");
         };
 
@@ -284,12 +310,25 @@ where
                     height,
                     hash: data.to_blockhash(),
                 },
-                data,
+                data: Some(data),
                 prev: Some(self.0),
             })))
         } else {
             Err(self)
         }
+    }
+
+    /// Get a reference of the `data` of the checkpoint.
+    pub fn data_ref(&self) -> Option<&D> {
+        self.0.data.as_ref()
+    }
+
+    /// Get the `data` of a the checkpoint.
+    pub fn data(&self) -> Option<D>
+    where
+        D: Clone,
+    {
+        self.0.data.clone()
     }
 }
 

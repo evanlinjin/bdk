@@ -27,7 +27,9 @@ where
 
         for cp in init_cp.iter() {
             if cp.height() >= start_height {
-                extension.insert(cp.height(), cp.data());
+                if let Some(data) = cp.data() {
+                    extension.insert(cp.height(), data);
+                }
             } else {
                 base = Some(cp);
                 break;
@@ -325,7 +327,7 @@ where
             blocks: self
                 .tip
                 .iter()
-                .map(|cp| (cp.height(), Some(cp.data())))
+                .filter_map(|cp| Some((cp.height(), Some(cp.data()?))))
                 .collect(),
         }
     }
@@ -634,7 +636,9 @@ where
         match (curr_orig.as_ref(), curr_update.as_ref()) {
             // Update block that doesn't exist in the original chain
             (o, Some(u)) if Some(u.height()) > o.map(|o| o.height()) => {
-                changeset.blocks.insert(u.height(), Some(u.data()));
+                if let Some(data) = u.data() {
+                    changeset.blocks.insert(u.height(), Some(data));
+                }
                 prev_update = curr_update.take();
             }
             // Original block that isn't in the update
@@ -685,7 +689,11 @@ where
                 } else {
                     // We have an invalidation height so we set the height to the updated hash and
                     // also purge all the original chain block hashes above this block.
-                    changeset.blocks.insert(u.height(), Some(u.data()));
+
+                    // This will either add the update block or remove the old block, depending on
+                    // whether the update block is empty or not.
+                    changeset.blocks.insert(u.height(), u.data());
+
                     for invalidated_height in potentially_invalidated_heights.drain(..) {
                         changeset.blocks.insert(invalidated_height, None);
                     }
