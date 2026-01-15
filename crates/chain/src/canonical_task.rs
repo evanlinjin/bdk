@@ -14,6 +14,8 @@ type NotCanonicalSet = HashSet<Txid>;
 /// Represents the current stage of canonicalization processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CanonicalStage {
+    /// Processing assumed-canonical transactions.
+    AssumedTxs,
     /// Processing directly anchored transactions.
     AnchoredTxs,
     /// Processing transactions seen in mempool.
@@ -64,38 +66,82 @@ impl<'g, A: Anchor> ChainQuery for CanonicalizationTask<'g, A> {
     type Output = CanonicalView<A>;
 
     fn next_query(&mut self) -> Option<ChainRequest> {
-        // Try to advance to the next stage if needed
-        self.try_advance();
+        loop {
+            match self.current_stage {
+                CanonicalStage::AssumedTxs => {
+                    while let Some((txid, tx)) = self.unprocessed_assumed_txs.next() {
+                        if !self.is_canonicalized(txid) {
+                            self.mark_canonical(txid, tx, CanonicalReason::assumed());
+                        }
+                    }
+                    self.current_stage = CanonicalStage::AnchoredTxs;
+                    continue;
+                }
+                CanonicalStage::AnchoredTxs => {
+                    if let Some((_txid, _, anchors)) = self.unprocessed_anchored_txs.front() {
+                        let block_ids =
+                            anchors.iter().map(|anchor| anchor.anchor_block()).collect();
+                        return Some(ChainRequest {
+                            chain_tip: self.chain_tip,
+                            block_ids,
+                        });
+                    }
+                    self.current_stage = CanonicalStage::SeenTxs;
+                    continue;
+                }
+                CanonicalStage::SeenTxs => {
+                    // Process all seen transactions at once
+                    while let Some((txid, tx, last_seen)) = self.unprocessed_seen_txs.next() {
+                        debug_assert!(
+                            !tx.is_coinbase(),
+                            "Coinbase txs must not have `last_seen` (in mempool) value"
+                        );
+                        if !self.is_canonicalized(txid) {
+                            let observed_in = ObservedIn::Mempool(last_seen);
+                            self.mark_canonical(
+                                txid,
+                                tx,
+                                CanonicalReason::from_observed_in(observed_in),
+                            );
+                        }
+                    }
+                    self.current_stage = CanonicalStage::LeftOverTxs;
+                    continue;
+                }
+                CanonicalStage::LeftOverTxs => {
+                    // Process all leftover transactions at once
+                    while let Some((txid, tx, height)) = self.unprocessed_leftover_txs.pop_front() {
+                        if !self.is_canonicalized(txid) && !tx.is_coinbase() {
+                            let observed_in = ObservedIn::Block(height);
+                            self.mark_canonical(
+                                txid,
+                                tx,
+                                CanonicalReason::from_observed_in(observed_in),
+                            );
+                        }
+                    }
 
-        match self.current_stage {
-            CanonicalStage::AnchoredTxs => {
-                // Process directly anchored transactions first
-                if let Some((_txid, _, anchors)) = self.unprocessed_anchored_txs.front() {
-                    let block_ids = anchors.iter().map(|anchor| anchor.anchor_block()).collect();
-                    return Some(ChainRequest {
-                        chain_tip: self.chain_tip,
-                        block_ids,
-                    });
+                    self.current_stage = CanonicalStage::TransitivelyAnchoredTxs;
+                    continue;
                 }
-                None
-            }
-            CanonicalStage::TransitivelyAnchoredTxs => {
-                // Process transitively anchored transactions last
-                if let Some((_txid, _, anchors)) =
-                    self.unprocessed_transitively_anchored_txs.front()
-                {
-                    let block_ids = anchors.iter().map(|anchor| anchor.anchor_block()).collect();
-                    return Some(ChainRequest {
-                        chain_tip: self.chain_tip,
-                        block_ids,
-                    });
+                CanonicalStage::TransitivelyAnchoredTxs => {
+                    if let Some((_txid, _, anchors)) =
+                        self.unprocessed_transitively_anchored_txs.front()
+                    {
+                        let block_ids =
+                            anchors.iter().map(|anchor| anchor.anchor_block()).collect();
+                        return Some(ChainRequest {
+                            chain_tip: self.chain_tip,
+                            block_ids,
+                        });
+                    }
+                    self.current_stage = CanonicalStage::Finished;
+                    continue;
                 }
-                None
-            }
-            CanonicalStage::SeenTxs | CanonicalStage::LeftOverTxs | CanonicalStage::Finished => {
-                // These stages don't need queries
-                None
-            }
+                CanonicalStage::Finished => {
+                    return None;
+                }
+            };
         }
     }
 
@@ -167,7 +213,10 @@ impl<'g, A: Anchor> ChainQuery for CanonicalizationTask<'g, A> {
                     // If no confirmed anchor, we keep the transitive canonicalization status
                 }
             }
-            CanonicalStage::SeenTxs | CanonicalStage::LeftOverTxs | CanonicalStage::Finished => {
+            CanonicalStage::AssumedTxs
+            | CanonicalStage::SeenTxs
+            | CanonicalStage::LeftOverTxs
+            | CanonicalStage::Finished => {
                 // These stages don't generate queries and shouldn't receive responses
                 debug_assert!(
                     false,
@@ -176,13 +225,6 @@ impl<'g, A: Anchor> ChainQuery for CanonicalizationTask<'g, A> {
                 );
             }
         }
-    }
-
-    fn is_finished(&mut self) -> bool {
-        // Try to advance stages first
-        self.try_advance();
-        // Check if we've reached the Finished stage
-        self.current_stage == CanonicalStage::Finished
     }
 
     fn finish(self) -> Self::Output {
@@ -266,49 +308,6 @@ impl<'g, A: Anchor> ChainQuery for CanonicalizationTask<'g, A> {
 }
 
 impl<'g, A: Anchor> CanonicalizationTask<'g, A> {
-    /// Try to advance to the next stage if the current stage is complete.
-    /// The loop continues through stages that process all their transactions at once
-    /// (SeenTxs and LeftOverTxs) to avoid needing multiple calls.
-    fn try_advance(&mut self) {
-        loop {
-            let advanced = match self.current_stage {
-                CanonicalStage::AnchoredTxs => {
-                    if self.unprocessed_anchored_txs.is_empty() {
-                        self.current_stage = CanonicalStage::SeenTxs;
-                        true // Continue to process SeenTxs immediately
-                    } else {
-                        false // Still have work, stop advancing
-                    }
-                }
-                CanonicalStage::SeenTxs => {
-                    // Process all seen transactions at once
-                    self.process_seen_txs();
-                    self.current_stage = CanonicalStage::LeftOverTxs;
-                    true // Continue to process LeftOverTxs immediately
-                }
-                CanonicalStage::LeftOverTxs => {
-                    // Process all leftover transactions at once
-                    self.process_leftover_txs();
-                    self.current_stage = CanonicalStage::TransitivelyAnchoredTxs;
-                    false // Stop here - TransitivelyAnchoredTxs need queries
-                }
-                CanonicalStage::TransitivelyAnchoredTxs => {
-                    if self.unprocessed_transitively_anchored_txs.is_empty() {
-                        self.current_stage = CanonicalStage::Finished;
-                    }
-                    false // Stop advancing
-                }
-                CanonicalStage::Finished => {
-                    false // Already finished, nothing to do
-                }
-            };
-
-            if !advanced {
-                break;
-            }
-        }
-    }
-
     /// Creates a new canonicalization task.
     pub fn new(
         tx_graph: &'g TxGraph<A>,
@@ -333,7 +332,7 @@ impl<'g, A: Anchor> CanonicalizationTask<'g, A> {
                 .filter_map(|(last_seen, txid)| Some((txid, tx_graph.get_tx(txid)?, last_seen))),
         );
 
-        let mut task = Self {
+        Self {
             tx_graph,
             chain_tip,
 
@@ -348,47 +347,12 @@ impl<'g, A: Anchor> CanonicalizationTask<'g, A> {
 
             canonical_order: Vec::new(),
             direct_anchors: HashMap::new(),
-            current_stage: CanonicalStage::AnchoredTxs,
-        };
-
-        // process assumed transactions first (they don't need queries)
-        task.process_assumed_txs();
-
-        task
+            current_stage: CanonicalStage::AssumedTxs,
+        }
     }
 
     fn is_canonicalized(&self, txid: Txid) -> bool {
         self.canonical.contains_key(&txid) || self.not_canonical.contains(&txid)
-    }
-
-    fn process_assumed_txs(&mut self) {
-        while let Some((txid, tx)) = self.unprocessed_assumed_txs.next() {
-            if !self.is_canonicalized(txid) {
-                self.mark_canonical(txid, tx, CanonicalReason::assumed());
-            }
-        }
-    }
-
-    fn process_seen_txs(&mut self) {
-        while let Some((txid, tx, last_seen)) = self.unprocessed_seen_txs.next() {
-            debug_assert!(
-                !tx.is_coinbase(),
-                "Coinbase txs must not have `last_seen` (in mempool) value"
-            );
-            if !self.is_canonicalized(txid) {
-                let observed_in = ObservedIn::Mempool(last_seen);
-                self.mark_canonical(txid, tx, CanonicalReason::from_observed_in(observed_in));
-            }
-        }
-    }
-
-    fn process_leftover_txs(&mut self) {
-        while let Some((txid, tx, height)) = self.unprocessed_leftover_txs.pop_front() {
-            if !self.is_canonicalized(txid) && !tx.is_coinbase() {
-                let observed_in = ObservedIn::Block(height);
-                self.mark_canonical(txid, tx, CanonicalReason::from_observed_in(observed_in));
-            }
-        }
     }
 
     fn mark_canonical(&mut self, txid: Txid, tx: Arc<Transaction>, reason: CanonicalReason<A>) {

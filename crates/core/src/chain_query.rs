@@ -43,7 +43,7 @@ pub trait ChainQuery<B = BlockId> {
     /// Returns the next query needed, if any.
     ///
     /// This method should return `Some(request)` if more information is needed,
-    /// or `None` if no more queries are required.
+    /// or `None` if no more queries are required and `finish` can be called.
     fn next_query(&mut self) -> Option<ChainRequest<B>>;
 
     /// Resolves a query with the given response.
@@ -51,14 +51,6 @@ pub trait ChainQuery<B = BlockId> {
     /// This method processes the response to a previous query request and updates
     /// the internal state accordingly.
     fn resolve_query(&mut self, response: ChainResponse<B>);
-
-    /// Returns true if the query process is complete and ready to finish.
-    ///
-    /// The default implementation returns `true` when there are no more queries needed.
-    /// Implementors can override this for more specific behavior if needed.
-    fn is_finished(&mut self) -> bool {
-        self.next_query().is_none()
-    }
 
     /// Completes the query process and returns the final output.
     ///
