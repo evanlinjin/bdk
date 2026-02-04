@@ -1026,3 +1026,160 @@ proptest! {
         prop_assert_eq!(heights, exp_heights);
     }
 }
+
+/// A test block type that returns `Some` for `prev_blockhash`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TestBlock {
+    hash: BlockHash,
+    prev_hash: BlockHash,
+}
+
+impl bdk_core::ToBlockHash for TestBlock {
+    fn to_blockhash(&self) -> BlockHash {
+        self.hash
+    }
+
+    fn prev_blockhash(&self) -> Option<BlockHash> {
+        Some(self.prev_hash)
+    }
+}
+
+/// Test that `prev_blockhash` can invalidate blocks in the original chain.
+///
+/// ```text
+///        | 0 | 1 | 2 | 3 | 4 |
+/// chain  | _   A   B       D
+/// update | _   A       C'(prev=B')
+/// result | _   A       C'
+/// ```
+///
+/// The update at height 3 has `prev_blockhash = B'` which conflicts with the original `B` at
+/// height 2. This should invalidate blocks at heights 2 and 4.
+#[test]
+fn merge_chains_prev_blockhash_invalidates() {
+    let block_genesis = TestBlock {
+        hash: hash!("_"),
+        prev_hash: BlockHash::all_zeros(),
+    };
+    let block_a = TestBlock {
+        hash: hash!("A"),
+        prev_hash: hash!("_"),
+    };
+    let block_b = TestBlock {
+        hash: hash!("B"),
+        prev_hash: hash!("A"),
+    };
+    let block_d = TestBlock {
+        hash: hash!("D"),
+        prev_hash: hash!("C"), // points to some C that doesn't exist in chain
+    };
+
+    // Original chain: 0:_, 1:A, 2:B, 4:D
+    let mut chain: bdk_chain::local_chain::LocalChain<TestBlock> =
+        bdk_chain::local_chain::LocalChain::from_blocks(
+            [(0, block_genesis), (1, block_a), (2, block_b), (4, block_d)].into(),
+        )
+        .expect("valid chain");
+
+    // Update: 0:_, 1:A, 3:C' (prev=B')
+    // C' points to B' at height 2, which is different from the original B
+    let block_c_prime = TestBlock {
+        hash: hash!("C'"),
+        prev_hash: hash!("B'"), // conflicts with original B at height 2
+    };
+
+    let update = CheckPoint::from_blocks([(0, block_genesis), (1, block_a), (3, block_c_prime)])
+        .expect("valid update chain");
+
+    let changeset = chain.apply_update(update).expect("merge should succeed");
+
+    // Result should be: 0:_, 1:A, 3:C'
+    // Heights 2 and 4 should be invalidated (removed)
+    assert_eq!(
+        changeset.blocks.get(&2),
+        Some(&None),
+        "height 2 should be invalidated"
+    );
+    assert_eq!(
+        changeset.blocks.get(&3),
+        Some(&Some(block_c_prime)),
+        "height 3 should be added"
+    );
+    assert_eq!(
+        changeset.blocks.get(&4),
+        Some(&None),
+        "height 4 should be invalidated"
+    );
+
+    // Verify final chain state
+    assert!(chain.get(0).is_some_and(|cp| cp.hash() == hash!("_")));
+    assert!(chain.get(1).is_some_and(|cp| cp.hash() == hash!("A")));
+    assert!(chain.get(2).is_none());
+    assert!(chain.get(3).is_some_and(|cp| cp.hash() == hash!("C'")));
+    assert!(chain.get(4).is_none());
+}
+
+/// Test that `prev_blockhash` can connect disjoint chains.
+///
+/// ```text
+///        | 0 | 2 | 3 | 4 |
+/// chain  | _   B   C
+/// update | _   B       D(prev=C)
+/// result | _   B   C   D
+/// ```
+///
+/// The update at height 4 has `prev_blockhash = C` which matches height 3 in the original.
+/// Even though the update doesn't include height 3 explicitly, the chains should connect.
+#[test]
+fn merge_chains_prev_blockhash_connects() {
+    let block_genesis = TestBlock {
+        hash: hash!("_"),
+        prev_hash: BlockHash::all_zeros(),
+    };
+    let block_b = TestBlock {
+        hash: hash!("B"),
+        prev_hash: hash!("A"),
+    };
+    let block_c = TestBlock {
+        hash: hash!("C"),
+        prev_hash: hash!("B"),
+    };
+
+    // Original chain: 0:_, 2:B, 3:C
+    let mut chain: bdk_chain::local_chain::LocalChain<TestBlock> =
+        bdk_chain::local_chain::LocalChain::from_blocks(
+            [(0, block_genesis), (2, block_b), (3, block_c)].into(),
+        )
+        .expect("valid chain");
+
+    // Update: 0:_, 2:B, 4:D (prev=C)
+    // D points to C at height 3, which exists in the original chain
+    let block_d = TestBlock {
+        hash: hash!("D"),
+        prev_hash: hash!("C"), // matches original C at height 3
+    };
+
+    let update = CheckPoint::from_blocks([(0, block_genesis), (2, block_b), (4, block_d)])
+        .expect("valid update chain");
+
+    let changeset = chain.apply_update(update).expect("merge should succeed");
+
+    // Result should be: 0:_, 2:B, 3:C, 4:D
+    // Only height 4 should be added, height 3 should remain
+    assert_eq!(
+        changeset.blocks.get(&3),
+        None,
+        "height 3 should not be in changeset (unchanged)"
+    );
+    assert_eq!(
+        changeset.blocks.get(&4),
+        Some(&Some(block_d)),
+        "height 4 should be added"
+    );
+
+    // Verify final chain state
+    assert!(chain.get(0).is_some_and(|cp| cp.hash() == hash!("_")));
+    assert!(chain.get(2).is_some_and(|cp| cp.hash() == hash!("B")));
+    assert!(chain.get(3).is_some_and(|cp| cp.hash() == hash!("C")));
+    assert!(chain.get(4).is_some_and(|cp| cp.hash() == hash!("D")));
+}
