@@ -50,21 +50,26 @@ use bitcoin::BlockHash;
 
 pub use crate::local_chain::{CannotConnectError, MissingGenesisError};
 
-/// A chain-segment observation whose anchor isn't (yet) reachable from any live tip.
+/// A chain-segment observation whose splice point isn't (yet) reachable from any live tip.
 ///
-/// `anchor` is the [`BlockId`] this fragment expects to splice onto — typically the
-/// highest BlockId in the producer's chain that they already knew about at the time
-/// they emitted the delta. `blocks` is the height → data map for the fragment's
-/// reachable heights (i.e. heights strictly above the anchor for which the producer
-/// supplied data). The anchor's *own* data may not be present in `blocks` — that's why
-/// we record it explicitly.
+/// `anchors` is the set of candidate splice points — every [`BlockId`] in the producer's
+/// `branches[tip]` set that sits below the fragment's tip. At release time the cascade
+/// tries them highest-first and splices at the first one reachable from a live tip.
+/// Carrying the full candidate set (rather than a single "smallest" anchor) is robust to
+/// multi-source merges that produce overlapping but not-fully-overlapping chains: any
+/// future tip that lands on *any* candidate suffices to release the fragment.
+///
+/// `blocks` is the height → data map for the fragment's stored heights. Heights are
+/// `< tip.height + 1`. The anchors' own data may or may not appear in `blocks` — a
+/// producer commonly omits anchor data because the consumer already had it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuarantinedFragment<D> {
-    /// The BlockId this fragment splices onto. Always at `height > 0` for quarantined
-    /// fragments (genesis-rooted fragments live in [`BlockGraph::tips`]).
-    pub anchor: BlockId,
-    /// Height → data for the fragment's stored heights. Heights here are >= the anchor's
-    /// height; the anchor's height appears here only if the producer included its data.
+    /// Candidate splice points — BlockIds at heights strictly below the fragment's tip.
+    /// Always non-empty (a fragment with no anchors below its tip would just be a
+    /// genesis-rooted CheckPoint and would live in [`BlockGraph::tips`] instead).
+    pub anchors: BTreeSet<BlockId>,
+    /// Height → data for the fragment's stored heights, including the tip if its data
+    /// was available. May overlap `anchors` in height when an anchor's data was shipped.
     pub blocks: BTreeMap<u32, D>,
 }
 
@@ -374,12 +379,14 @@ where
                 .extend_branch(tip.block_id(), tip.iter().map(|cp| cp.block_id()));
         }
         for (tip_id, frag) in &self.quarantined {
-            // Always emit the anchor BlockId so future reconstructions can find it; the
-            // anchor's *data* may not be in `frag.blocks` (the original producer may have
-            // omitted it because their pre-state already had it), in which case the
-            // anchor lives in `branches` as a "ghost" entry — present as a BlockId,
-            // absent from `blocks` — to be resolved by a future merge.
-            cs.branches.insert(*tip_id, frag.anchor);
+            // Emit every candidate anchor BlockId so future reconstructions have the
+            // same set of splice points to try. Anchors whose data is not in
+            // `frag.blocks` survive as "ghost" entries in `branches` — present as
+            // BlockIds, absent from `blocks` — to be resolved when a future merge
+            // supplies either the anchor's chain or another candidate's chain.
+            for anchor in &frag.anchors {
+                cs.branches.insert(*tip_id, *anchor);
+            }
             for (h, d) in &frag.blocks {
                 let hash = d.to_blockhash();
                 cs.blocks.entry(hash).or_insert_with(|| d.clone());
@@ -439,30 +446,42 @@ where
         // Iterate branches in tip BlockId order — predecessors (lower tips) come first
         // in the no-reorg / append-only case, which matches typical anchor walks.
         for (tip_id, bid_set) in cs.branches.iter() {
-            let anchor = match bid_set.iter().next() {
-                Some(a) => *a,
-                None => continue,
-            };
+            // Candidate anchors: every BlockId in `bid_set` strictly below the tip.
+            let anchors: BTreeSet<BlockId> = bid_set
+                .iter()
+                .filter(|b| b.height < tip_id.height)
+                .copied()
+                .collect();
 
-            if anchor.height == 0 {
+            // Genesis-rooted branch: smallest anchor is at height 0, build standalone.
+            if anchors.iter().next().is_some_and(|a| a.height == 0) {
                 if let Some(cp) = build_branch_lenient(cs, bid_set, genesis_hash) {
                     graph.absorb_tip(cp);
                 }
                 continue;
             }
+            if anchors.is_empty() {
+                // No anchor below the tip — degenerate: tip-as-its-own-anchor isn't a
+                // valid splice. Skip (or treat tip == genesis as genesis-rooted above).
+                continue;
+            }
 
-            // Non-genesis anchor — try to splice onto a live predecessor.
-            match graph.find_predecessor_at(anchor) {
-                Some(pred) => {
+            // Non-genesis: try to splice at the highest reachable candidate anchor.
+            let reachable = anchors.iter().rev().find_map(|a| {
+                graph.find_predecessor_at(*a).map(|pred| (*a, pred))
+            });
+            match reachable {
+                Some((anchor, pred)) => {
                     if let Some(cp) = lenient_extend_above_anchor(pred, cs, bid_set, anchor) {
                         graph.absorb_tip(cp);
                     }
                 }
                 None => {
-                    // No reachable predecessor yet — stage as raw data. The anchor is
-                    // recorded explicitly so it survives even if its data isn't present
-                    // in `cs.blocks` (which is common in deltas where the producer's
-                    // pre-state already had the anchor).
+                    // No reachable predecessor yet — quarantine. We keep all anchor
+                    // candidates so a future merge that lands on *any* of them can release
+                    // the fragment. The anchors' data may not be present in `cs.blocks`
+                    // (common in deltas where the producer's pre-state already had it);
+                    // anchors are stored as BlockIds either way.
                     let blocks: BTreeMap<u32, D> = bid_set
                         .iter()
                         .filter_map(|bid| {
@@ -472,7 +491,7 @@ where
                         .collect();
                     graph
                         .quarantined
-                        .insert(*tip_id, QuarantinedFragment { anchor, blocks });
+                        .insert(*tip_id, QuarantinedFragment { anchors, blocks });
                 }
             }
         }
@@ -490,34 +509,38 @@ where
         })
     }
 
-    /// Promote quarantined fragments whose anchor is now reachable from a live tip. Loops to a
-    /// fixed point because one promotion may unlock another fragment (cascade).
+    /// Promote quarantined fragments whose anchor candidates are now reachable from a
+    /// live tip. Each fragment tries its anchors highest-first and splices at the first
+    /// reachable one. Loops to a fixed point because one promotion may unlock another.
     fn release_quarantined(&mut self) {
         loop {
-            let promotable: Vec<BlockId> = self
+            let promotable: Vec<(BlockId, BlockId)> = self
                 .quarantined
                 .iter()
                 .filter_map(|(tip_id, frag)| {
-                    self.find_predecessor_at(frag.anchor).map(|_| *tip_id)
+                    frag.anchors
+                        .iter()
+                        .rev()
+                        .find_map(|a| self.find_predecessor_at(*a).map(|_| (*tip_id, *a)))
                 })
                 .collect();
             if promotable.is_empty() {
                 return;
             }
-            for tip_id in promotable {
+            for (tip_id, anchor) in promotable {
                 let frag = self.quarantined.remove(&tip_id).expect("just listed");
                 let pred = self
-                    .find_predecessor_at(frag.anchor)
+                    .find_predecessor_at(anchor)
                     .expect("just verified reachable");
-                // Iterate strictly above the anchor (ascending) and lenient-push.
+                // Lenient-push every block in the fragment. `push`'s height check
+                // naturally skips entries at or below the chosen anchor's height, so we
+                // don't need to pre-filter — and any spurious low-height block silently
+                // drops away.
                 let mut cp = pred;
-                for (h, d) in frag
-                    .blocks
-                    .range((core::ops::Bound::Excluded(frag.anchor.height), core::ops::Bound::Unbounded))
-                {
+                for (h, d) in &frag.blocks {
                     cp = match cp.clone().push(*h, d.clone()) {
                         Ok(extended) => extended,
-                        Err(_) => cp, // skip non-linking
+                        Err(_) => cp,
                     };
                 }
                 self.absorb_tip(cp);

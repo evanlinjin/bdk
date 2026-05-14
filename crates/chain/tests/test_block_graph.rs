@@ -964,6 +964,72 @@ fn out_of_order_delta_quarantines_then_releases() {
 }
 
 #[test]
+fn quarantined_fragment_releases_via_highest_reachable_anchor() {
+    // A persisted `branches[T]` carries multiple candidate anchors. The fragment must
+    // release as soon as ANY of them becomes reachable — picking the highest. Lower
+    // anchors that never become reachable must not block release.
+    use bdk_chain::collections::BTreeSet;
+
+    let (mut graph, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+
+    // Craft a changeset where `branches[(10, X)] = {(2, A), (5, B), (10, X)}`. Neither
+    // (2, A) nor (5, B) is reachable from any tip — both are "ghost" anchors. (10, X)
+    // is the tip and its data is shipped.
+    let mut cs = graph.initial_changeset();
+    cs.blocks.insert(hash!("X"), hash!("X"));
+    let mut set = BTreeSet::<BlockId>::new();
+    set.insert(block(2, "A"));
+    set.insert(block(5, "B"));
+    set.insert(block(10, "X"));
+    cs.branches.extend_branch(block(10, "X"), set);
+    graph.apply_changeset(&cs);
+    assert_eq!(graph.quarantined_count(), 1, "no anchor reachable yet");
+
+    // Now apply a chain that reaches (5, B) but NOT (2, A). The fragment should
+    // release via the (5, B) anchor (the higher candidate).
+    graph
+        .apply_update(chain_update![(0, hash!("G")), (5, hash!("B"))])
+        .unwrap();
+
+    assert_eq!(
+        graph.quarantined_count(),
+        0,
+        "fragment should release via (5, B) without (2, A) ever being reachable",
+    );
+    assert_eq!(graph.get_chain_tip().unwrap(), block(10, "X"));
+    // The chain should run G → B → X (sparse) — no entry at height 2 because the
+    // (2, A) anchor was never reachable and is correctly absent from the live chain.
+    assert!(graph.tip().get(5).is_some_and(|cp| cp.hash() == hash!("B")));
+    assert!(graph.tip().get(2).is_none(), "no spurious height-2 entry");
+}
+
+#[test]
+fn quarantined_fragment_releases_via_lower_anchor_when_higher_unreachable() {
+    // Inverse of the above: only the LOWER candidate anchor becomes reachable. The
+    // fragment must still release via that anchor.
+    use bdk_chain::collections::BTreeSet;
+
+    let (mut graph, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    let mut cs = graph.initial_changeset();
+    cs.blocks.insert(hash!("X"), hash!("X"));
+    let mut set = BTreeSet::<BlockId>::new();
+    set.insert(block(2, "A"));
+    set.insert(block(5, "B"));
+    set.insert(block(10, "X"));
+    cs.branches.extend_branch(block(10, "X"), set);
+    graph.apply_changeset(&cs);
+    assert_eq!(graph.quarantined_count(), 1);
+
+    // Reach (2, A) only.
+    graph
+        .apply_update(chain_update![(0, hash!("G")), (2, hash!("A"))])
+        .unwrap();
+    assert_eq!(graph.quarantined_count(), 0);
+    assert_eq!(graph.get_chain_tip().unwrap(), block(10, "X"));
+    assert!(graph.tip().get(2).is_some_and(|cp| cp.hash() == hash!("A")));
+}
+
+#[test]
 fn stranded_quarantined_fragment_survives_roundtrip() {
     // Build a changeset that *only* describes an anchor-non-genesis branch — no
     // predecessor entry. `from_changeset` should stage it and the round-trip should
