@@ -281,10 +281,57 @@ impl BlockGraph {
                     }
                 }
                 None => {
-                    // No live tip can absorb this block — fork, orphan, or
-                    // attachment to an already-absorbed ancestor. Defer to
-                    // `recompute` for the safe answer.
-                    needs_recompute = true;
+                    // No live tip can absorb this block. Try the fork-creation
+                    // fast path: if the block has an observed ancestor (natural
+                    // parent in `self.blocks`, or any sparse-link target in
+                    // `self.blocks`), it's a fork rooted in the existing block
+                    // graph — materialise just *its* chain and add it as a new
+                    // tip, leaving all other tips untouched.
+                    let natural_parent_observed = self.blocks.contains_key(&BlockId {
+                        height: bid.height - 1,
+                        hash: header.prev_blockhash,
+                    });
+                    let sparse_parent_observed = truly_new_links
+                        .iter()
+                        .any(|sp| self.blocks.contains_key(sp));
+                    if natural_parent_observed || sparse_parent_observed {
+                        match self.materialise_chain_via_headers(bid) {
+                            Some(cp) => {
+                                // Verify the fast-path is safe: bid's chain
+                                // doesn't contain an existing tip (would absorb
+                                // it, violating the no-ancestor invariant), and
+                                // bid isn't already inside some existing tip's
+                                // chain (then it's not a new tip at all). Either
+                                // case requires `recompute` for correctness.
+                                let absorbs_existing_tip =
+                                    self.tips.keys().any(|t_bid| {
+                                        cp.get(t_bid.height)
+                                            .is_some_and(|c| c.block_id() == *t_bid)
+                                    });
+                                let subsumed_by_existing =
+                                    self.tips.values().any(|t_cp| {
+                                        t_cp.get(bid.height)
+                                            .is_some_and(|c| c.block_id() == bid)
+                                    });
+                                if absorbs_existing_tip || subsumed_by_existing {
+                                    needs_recompute = true;
+                                } else {
+                                    self.tips.insert(bid, cp);
+                                    self.tip_by_hash.insert(bid.hash, bid);
+                                }
+                            }
+                            None => {
+                                // Chain didn't reach genesis — orphan. Fall
+                                // back to full recompute (handles quarantine).
+                                needs_recompute = true;
+                            }
+                        }
+                    } else {
+                        // Orphan: prev isn't in blocks and no sparse-link
+                        // target is observed. Defer to `recompute`, which
+                        // will quarantine this block correctly.
+                        needs_recompute = true;
+                    }
                 }
             }
         }
@@ -454,13 +501,26 @@ impl BlockGraph {
         }
 
         // Materialise each tip's chain by walking `chosen_parent` backward.
+        // Per-tip granularity optimisation: if a tip's BlockId was a tip before
+        // this recompute *and* its old chain still agrees with the new
+        // `chosen_parent` map, reuse the cached `CheckPoint` Arc — skip the
+        // O(chain) re-materialisation (and its N Arc allocations) for tips
+        // structurally unaffected by the changes.
+        let old_tips = core::mem::take(&mut self.tips);
         let mut tips = BTreeMap::new();
         let mut tip_by_hash = BTreeMap::new();
         for tip_bid in tip_bids {
-            if let Some(cp) = self.materialise_chain(tip_bid, &chosen_parent) {
-                tips.insert(tip_bid, cp);
-                tip_by_hash.insert(tip_bid.hash, tip_bid);
-            }
+            let cp = match old_tips.get(&tip_bid) {
+                Some(old_cp) if chain_matches_chosen_parent(old_cp, &chosen_parent) => {
+                    old_cp.clone()
+                }
+                _ => match self.materialise_chain(tip_bid, &chosen_parent) {
+                    Some(cp) => cp,
+                    None => continue,
+                },
+            };
+            tips.insert(tip_bid, cp);
+            tip_by_hash.insert(tip_bid.hash, tip_bid);
         }
         // If no tips materialised (e.g., genesis missing), seed with bare genesis.
         if tips.is_empty() {
@@ -494,6 +554,60 @@ impl BlockGraph {
         chain.reverse();
         CheckPoint::from_blocks(chain).ok()
     }
+
+    /// Walk `header.prev_blockhash → blocks[parent_bid]` (with sparse_link
+    /// fallback) to materialise a tip's chain back to genesis without needing
+    /// the global `chosen_parent` map. Used by the `apply_update` fast path
+    /// for fork-at-intermediate-height cases.
+    fn materialise_chain_via_headers(&self, tip_bid: BlockId) -> Option<CheckPoint<Header>> {
+        let mut chain: Vec<(u32, Header)> = Vec::new();
+        let mut current = tip_bid;
+        loop {
+            let (header, sparse_links) = self.blocks.get(&current)?;
+            chain.push((current.height, *header));
+            if current.height == 0 {
+                break;
+            }
+            // Natural parent: (current.height - 1, header.prev_blockhash) if observed.
+            let natural_bid = BlockId {
+                height: current.height - 1,
+                hash: header.prev_blockhash,
+            };
+            let next_bid = if self.blocks.contains_key(&natural_bid) {
+                natural_bid
+            } else {
+                // Fall back to highest observed sparse_link target.
+                sparse_links
+                    .iter()
+                    .filter(|sp| self.blocks.contains_key(sp))
+                    .max_by_key(|sp| sp.height)
+                    .copied()?
+            };
+            current = next_bid;
+        }
+        chain.reverse();
+        CheckPoint::from_blocks(chain).ok()
+    }
+}
+
+/// Walk `old_cp` and the new `chosen_parent` map in lockstep. Returns `true`
+/// iff every step agrees — i.e., the new structure produces the exact same
+/// chain. When `true`, the caller can reuse `old_cp` without re-materialising.
+fn chain_matches_chosen_parent(
+    old_cp: &CheckPoint<Header>,
+    chosen_parent: &BTreeMap<BlockId, Option<BlockId>>,
+) -> bool {
+    let mut current = Some(old_cp.clone());
+    while let Some(node) = current {
+        let bid = node.block_id();
+        let expected_parent = chosen_parent.get(&bid).copied().flatten();
+        let actual_prev = node.prev().map(|p| p.block_id());
+        if expected_parent != actual_prev {
+            return false;
+        }
+        current = node.prev();
+    }
+    true
 }
 
 impl ChainOracle for BlockGraph {

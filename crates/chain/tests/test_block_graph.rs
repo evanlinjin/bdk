@@ -471,6 +471,93 @@ fn apply_update_fast_path_does_not_touch_unrelated_tips() {
 }
 
 #[test]
+fn apply_update_fork_at_intermediate_height_leaves_other_tips_untouched() {
+    // Build a long canonical chain T20 (G→…→20) and a short non-canonical tip
+    // T10' (G→…→10' on a different fork). Then apply a fork off T20's chain at
+    // an internal height (say height 12). T20 stays, T10' stays Arc-identical,
+    // a third tip appears at the fork height.
+    let g = genesis();
+    let (mut graph, _) = BlockGraph::from_genesis(g);
+    // Long chain: heights 1..=20, markers 1..=20.
+    let (u_long, hs_long) = dense_chain(g, &(1..=20).collect::<Vec<u32>>());
+    // Short non-canonical: heights 1..=10 with different markers.
+    let (u_short, _) = dense_chain(g, &(100..=109).collect::<Vec<u32>>());
+    graph.apply_update(u_long).unwrap();
+    graph.apply_update(u_short).unwrap();
+    assert_eq!(graph.tip_count(), 2);
+    let short_tip_before = graph
+        .tips()
+        .find(|cp| cp.height() == 10)
+        .expect("short tip present")
+        .clone();
+
+    // Build a fork off T20's chain at height 12: a new block at height 13 whose
+    // prev_blockhash is the actual h12 from the long chain.
+    let h12_hash = hs_long[12].block_hash();
+    let fork_h = header(h12_hash, 9999);
+    // Fork's CheckPoint chain: G → h12 → fork_h. Sparse from G.
+    let fork_cp = CheckPoint::from_blocks(vec![
+        (0, hs_long[0]),
+        (12, hs_long[12]),
+        (13, fork_h),
+    ])
+    .unwrap();
+    graph.apply_update(fork_cp).unwrap();
+
+    // T20 still there.
+    assert!(
+        graph.tips().any(|cp| cp.height() == 20),
+        "T20 still a tip"
+    );
+    // Fork tip present.
+    assert!(
+        graph.tips().any(|cp| cp.height() == 13 && cp.hash() == fork_h.block_hash()),
+        "fork tip at height 13 present"
+    );
+    // T10' still Arc-identical (untouched by fork-creation fast-path).
+    let short_tip_after = graph
+        .tips()
+        .find(|cp| cp.height() == 10)
+        .expect("short tip still present");
+    assert!(
+        short_tip_before.eq_ptr(short_tip_after),
+        "T10' CheckPoint Arc should be unchanged",
+    );
+    assert_eq!(graph.tip_count(), 3);
+}
+
+#[test]
+fn recompute_reuses_arc_for_unchanged_tips() {
+    // Force the fallback path (so recompute() runs) and verify that unrelated
+    // tips retain their Arc identity.
+    let g = genesis();
+    let (mut graph, _) = BlockGraph::from_genesis(g);
+    let (u_long, hs_long) = dense_chain(g, &[1, 2, 3, 4, 5]);
+    let (u_short, _) = dense_chain(g, &[100, 101]);
+    graph.apply_update(u_long).unwrap();
+    graph.apply_update(u_short).unwrap();
+    let short_tip_before = graph
+        .tips()
+        .find(|cp| cp.height() == 2 && cp.hash() == header(hs_long[0].block_hash(), 100).block_hash().min(cp.hash()))
+        .or_else(|| graph.tips().find(|cp| cp.height() == 2))
+        .expect("short tip present")
+        .clone();
+    // Re-apply the long chain via a sparse update that adds a sparse_link to an
+    // existing block — forces the recompute path (not the fast path).
+    let sparse = sparse_chain(&hs_long, &[0, 3, 5]);
+    graph.apply_update(sparse).unwrap();
+    // The short tip should retain its Arc identity even though recompute ran.
+    let short_tip_after = graph
+        .tips()
+        .find(|cp| cp.height() == 2)
+        .expect("short tip still present");
+    assert!(
+        short_tip_before.eq_ptr(short_tip_after),
+        "Arc identity preserved across recompute when chain unchanged",
+    );
+}
+
+#[test]
 fn apply_update_falls_back_to_recompute_on_fork() {
     // Apply a chain extending the canonical tip, then a divergent fork —
     // the fork lands via the recompute fallback. Verify final state matches
