@@ -872,3 +872,162 @@ fn chain_oracle_is_block_in_chain() {
     );
 }
 
+#[test]
+fn apply_update_delta_is_linear_in_chain_length_not_quadratic_in_update_count() {
+    // After N sequential tip-extensions of size H, persisted `branches[…]` BlockId
+    // references should be O(H·N), not O(H·N²).
+    let (mut graph, init) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    let mut persisted = init;
+
+    let n = 20_u32;
+    let h = 10_u32;
+    let mut last_tip_hash: BlockHash = hash!("G");
+    for i in 1..=n {
+        // Build a CheckPoint chain from genesis to height i*h.
+        // Each new tip extends the previous tip — no fork.
+        let mut chain: Vec<(u32, BlockHash)> = (0..=i * h)
+            .map(|height| {
+                let h: BlockHash = bitcoin::hashes::Hash::hash(
+                    format!("blk-{height}").as_bytes(),
+                );
+                (height, h)
+            })
+            .collect();
+        // Override (0, …) → genesis G so all updates share the same root.
+        chain[0] = (0, hash!("G"));
+        let cp = bdk_chain::local_chain::CheckPoint::from_blocks(chain)
+            .expect("non-empty chain");
+        last_tip_hash = cp.hash();
+        let delta = graph.apply_update(cp).expect("connects to genesis");
+        persisted.merge(delta);
+    }
+    let _ = last_tip_hash;
+
+    // Total BlockId references across all `branches[…]` entries.
+    let total_refs: usize = persisted
+        .branches
+        .iter()
+        .map(|(_, set)| set.len())
+        .sum();
+    // Implicit-anchor design: each apply emits exactly (h + 1) refs (anchor + h new
+    // BlockIds) for the new tip's branch entry. Plus the genesis branch entry from
+    // `init` with a single BlockId. Total ≤ 1 + N·(H+1).
+    let max_linear = 1 + (n as usize) * ((h as usize) + 1);
+    assert!(
+        total_refs <= max_linear,
+        "branch BlockId refs should be linear: got {} > {}",
+        total_refs,
+        max_linear,
+    );
+    // And we should be far below the v1 quadratic bound (~ H·N²/2).
+    let v1_quadratic_lower_bound = (h as usize) * (n as usize) * (n as usize) / 4;
+    assert!(
+        total_refs < v1_quadratic_lower_bound,
+        "expected sub-quadratic: got {} (quadratic lower bound was {})",
+        total_refs,
+        v1_quadratic_lower_bound,
+    );
+}
+
+#[test]
+fn out_of_order_delta_stages_then_promotes() {
+    // Persistor A: synced genesis → (1, A) → (2, B). Two deltas emitted.
+    let (mut graph_a, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    let delta1 = graph_a
+        .apply_update(chain_update![(0, hash!("G")), (1, hash!("A"))])
+        .unwrap();
+    let delta2 = graph_a
+        .apply_update(chain_update![(0, hash!("G")), (1, hash!("A")), (2, hash!("B"))])
+        .unwrap();
+
+    // Persistor B: starts fresh at genesis, then receives delta2 BEFORE delta1.
+    let (mut graph_b, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    graph_b.apply_changeset(&delta2);
+    // delta2's branch is anchored at (1, A) — not present in graph_b yet → must stage.
+    assert_eq!(
+        graph_b.staged_count(),
+        1,
+        "delta2 should stage because anchor (1, A) is unreachable",
+    );
+    assert_eq!(graph_b.tip_count(), 1, "still only the genesis tip live");
+    assert_eq!(graph_b.get_chain_tip().unwrap(), block(0, "G"));
+
+    // Now deliver delta1 — supplies the (1, A) anchor.
+    graph_b.apply_changeset(&delta1);
+
+    // Both fragments should now be live; the staged (2, B) should have promoted.
+    assert_eq!(graph_b.staged_count(), 0);
+    assert_eq!(graph_b.get_chain_tip().unwrap(), block(2, "B"));
+
+    // Order-equivalent state to graph_a (canonical).
+    assert_eq!(graph_a, graph_b);
+}
+
+#[test]
+fn stranded_staged_fragment_survives_roundtrip() {
+    // Build a changeset that *only* describes an anchor-non-genesis branch — no
+    // predecessor entry. `from_changeset` should stage it and the round-trip should
+    // preserve it.
+    use bdk_chain::collections::BTreeSet;
+
+    let (g_only_graph, init) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    let _ = g_only_graph;
+
+    // Stranded branch: (3, C) anchored at (2, B) which is not present anywhere.
+    let mut stranded = init.clone();
+    let stranded_tip = block(3, "C");
+    stranded.blocks.insert(hash!("B"), hash!("B"));
+    stranded.blocks.insert(hash!("C"), hash!("C"));
+    let mut set = BTreeSet::<BlockId>::new();
+    set.insert(block(2, "B")); // anchor — height > 0, no predecessor branch
+    set.insert(block(3, "C"));
+    stranded.branches.extend_branch(stranded_tip, set);
+
+    let graph = BlockGraph::<BlockHash>::from_changeset(stranded)
+        .expect("genesis is present");
+    assert_eq!(graph.tip_count(), 1, "only genesis is reachable");
+    assert_eq!(graph.staged_count(), 1, "stranded fragment is staged");
+    assert_eq!(graph.get_chain_tip().unwrap(), block(0, "G"));
+
+    // Round-trip via initial_changeset → from_changeset preserves the staged fragment.
+    let cs = graph.initial_changeset();
+    let rebuilt = BlockGraph::<BlockHash>::from_changeset(cs).unwrap();
+    assert_eq!(graph, rebuilt);
+}
+
+#[test]
+fn cascade_promotes_chained_staged_fragments() {
+    // A is staged anchored at B; B is staged anchored at (1, X) where X is genesis-rooted.
+    // Once X is delivered, the cascade should promote B then A.
+    let (mut graph, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+
+    // Build the three pieces as separate updates from graph_a (the canonical source).
+    let (mut graph_a, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    let delta_x = graph_a
+        .apply_update(chain_update![(0, hash!("G")), (1, hash!("X"))])
+        .unwrap();
+    let delta_b = graph_a
+        .apply_update(chain_update![(0, hash!("G")), (1, hash!("X")), (2, hash!("B"))])
+        .unwrap();
+    let delta_a = graph_a
+        .apply_update(chain_update![
+            (0, hash!("G")),
+            (1, hash!("X")),
+            (2, hash!("B")),
+            (3, hash!("A"))
+        ])
+        .unwrap();
+
+    // Deliver in reverse order: A first, then B, then X.
+    graph.apply_changeset(&delta_a);
+    assert_eq!(graph.staged_count(), 1);
+    graph.apply_changeset(&delta_b);
+    assert_eq!(graph.staged_count(), 2);
+    graph.apply_changeset(&delta_x);
+
+    // X unlocks B which unlocks A — cascade.
+    assert_eq!(graph.staged_count(), 0, "all promoted via cascade");
+    assert_eq!(graph.get_chain_tip().unwrap(), block(3, "A"));
+    assert_eq!(graph, graph_a);
+}
+

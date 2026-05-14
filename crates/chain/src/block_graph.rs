@@ -33,27 +33,57 @@ use bitcoin::BlockHash;
 
 pub use crate::local_chain::{CannotConnectError, MissingGenesisError};
 
+/// A chain-segment observation whose anchor isn't (yet) reachable from any live tip.
+///
+/// `anchor` is the [`BlockId`] this fragment expects to splice onto — typically the
+/// highest BlockId in the producer's chain that they already knew about at the time
+/// they emitted the delta. `blocks` is the height → data map for the fragment's
+/// reachable heights (i.e. heights strictly above the anchor for which the producer
+/// supplied data). The anchor's *own* data may not be present in `blocks` — that's why
+/// we record it explicitly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedFragment<D> {
+    /// The BlockId this fragment splices onto. Always at `height > 0` for staged
+    /// fragments (genesis-rooted fragments live in [`BlockGraph::tips`]).
+    pub anchor: BlockId,
+    /// Height → data for the fragment's stored heights. Heights here are >= the anchor's
+    /// height; the anchor's height appears here only if the producer included its data.
+    pub blocks: BTreeMap<u32, D>,
+}
+
 /// Multi-tip, monotone chain tracker.
 ///
 /// Maintains every observed branch tip in `tips`. Branches that share history share the
 /// underlying `Arc<CPInner>` nodes for free.
+///
+/// Observations whose chain does not (yet) reach genesis are kept in `staged` until a
+/// future merge supplies the missing predecessor. They are then promoted via
+/// [`BlockGraph::cascade_staged`].
 #[derive(Debug, Clone)]
 pub struct BlockGraph<D = BlockHash> {
-    /// All known branch tips. Always non-empty. Sorted by `(Reverse(height), hash)` so
-    /// `tips[0]` is the best (canonical) tip — max height, lowest hash on ties.
+    /// Reachable tips — chain bottoms reach genesis. Always non-empty. Sorted by
+    /// `(Reverse(height), hash)` so `tips[0]` is the best (canonical) tip.
     ///
     /// Invariants: (a) no tip is a strict ancestor of another tip; (b) no two tips share a
     /// [`BlockId`] (same-BlockId tips are merged at absorb time, with the union of their
-    /// sparse coverage).
+    /// sparse coverage); (c) every tip's chain reaches genesis at `iter().last()`.
     tips: Vec<CheckPoint<D>>,
+    /// Fragments whose anchor is not currently reachable from any live tip. Outer key =
+    /// fragment's tip BlockId; value = the [`StagedFragment`] (anchor + height → data).
+    /// Promoted to `tips` once a predecessor arrives.
+    staged: BTreeMap<BlockId, StagedFragment<D>>,
 }
 
-impl<D> PartialEq for BlockGraph<D> {
+impl<D> PartialEq for BlockGraph<D>
+where
+    D: PartialEq,
+{
     fn eq(&self, other: &Self) -> bool {
         // `tips` is kept sorted by `(Reverse(height), hash)`, so element-wise comparison
         // is a canonical equality check.
         self.tips.len() == other.tips.len()
             && self.tips.iter().zip(&other.tips).all(|(a, b)| a == b)
+            && self.staged == other.staged
     }
 }
 
@@ -281,6 +311,22 @@ impl<D> BlockGraph<D> {
     {
         self.tips[0].range(range)
     }
+
+    /// Iterate over staged fragments — observations whose chain does not (yet) reach
+    /// genesis. Each entry is `(tip_BlockId, &StagedFragment)`. Staged fragments are not
+    /// visible through [`tips`], [`tip`], or [`ChainOracle`] until their anchor becomes
+    /// reachable and they promote via the cascade.
+    ///
+    /// [`tips`]: Self::tips
+    /// [`tip`]: Self::tip
+    pub fn staged(&self) -> impl Iterator<Item = (&BlockId, &StagedFragment<D>)> {
+        self.staged.iter()
+    }
+
+    /// Number of staged fragments.
+    pub fn staged_count(&self) -> usize {
+        self.staged.len()
+    }
 }
 
 impl<D> ChainOracle for BlockGraph<D> {
@@ -317,6 +363,7 @@ where
         let cp = CheckPoint::new(0, data);
         let graph = Self {
             tips: alloc::vec![cp],
+            staged: BTreeMap::new(),
         };
         let changeset = graph.initial_changeset();
         (graph, changeset)
@@ -330,6 +377,7 @@ where
         }
         Ok(Self {
             tips: alloc::vec![tip],
+            staged: BTreeMap::new(),
         })
     }
 
@@ -348,6 +396,9 @@ where
     /// Apply an `update` tip to the graph.
     ///
     /// Returns a delta [`ChangeSet`] describing newly observed blocks and branch entries.
+    /// For a brand-new tip the branch entry contains only BlockIds from the **anchor**
+    /// (the highest BlockId in `update`'s chain already known to `self`) up to the new
+    /// tip — *not* the entire genesis-to-tip set. Reconstruction reattaches at the anchor.
     ///
     /// Fails with [`CannotConnectError`] only when `update` does not descend from this
     /// graph's genesis.
@@ -364,27 +415,53 @@ where
         // Cheap pre-snapshot: hashes + per-tip BlockId sets, no `D` clones.
         let (pre_hashes, pre_branches) = self.snapshot_indexes();
         self.absorb_tip(update);
+        // New tip(s) may unlock previously-staged fragments.
+        self.cascade_staged();
         self.sort_tips();
 
         let mut delta = ChangeSet::<D>::default();
         for tip in &self.tips {
-            let mut post_bids = BTreeSet::<BlockId>::new();
-            for cp in tip.iter() {
-                if !pre_hashes.contains(&cp.hash()) {
-                    delta
-                        .blocks
-                        .entry(cp.hash())
-                        .or_insert_with(|| cp.data());
-                }
-                post_bids.insert(cp.block_id());
-            }
             match pre_branches.get(&tip.block_id()) {
                 Some(pre_set) => {
-                    let new_bids = post_bids.difference(pre_set).copied();
+                    // Existing tip: emit only newly-added BlockIds + their data.
+                    let post_bids: BTreeSet<BlockId> =
+                        tip.iter().map(|cp| cp.block_id()).collect();
+                    let new_bids: BTreeSet<BlockId> =
+                        post_bids.difference(pre_set).copied().collect();
+                    for bid in &new_bids {
+                        if !pre_hashes.contains(&bid.hash) {
+                            let data = tip
+                                .get(bid.height)
+                                .expect("bid is in tip's chain")
+                                .data();
+                            delta.blocks.insert(bid.hash, data);
+                        }
+                    }
                     delta.branches.extend_branch(tip.block_id(), new_bids);
                 }
                 None => {
-                    delta.branches.extend_branch(tip.block_id(), post_bids);
+                    // New tip: find the anchor — highest BlockId in tip.iter() whose
+                    // hash is in `pre_hashes`. Emit `{anchor, …, tip}` and the data for
+                    // every block at-or-above the anchor that's not in `pre_hashes`.
+                    let anchor = tip
+                        .iter()
+                        .find(|cp| pre_hashes.contains(&cp.hash()))
+                        .map(|cp| cp.block_id())
+                        .unwrap_or(BlockId {
+                            height: 0,
+                            hash: self.genesis_hash(),
+                        });
+                    let mut delta_bids = BTreeSet::<BlockId>::new();
+                    for cp in tip.iter() {
+                        if cp.height() < anchor.height {
+                            break;
+                        }
+                        delta_bids.insert(cp.block_id());
+                        if !pre_hashes.contains(&cp.hash()) {
+                            delta.blocks.insert(cp.hash(), cp.data());
+                        }
+                    }
+                    delta.branches.extend_branch(tip.block_id(), delta_bids);
                 }
             }
         }
@@ -406,7 +483,7 @@ where
     }
 
     /// Derive a [`ChangeSet`] that, applied to an empty graph (via [`from_changeset`]),
-    /// recovers this graph's full state.
+    /// recovers this graph's full state — including staged fragments.
     ///
     /// [`from_changeset`]: Self::from_changeset
     pub fn initial_changeset(&self) -> ChangeSet<D> {
@@ -417,6 +494,25 @@ where
             }
             cs.branches
                 .extend_branch(tip.block_id(), tip.iter().map(|cp| cp.block_id()));
+        }
+        for (tip_id, frag) in &self.staged {
+            // Always emit the anchor BlockId so future reconstructions can find it; the
+            // anchor's *data* may not be in `frag.blocks` (the original producer may have
+            // omitted it because their pre-state already had it), in which case the
+            // anchor lives in `branches` as a "ghost" entry — present as a BlockId,
+            // absent from `blocks` — to be resolved by a future merge.
+            cs.branches.insert(*tip_id, frag.anchor);
+            for (h, d) in &frag.blocks {
+                let hash = d.to_blockhash();
+                cs.blocks.entry(hash).or_insert_with(|| d.clone());
+                cs.branches.insert(
+                    *tip_id,
+                    BlockId {
+                        height: *h,
+                        hash,
+                    },
+                );
+            }
         }
         cs
     }
@@ -458,16 +554,97 @@ where
 
         let mut graph = Self {
             tips: alloc::vec![CheckPoint::new(0, genesis_data)],
+            staged: BTreeMap::new(),
         };
         let genesis_hash = graph.genesis_hash();
 
-        for bid_set in cs.branches.values() {
-            if let Some(cp) = build_branch_lenient(cs, bid_set, genesis_hash) {
-                graph.absorb_tip(cp);
+        // Iterate branches in tip BlockId order — predecessors (lower tips) come first
+        // in the no-reorg / append-only case, which matches typical anchor walks.
+        for (tip_id, bid_set) in cs.branches.iter() {
+            let anchor = match bid_set.iter().next() {
+                Some(a) => *a,
+                None => continue,
+            };
+
+            if anchor.height == 0 {
+                if let Some(cp) = build_branch_lenient(cs, bid_set, genesis_hash) {
+                    graph.absorb_tip(cp);
+                }
+                continue;
+            }
+
+            // Non-genesis anchor — try to splice onto a live predecessor.
+            match graph.find_predecessor_at(anchor) {
+                Some(pred) => {
+                    if let Some(cp) = lenient_extend_above_anchor(pred, cs, bid_set, anchor) {
+                        graph.absorb_tip(cp);
+                    }
+                }
+                None => {
+                    // No reachable predecessor yet — stage as raw data. The anchor is
+                    // recorded explicitly so it survives even if its data isn't present
+                    // in `cs.blocks` (which is common in deltas where the producer's
+                    // pre-state already had the anchor).
+                    let blocks: BTreeMap<u32, D> = bid_set
+                        .iter()
+                        .filter_map(|bid| {
+                            let data = cs.blocks.get(&bid.hash)?.clone();
+                            (data.to_blockhash() == bid.hash).then_some((bid.height, data))
+                        })
+                        .collect();
+                    graph
+                        .staged
+                        .insert(*tip_id, StagedFragment { anchor, blocks });
+                }
             }
         }
+        graph.cascade_staged();
         graph.sort_tips();
         Ok(graph)
+    }
+
+    /// Find a live tip whose chain contains `anchor` at exactly `anchor.height`.
+    /// Returns the `CheckPoint` at that point of the matching tip's chain.
+    fn find_predecessor_at(&self, anchor: BlockId) -> Option<CheckPoint<D>> {
+        self.tips.iter().find_map(|tip| {
+            let cp = tip.get(anchor.height)?;
+            (cp.block_id() == anchor).then_some(cp)
+        })
+    }
+
+    /// Promote staged fragments whose anchor is now reachable from a live tip. Loops to a
+    /// fixed point because one promotion may unlock another fragment (cascade).
+    fn cascade_staged(&mut self) {
+        loop {
+            let promotable: Vec<BlockId> = self
+                .staged
+                .iter()
+                .filter_map(|(tip_id, frag)| {
+                    self.find_predecessor_at(frag.anchor).map(|_| *tip_id)
+                })
+                .collect();
+            if promotable.is_empty() {
+                return;
+            }
+            for tip_id in promotable {
+                let frag = self.staged.remove(&tip_id).expect("just listed");
+                let pred = self
+                    .find_predecessor_at(frag.anchor)
+                    .expect("just verified reachable");
+                // Iterate strictly above the anchor (ascending) and lenient-push.
+                let mut cp = pred;
+                for (h, d) in frag
+                    .blocks
+                    .range((core::ops::Bound::Excluded(frag.anchor.height), core::ops::Bound::Unbounded))
+                {
+                    cp = match cp.clone().push(*h, d.clone()) {
+                        Ok(extended) => extended,
+                        Err(_) => cp, // skip non-linking
+                    };
+                }
+                self.absorb_tip(cp);
+            }
+        }
     }
 
     /// Integrate `update` into `self.tips`, preserving the no-strict-ancestor invariant.
@@ -633,6 +810,53 @@ where
     let bottom = cp.iter().last().expect("CheckPoint is non-empty");
     if bottom.height() != 0 || bottom.hash() != genesis_hash {
         return None;
+    }
+    Some(cp)
+}
+
+/// Extend a predecessor [`CheckPoint`] at `anchor` with the BlockIds in `bid_set` that
+/// are strictly above the anchor, leniently skipping malformed entries (dangling refs,
+/// data-hash mismatch, non-linking pushes).
+///
+/// Mirrors the lenience rules of [`build_branch_lenient`] but starts from a known
+/// predecessor instead of building from scratch.
+fn lenient_extend_above_anchor<D>(
+    pred: CheckPoint<D>,
+    cs: &ChangeSet<D>,
+    bid_set: &BTreeSet<BlockId>,
+    anchor: BlockId,
+) -> Option<CheckPoint<D>>
+where
+    D: ToBlockHash + fmt::Debug + Clone,
+{
+    // Group entries strictly above the anchor by height.
+    let mut by_height: BTreeMap<u32, Vec<&BlockId>> = BTreeMap::new();
+    for bid in bid_set {
+        if bid.height > anchor.height {
+            by_height.entry(bid.height).or_default().push(bid);
+        }
+    }
+
+    let mut cp = pred;
+    'heights: for (h, candidates) in by_height {
+        for bid in candidates {
+            let data = match cs.blocks.get(&bid.hash) {
+                Some(d) => d.clone(),
+                None => continue,
+            };
+            if data.to_blockhash() != bid.hash {
+                continue;
+            }
+            match cp.clone().push(h, data) {
+                Ok(extended) => {
+                    cp = extended;
+                    continue 'heights;
+                }
+                Err(_) => continue,
+            }
+        }
+        // No candidate at `h` linked successfully ⇒ stop extending here.
+        break;
     }
     Some(cp)
 }
