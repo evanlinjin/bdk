@@ -425,8 +425,19 @@ where
     for cp in other.iter() {
         union.entry(cp.height()).or_insert_with(|| cp.data());
     }
-    CheckPoint::from_blocks(union)
-        .expect("non-empty union; sparse chains skip prev_blockhash validation")
+    // Build incrementally via `push`, skipping non-linking entries. This preserves the
+    // shared tip (the tip's prev was already validated in `base`'s construction) and
+    // avoids panicking if a caller fed in an internally inconsistent `CheckPoint`.
+    let mut iter = union.into_iter();
+    let (h0, d0) = iter.next().expect("union is non-empty: base contains at least the tip");
+    let mut cp = CheckPoint::new(h0, d0);
+    for (h, d) in iter {
+        cp = match cp.clone().push(h, d) {
+            Ok(extended) => extended,
+            Err(_) => cp, // non-linking entry — skip, keep prior cp
+        };
+    }
+    cp
 }
 
 /// Build a [`CheckPoint`] from a branch's [`BlockId`] set, leniently skipping malformed
@@ -434,10 +445,14 @@ where
 ///
 /// - A [`BlockId`] whose `hash` is missing from `cs.blocks` is skipped.
 /// - An entry whose stored data does not hash back to the [`BlockId`]'s `hash` is skipped.
-/// - A block that fails to [`CheckPoint::push`] (height ordering or `prev_blockhash`
-///   mismatch) is skipped. The next candidate at the same height is tried (so a linking
-///   block beats a non-linking block at the same height); blocks at higher heights still
-///   get a chance to attach to the most recent successful checkpoint.
+/// - At each height, candidates are tried in `(height, hash)` order; the first that
+///   [`CheckPoint::push`]es successfully is taken. This realises "If there are two blocks
+///   at that height where one has a linked `prev_blockhash` and one does not, ignore the
+///   one that does not".
+/// - **If no candidate at a given height links, the branch is truncated at the prior
+///   height — heights at and above the failure are dropped.** This prevents a
+///   non-adjacent `push` from silently skipping `prev_blockhash` validation against a
+///   block we just dropped.
 /// - The reconstructed checkpoint is only returned if its bottom reaches the graph's
 ///   genesis hash. Otherwise the branch is dropped entirely.
 fn build_branch_lenient<D>(
@@ -448,23 +463,36 @@ fn build_branch_lenient<D>(
 where
     D: ToBlockHash + fmt::Debug + Clone,
 {
-    let mut cp: Option<CheckPoint<D>> = None;
+    // Group BlockIds by height so we can detect "no candidate at this height linked".
+    let mut by_height: BTreeMap<u32, Vec<&BlockId>> = BTreeMap::new();
     for bid in bid_set {
-        let data = match cs.blocks.get(&bid.hash) {
-            Some(d) => d.clone(),
-            None => continue, // dangling ref
-        };
-        if data.to_blockhash() != bid.hash {
-            continue; // tampered / corrupted entry
-        }
-        cp = match cp.take() {
-            None => Some(CheckPoint::new(bid.height, data)),
-            Some(existing) => match existing.clone().push(bid.height, data) {
-                Ok(extended) => Some(extended),
-                Err(_) => Some(existing), // push failed; keep prior, skip this entry
-            },
-        };
+        by_height.entry(bid.height).or_default().push(bid);
     }
+
+    let mut cp: Option<CheckPoint<D>> = None;
+    'heights: for (h, candidates) in by_height {
+        for bid in candidates {
+            let data = match cs.blocks.get(&bid.hash) {
+                Some(d) => d.clone(),
+                None => continue, // dangling ref
+            };
+            if data.to_blockhash() != bid.hash {
+                continue; // tampered / corrupted entry
+            }
+            let candidate_cp = match &cp {
+                None => CheckPoint::new(h, data),
+                Some(existing) => match existing.clone().push(h, data) {
+                    Ok(extended) => extended,
+                    Err(_) => continue, // push failed; try next candidate at same height
+                },
+            };
+            cp = Some(candidate_cp);
+            continue 'heights;
+        }
+        // No candidate at `h` linked successfully ⇒ truncate the branch here.
+        break;
+    }
+
     let cp = cp?;
     let bottom = cp.iter().last().expect("CheckPoint is non-empty");
     if bottom.height() != 0 || bottom.hash() != genesis_hash {

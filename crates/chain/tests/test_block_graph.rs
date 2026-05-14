@@ -316,6 +316,130 @@ fn from_changeset_silently_skips_prev_blockhash_mismatch() {
 }
 
 #[test]
+fn from_changeset_truncates_branch_above_unlinkable_height() {
+    // When no candidate at height H links, the branch must be truncated at H-1 so that
+    // a non-adjacent push doesn't silently re-accept higher blocks (whose prev_blockhash
+    // points to the dropped block).
+    use bdk_chain::collections::BTreeSet;
+    use bitcoin::block::Header;
+    use bitcoin::{hashes::Hash, CompactTarget, TxMerkleNode};
+
+    fn header(prev: BlockHash) -> Header {
+        Header {
+            version: bitcoin::block::Version::ONE,
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 0,
+            bits: CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        }
+    }
+    let zero = BlockHash::all_zeros();
+    let h0 = header(zero);
+    let g_hash = h0.block_hash();
+    // h1_bad does NOT link to genesis (prev = zero rather than g_hash).
+    let h1_bad = header(zero);
+    let h1_bad_hash = h1_bad.block_hash();
+    // h2 claims to descend from h1_bad. Heights 0 and 2 are non-adjacent, so a naive
+    // `push(2, h2)` onto cp(0, g) would skip the prev_blockhash check and silently
+    // accept h2 even though h1_bad was dropped.
+    let h2 = header(h1_bad_hash);
+    let h2_hash = h2.block_hash();
+
+    let mut cs = ChangeSet::<Header>::default();
+    cs.blocks.insert(g_hash, h0);
+    cs.blocks.insert(h1_bad_hash, h1_bad);
+    cs.blocks.insert(h2_hash, h2);
+    let mut set = BTreeSet::<BlockId>::new();
+    set.insert(BlockId {
+        height: 0,
+        hash: g_hash,
+    });
+    set.insert(BlockId {
+        height: 1,
+        hash: h1_bad_hash,
+    });
+    set.insert(BlockId {
+        height: 2,
+        hash: h2_hash,
+    });
+    cs.branches.insert(
+        BlockId {
+            height: 2,
+            hash: h2_hash,
+        },
+        set,
+    );
+
+    let graph = BlockGraph::<Header>::from_changeset(cs)
+        .expect("genesis is present and self-consistent");
+    // The branch must be truncated at the unlinkable height — we keep only genesis.
+    assert_eq!(graph.tip_count(), 1);
+    assert_eq!(graph.get_chain_tip().unwrap().height, 0);
+    assert_eq!(graph.get_chain_tip().unwrap().hash, g_hash);
+}
+
+#[test]
+fn from_changeset_prefers_linking_candidate_at_same_height() {
+    // Two candidates at the same height — one links, one doesn't. The linking one must win.
+    use bdk_chain::collections::BTreeSet;
+    use bitcoin::block::Header;
+    use bitcoin::{hashes::Hash, CompactTarget, TxMerkleNode};
+
+    fn header(prev: BlockHash, nonce: u32) -> Header {
+        Header {
+            version: bitcoin::block::Version::ONE,
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 0,
+            bits: CompactTarget::from_consensus(0x207fffff),
+            nonce,
+        }
+    }
+    let zero = BlockHash::all_zeros();
+    let h0 = header(zero, 0);
+    let g_hash = h0.block_hash();
+    // h1_bad: at height 1 but doesn't link.
+    let h1_bad = header(zero, 1);
+    let h1_bad_hash = h1_bad.block_hash();
+    // h1_good: at height 1 and DOES link to genesis.
+    let h1_good = header(g_hash, 2);
+    let h1_good_hash = h1_good.block_hash();
+
+    let mut cs = ChangeSet::<Header>::default();
+    cs.blocks.insert(g_hash, h0);
+    cs.blocks.insert(h1_bad_hash, h1_bad);
+    cs.blocks.insert(h1_good_hash, h1_good);
+    let mut set = BTreeSet::<BlockId>::new();
+    set.insert(BlockId {
+        height: 0,
+        hash: g_hash,
+    });
+    set.insert(BlockId {
+        height: 1,
+        hash: h1_bad_hash,
+    });
+    set.insert(BlockId {
+        height: 1,
+        hash: h1_good_hash,
+    });
+    // Use h1_good as the declared tip (so the branch entry tries to express the linking tip).
+    cs.branches.insert(
+        BlockId {
+            height: 1,
+            hash: h1_good_hash,
+        },
+        set,
+    );
+
+    let graph = BlockGraph::<Header>::from_changeset(cs)
+        .expect("the linking candidate at height 1 should be chosen");
+    assert_eq!(graph.tip_count(), 1);
+    assert_eq!(graph.get_chain_tip().unwrap().height, 1);
+    assert_eq!(graph.get_chain_tip().unwrap().hash, h1_good_hash);
+}
+
+#[test]
 fn chain_oracle_is_block_in_chain() {
     let (mut graph, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
     graph
