@@ -38,7 +38,6 @@ pub mod indexer;
 pub use indexer::spk_txout;
 pub use indexer::Indexer;
 pub mod local_chain;
-mod branches;
 pub mod block_graph;
 mod tx_data_traits;
 pub use tx_data_traits::*;

@@ -13,19 +13,19 @@
 //! Split into two maps so each block's `D` is stored exactly once:
 //!
 //! - [`ChangeSet::blocks`]: content-addressed `BlockHash → D`.
-//! - [`ChangeSet::branches`]: per-tip [`Branches`] index — a `BlockId` set per tip.
-//!   BlockIds strictly below the tip are *candidate anchors* (potential splice points).
+//! - [`ChangeSet::branches`]: `BTreeMap<BlockId /*tip*/, BTreeSet<BlockId>>` — a sparse
+//!   set of BlockIds per tip. BlockIds strictly below the tip are *candidate anchors*
+//!   (potential splice points).
 //!
 //! [`BlockGraph::apply_update`] emits **anchored deltas**: only BlockIds from the highest
 //! splice point already known to `self` up to the new tip, not the full genesis-to-tip
 //! set. The persisted changeset stays linear in chain length without compaction.
 //!
-//! Reconstruction tries each branch's candidate anchors highest-first via
-//! [`Branches::containing`] (an `O(log)` reverse index). If a live tip contains one, the
-//! fragment splices onto it. Otherwise the fragment becomes a [`QuarantinedFragment`] and
-//! waits — until a future merge lands on any candidate, at which point it's promoted.
-//! This tolerates out-of-order multi-source merges without sacrificing monotonicity or
-//! order-independence.
+//! Reconstruction tries each branch's candidate anchors highest-first. If a live tip
+//! contains one, the fragment splices onto it. Otherwise the fragment becomes a
+//! [`QuarantinedFragment`] and waits — until a future merge lands on any candidate, at
+//! which point it's promoted. This tolerates out-of-order multi-source merges without
+//! sacrificing monotonicity or order-independence.
 
 use alloc::vec::Vec;
 use core::cmp::Reverse;
@@ -77,24 +77,22 @@ where
     }
 }
 
-pub use crate::branches::Branches;
-
 /// Strictly-additive changeset for [`BlockGraph`].
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct ChangeSet<D = BlockHash> {
     /// Block payloads, content-addressed by [`BlockHash`].
     pub blocks: BTreeMap<BlockHash, D>,
-    /// Per-tip branch index. BlockIds below a branch's tip are candidate anchors;
+    /// Per-tip BlockId sets. BlockIds below a branch's tip are candidate anchors;
     /// genesis-rooted branches have an anchor at height 0.
-    pub branches: Branches,
+    pub branches: BTreeMap<BlockId, BTreeSet<BlockId>>,
 }
 
 impl<D> Default for ChangeSet<D> {
     fn default() -> Self {
         Self {
             blocks: BTreeMap::default(),
-            branches: Branches::default(),
+            branches: BTreeMap::default(),
         }
     }
 }
@@ -105,7 +103,9 @@ impl<D> Merge for ChangeSet<D> {
         for (hash, data) in other.blocks {
             self.blocks.entry(hash).or_insert(data);
         }
-        self.branches.merge(other.branches);
+        for (tip, set) in other.branches {
+            self.branches.entry(tip).or_default().extend(set);
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -274,7 +274,9 @@ where
                             delta.blocks.insert(bid.hash, data);
                         }
                     }
-                    delta.branches.extend_branch(tip.block_id(), new_bids);
+                    if !new_bids.is_empty() {
+                        delta.branches.insert(tip.block_id(), new_bids);
+                    }
                 }
                 None => {
                     // New tip: find the anchor — highest BlockId in tip.iter() whose
@@ -298,7 +300,7 @@ where
                             delta.blocks.insert(cp.hash(), cp.data());
                         }
                     }
-                    delta.branches.extend_branch(tip.block_id(), delta_bids);
+                    delta.branches.insert(tip.block_id(), delta_bids);
                 }
             }
         }
@@ -318,31 +320,26 @@ where
     pub fn initial_changeset(&self) -> ChangeSet<D> {
         let mut cs = ChangeSet::<D>::default();
         for tip in &self.tips {
+            let mut bids = BTreeSet::<BlockId>::new();
             for cp in tip.iter() {
                 cs.blocks.entry(cp.hash()).or_insert_with(|| cp.data());
+                bids.insert(cp.block_id());
             }
-            cs.branches
-                .extend_branch(tip.block_id(), tip.iter().map(|cp| cp.block_id()));
+            cs.branches.insert(tip.block_id(), bids);
         }
         for (tip_id, frag) in &self.quarantined {
             // Emit every candidate anchor BlockId so future reconstructions have the
-            // same set of splice points to try. Anchors whose data is not in
-            // `frag.blocks` survive as "ghost" entries in `branches` — present as
-            // BlockIds, absent from `blocks` — to be resolved when a future merge
-            // supplies either the anchor's chain or another candidate's chain.
+            // same set of splice points. Anchors whose data isn't in `frag.blocks` live
+            // as "ghost" entries — referenced in `branches` but absent from `blocks` —
+            // until a future merge supplies them.
+            let bids = cs.branches.entry(*tip_id).or_default();
             for anchor in &frag.anchors {
-                cs.branches.insert(*tip_id, *anchor);
+                bids.insert(*anchor);
             }
             for (h, d) in &frag.blocks {
                 let hash = d.to_blockhash();
                 cs.blocks.entry(hash).or_insert_with(|| d.clone());
-                cs.branches.insert(
-                    *tip_id,
-                    BlockId {
-                        height: *h,
-                        hash,
-                    },
-                );
+                bids.insert(BlockId { height: *h, hash });
             }
         }
         cs

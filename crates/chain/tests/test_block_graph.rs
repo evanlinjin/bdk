@@ -604,7 +604,7 @@ fn from_changeset_silently_skips_dangling_branch_refs() {
     let mut set = BTreeSet::<BlockId>::new();
     set.insert(block(0, "G"));
     set.insert(block(1, "MISSING")); // no entry in `blocks` for hash!("MISSING")
-    cs.branches.extend_branch(block(1, "MISSING"), set);
+    cs.branches.insert(block(1, "MISSING"), set);
     let graph = BlockGraph::<BlockHash>::from_changeset(cs)
         .expect("dangling refs should be silently skipped, not errored");
     assert_eq!(graph.tip_count(), 1);
@@ -660,7 +660,7 @@ fn from_changeset_silently_skips_prev_blockhash_mismatch() {
         height: 2,
         hash: h2_bad_hash,
     };
-    cs.branches.extend_branch(claimed_tip, set);
+    cs.branches.insert(claimed_tip, set);
 
     let graph =
         BlockGraph::<Header>::from_changeset(cs).expect("non-linking entry should be skipped");
@@ -718,7 +718,7 @@ fn from_changeset_truncates_branch_above_unlinkable_height() {
         height: 2,
         hash: h2_hash,
     });
-    cs.branches.extend_branch(
+    cs.branches.insert(
         BlockId {
             height: 2,
             hash: h2_hash,
@@ -779,7 +779,7 @@ fn from_changeset_prefers_linking_candidate_at_same_height() {
         hash: h1_good_hash,
     });
     // Use h1_good as the declared tip (so the branch entry tries to express the linking tip).
-    cs.branches.extend_branch(
+    cs.branches.insert(
         BlockId {
             height: 1,
             hash: h1_good_hash,
@@ -792,62 +792,6 @@ fn from_changeset_prefers_linking_candidate_at_same_height() {
     assert_eq!(graph.tip_count(), 1);
     assert_eq!(graph.get_chain_tip().unwrap().height, 1);
     assert_eq!(graph.get_chain_tip().unwrap().hash, h1_good_hash);
-}
-
-#[test]
-fn branches_reverse_index_stays_consistent_through_merge() {
-    use bdk_chain::block_graph::Branches;
-    use bdk_chain::collections::BTreeSet;
-
-    fn check_consistency(b: &Branches) {
-        // For every (tip, bid) in the forward map, `by_member[bid]` must contain `tip`.
-        for (tip, set) in b.iter() {
-            for bid in set {
-                let containing: BTreeSet<BlockId> = b.containing(bid).collect();
-                assert!(
-                    containing.contains(tip),
-                    "forward → reverse inconsistency: tip={tip:?} bid={bid:?}",
-                );
-            }
-        }
-        // And every `containing(bid)` entry must be backed by the forward map.
-        // (Iterate by collecting unique bids first.)
-        let all_bids: BTreeSet<BlockId> =
-            b.iter().flat_map(|(_, s)| s.iter().copied()).collect();
-        for bid in all_bids {
-            for tip in b.containing(&bid) {
-                assert!(
-                    b.get(&tip).is_some_and(|s| s.contains(&bid)),
-                    "reverse → forward inconsistency: tip={tip:?} bid={bid:?}",
-                );
-            }
-        }
-    }
-
-    let (mut graph, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
-    graph
-        .apply_update(chain_update![(0, hash!("G")), (1, hash!("A")), (2, hash!("B"))])
-        .unwrap();
-    graph
-        .apply_update(chain_update![(0, hash!("G")), (1, hash!("C"))])
-        .unwrap();
-    let cs = graph.initial_changeset();
-    check_consistency(&cs.branches);
-
-    // Now merge a delta into a fresh changeset and verify the index still consistent.
-    let mut acc = ChangeSet::<BlockHash>::default();
-    acc.merge(cs.clone());
-    check_consistency(&acc.branches);
-    acc.merge(cs);
-    check_consistency(&acc.branches);
-
-    // `containing` returns at least one tip for shared ancestors.
-    let genesis_bid = block(0, "G");
-    let tips_with_genesis: BTreeSet<BlockId> = acc.branches.containing(&genesis_bid).collect();
-    assert!(
-        tips_with_genesis.len() >= 2,
-        "shared genesis should appear in every retained branch's set",
-    );
 }
 
 #[test]
@@ -904,11 +848,7 @@ fn apply_update_delta_is_linear_in_chain_length_not_quadratic_in_update_count() 
     let _ = last_tip_hash;
 
     // Total BlockId references across all `branches[…]` entries.
-    let total_refs: usize = persisted
-        .branches
-        .iter()
-        .map(|(_, set)| set.len())
-        .sum();
+    let total_refs: usize = persisted.branches.values().map(|set| set.len()).sum();
     // Implicit-anchor design: each apply emits exactly (h + 1) refs (anchor + h new
     // BlockIds) for the new tip's branch entry. Plus the genesis branch entry from
     // `init` with a single BlockId. Total ≤ 1 + N·(H+1).
@@ -981,7 +921,7 @@ fn quarantined_fragment_releases_via_highest_reachable_anchor() {
     set.insert(block(2, "A"));
     set.insert(block(5, "B"));
     set.insert(block(10, "X"));
-    cs.branches.extend_branch(block(10, "X"), set);
+    cs.branches.insert(block(10, "X"), set);
     graph.apply_changeset(&cs);
     assert_eq!(graph.quarantined_count(), 1, "no anchor reachable yet");
 
@@ -1016,7 +956,7 @@ fn quarantined_fragment_releases_via_lower_anchor_when_higher_unreachable() {
     set.insert(block(2, "A"));
     set.insert(block(5, "B"));
     set.insert(block(10, "X"));
-    cs.branches.extend_branch(block(10, "X"), set);
+    cs.branches.insert(block(10, "X"), set);
     graph.apply_changeset(&cs);
     assert_eq!(graph.quarantined_count(), 1);
 
@@ -1047,7 +987,7 @@ fn stranded_quarantined_fragment_survives_roundtrip() {
     let mut set = BTreeSet::<BlockId>::new();
     set.insert(block(2, "B")); // anchor — height > 0, no predecessor branch
     set.insert(block(3, "C"));
-    stranded.branches.extend_branch(stranded_tip, set);
+    stranded.branches.insert(stranded_tip, set);
 
     let graph = BlockGraph::<BlockHash>::from_changeset(stranded)
         .expect("genesis is present");
