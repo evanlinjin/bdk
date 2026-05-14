@@ -63,8 +63,6 @@ pub struct BlockGraph {
     blocks: BTreeMap<BlockId, (Header, BTreeSet<BlockId>)>,
     /// Materialised tip chains, derived from `blocks`. Always non-empty.
     tips: BTreeMap<BlockId, CheckPoint<Header>>,
-    /// `BlockHash → tip BlockId` for fast lookup by `prev_blockhash`.
-    tip_by_hash: BTreeMap<BlockHash, BlockId>,
     /// Observed blocks whose chain back to genesis is broken. Re-evaluated on
     /// every state change; populated when an observed block's parent (via
     /// `Header::prev_blockhash` or any sparse link) isn't itself in `blocks`.
@@ -92,7 +90,6 @@ impl BlockGraph {
         let mut graph = Self {
             blocks,
             tips: BTreeMap::new(),
-            tip_by_hash: BTreeMap::new(),
             quarantined: BTreeSet::new(),
             genesis_hash: g_hash,
         };
@@ -130,7 +127,6 @@ impl BlockGraph {
         let mut graph = Self {
             blocks,
             tips: BTreeMap::new(),
-            tip_by_hash: BTreeMap::new(),
             quarantined: BTreeSet::new(),
             genesis_hash: g_hash,
         };
@@ -160,7 +156,6 @@ impl BlockGraph {
         let mut graph = Self {
             blocks: changeset.blocks,
             tips: BTreeMap::new(),
-            tip_by_hash: BTreeMap::new(),
             quarantined: BTreeSet::new(),
             genesis_hash: g_bid.hash,
         };
@@ -194,9 +189,9 @@ impl BlockGraph {
         let chain: Vec<_> = update.iter().collect();
         let mut needs_recompute = false;
         let mut newly_inserted_hashes = BTreeSet::<BlockHash>::new();
-        // Bottom-up iteration: parents land in `self.tips`/`tip_by_hash` before
-        // their children are processed, so each child's fast-path extension
-        // sees its parent as a live tip.
+        // Bottom-up iteration: parents land in `self.tips` before their
+        // children are processed, so each child's fast-path extension sees
+        // its parent as a live tip.
         for (i, cp) in chain.iter().enumerate().rev() {
             let bid = cp.block_id();
             let header = cp.data();
@@ -248,34 +243,27 @@ impl BlockGraph {
             // Try fast-path: extend a current live tip.
             //   1. Natural parent via `Header::prev_blockhash`.
             //   2. Highest sparse_link target that's itself a live tip.
-            let chosen_tip_parent = self
-                .tip_by_hash
-                .get(&header.prev_blockhash)
-                .copied()
-                .or_else(|| {
-                    truly_new_links
-                        .iter()
-                        .filter(|sp| self.tip_by_hash.contains_key(&sp.hash))
-                        .max_by_key(|sp| sp.height)
-                        .copied()
-                });
+            let chosen_tip_parent = self.tip_with_hash(header.prev_blockhash).or_else(|| {
+                truly_new_links
+                    .iter()
+                    .filter(|sp| self.tip_with_hash(sp.hash).is_some())
+                    .max_by_key(|sp| sp.height)
+                    .copied()
+            });
             match chosen_tip_parent {
                 Some(parent_bid) => {
                     let parent_cp = self
                         .tips
                         .remove(&parent_bid)
                         .expect("classified as live tip");
-                    self.tip_by_hash.remove(&parent_bid.hash);
                     match parent_cp.clone().push(bid.height, header) {
                         Ok(new_cp) => {
                             self.tips.insert(bid, new_cp);
-                            self.tip_by_hash.insert(bid.hash, bid);
                         }
                         Err(_) => {
                             // Push rejected the new block (shouldn't happen for
                             // valid updates). Restore the tip and fall back.
                             self.tips.insert(parent_bid, parent_cp);
-                            self.tip_by_hash.insert(parent_bid.hash, parent_bid);
                             needs_recompute = true;
                         }
                     }
@@ -317,7 +305,6 @@ impl BlockGraph {
                                     needs_recompute = true;
                                 } else {
                                     self.tips.insert(bid, cp);
-                                    self.tip_by_hash.insert(bid.hash, bid);
                                 }
                             }
                             None => {
@@ -428,6 +415,14 @@ impl BlockGraph {
         self.tip().range(range)
     }
 
+    /// Find the live tip whose hash equals `hash`, if any. Linear in tip count.
+    fn tip_with_hash(&self, hash: BlockHash) -> Option<BlockId> {
+        self.tips
+            .values()
+            .find(|cp| cp.hash() == hash)
+            .map(|cp| cp.block_id())
+    }
+
     // ---- Internal: rebuild derived state from `self.blocks` ----
 
     fn recompute(&mut self) {
@@ -508,31 +503,19 @@ impl BlockGraph {
         // structurally unaffected by the changes.
         let old_tips = core::mem::take(&mut self.tips);
         let mut tips = BTreeMap::new();
-        let mut tip_by_hash = BTreeMap::new();
         for tip_bid in tip_bids {
             let cp = match old_tips.get(&tip_bid) {
                 Some(old_cp) if chain_matches_chosen_parent(old_cp, &chosen_parent) => {
                     old_cp.clone()
                 }
-                _ => match self.materialise_chain(tip_bid, &chosen_parent) {
-                    Some(cp) => cp,
-                    None => continue,
-                },
+                _ => self
+                    .materialise_chain(tip_bid, &chosen_parent)
+                    .expect("tip_bids ⊆ self.blocks via chosen_parent BFS"),
             };
             tips.insert(tip_bid, cp);
-            tip_by_hash.insert(tip_bid.hash, tip_bid);
-        }
-        // If no tips materialised (e.g., genesis missing), seed with bare genesis.
-        if tips.is_empty() {
-            if let Some((_, (header, _))) = self.blocks.get_key_value(&genesis_bid) {
-                let cp = CheckPoint::new(0, *header);
-                tips.insert(genesis_bid, cp);
-                tip_by_hash.insert(genesis_bid.hash, genesis_bid);
-            }
         }
 
         self.tips = tips;
-        self.tip_by_hash = tip_by_hash;
         self.quarantined = quarantined;
     }
 
@@ -597,15 +580,12 @@ fn chain_matches_chosen_parent(
     old_cp: &CheckPoint<Header>,
     chosen_parent: &BTreeMap<BlockId, Option<BlockId>>,
 ) -> bool {
-    let mut current = Some(old_cp.clone());
-    while let Some(node) = current {
-        let bid = node.block_id();
-        let expected_parent = chosen_parent.get(&bid).copied().flatten();
+    for node in old_cp.iter() {
+        let expected_parent = chosen_parent.get(&node.block_id()).copied().flatten();
         let actual_prev = node.prev().map(|p| p.block_id());
         if expected_parent != actual_prev {
             return false;
         }
-        current = node.prev();
     }
     true
 }
