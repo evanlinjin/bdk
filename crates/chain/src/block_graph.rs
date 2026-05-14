@@ -30,9 +30,9 @@
 //!
 //! Reconstruction looks up each branch's anchor via [`Branches::containing`] (an
 //! `O(log)` reverse index). If a reachable predecessor exists, the fragment is spliced
-//! onto its chain and absorbed. Otherwise the fragment goes to a [`StagedFragment`] in
+//! onto its chain and absorbed. Otherwise the fragment goes to a [`QuarantinedFragment`] in
 //! [`BlockGraph`] and waits — until a future merge supplies the missing predecessor,
-//! at which point [`BlockGraph::cascade_staged`] promotes it. This makes the design
+//! at which point [`BlockGraph::release_quarantined`] promotes it. This makes the design
 //! tolerant of out-of-order multi-source merges without sacrificing monotonicity or
 //! order-independence.
 
@@ -59,8 +59,8 @@ pub use crate::local_chain::{CannotConnectError, MissingGenesisError};
 /// supplied data). The anchor's *own* data may not be present in `blocks` — that's why
 /// we record it explicitly.
 #[derive(Debug, Clone, PartialEq)]
-pub struct StagedFragment<D> {
-    /// The BlockId this fragment splices onto. Always at `height > 0` for staged
+pub struct QuarantinedFragment<D> {
+    /// The BlockId this fragment splices onto. Always at `height > 0` for quarantined
     /// fragments (genesis-rooted fragments live in [`BlockGraph::tips`]).
     pub anchor: BlockId,
     /// Height → data for the fragment's stored heights. Heights here are >= the anchor's
@@ -73,9 +73,9 @@ pub struct StagedFragment<D> {
 /// Maintains every observed branch tip in `tips`. Branches that share history share the
 /// underlying `Arc<CPInner>` nodes for free.
 ///
-/// Observations whose chain does not (yet) reach genesis are kept in `staged` until a
+/// Observations whose chain does not (yet) reach genesis are kept in `quarantined` until a
 /// future merge supplies the missing predecessor. They are then promoted via
-/// [`BlockGraph::cascade_staged`].
+/// [`BlockGraph::release_quarantined`].
 #[derive(Debug, Clone)]
 pub struct BlockGraph<D = BlockHash> {
     /// Reachable tips — chain bottoms reach genesis. Always non-empty. Sorted by
@@ -86,9 +86,9 @@ pub struct BlockGraph<D = BlockHash> {
     /// sparse coverage); (c) every tip's chain reaches genesis at `iter().last()`.
     tips: Vec<CheckPoint<D>>,
     /// Fragments whose anchor is not currently reachable from any live tip. Outer key =
-    /// fragment's tip BlockId; value = the [`StagedFragment`] (anchor + height → data).
+    /// fragment's tip BlockId; value = the [`QuarantinedFragment`] (anchor + height → data).
     /// Promoted to `tips` once a predecessor arrives.
-    staged: BTreeMap<BlockId, StagedFragment<D>>,
+    quarantined: BTreeMap<BlockId, QuarantinedFragment<D>>,
 }
 
 impl<D> PartialEq for BlockGraph<D>
@@ -100,7 +100,7 @@ where
         // is a canonical equality check.
         self.tips.len() == other.tips.len()
             && self.tips.iter().zip(&other.tips).all(|(a, b)| a == b)
-            && self.staged == other.staged
+            && self.quarantined == other.quarantined
     }
 }
 
@@ -191,20 +191,20 @@ impl<D> BlockGraph<D> {
         self.tips[0].range(range)
     }
 
-    /// Iterate over staged fragments — observations whose chain does not (yet) reach
-    /// genesis. Each entry is `(tip_BlockId, &StagedFragment)`. Staged fragments are not
+    /// Iterate over quarantined fragments — observations whose chain does not (yet) reach
+    /// genesis. Each entry is `(tip_BlockId, &QuarantinedFragment)`. Quarantined fragments are not
     /// visible through [`tips`], [`tip`], or [`ChainOracle`] until their anchor becomes
     /// reachable and they promote via the cascade.
     ///
     /// [`tips`]: Self::tips
     /// [`tip`]: Self::tip
-    pub fn staged(&self) -> impl Iterator<Item = (&BlockId, &StagedFragment<D>)> {
-        self.staged.iter()
+    pub fn quarantined(&self) -> impl Iterator<Item = (&BlockId, &QuarantinedFragment<D>)> {
+        self.quarantined.iter()
     }
 
-    /// Number of staged fragments.
-    pub fn staged_count(&self) -> usize {
-        self.staged.len()
+    /// Number of quarantined fragments.
+    pub fn quarantined_count(&self) -> usize {
+        self.quarantined.len()
     }
 }
 
@@ -242,7 +242,7 @@ where
         let cp = CheckPoint::new(0, data);
         let graph = Self {
             tips: alloc::vec![cp],
-            staged: BTreeMap::new(),
+            quarantined: BTreeMap::new(),
         };
         let changeset = graph.initial_changeset();
         (graph, changeset)
@@ -256,7 +256,7 @@ where
         }
         Ok(Self {
             tips: alloc::vec![tip],
-            staged: BTreeMap::new(),
+            quarantined: BTreeMap::new(),
         })
     }
 
@@ -294,8 +294,8 @@ where
         // Cheap pre-snapshot: hashes + per-tip BlockId sets, no `D` clones.
         let (pre_hashes, pre_branches) = self.snapshot_indexes();
         self.absorb_tip(update);
-        // New tip(s) may unlock previously-staged fragments.
-        self.cascade_staged();
+        // New tip(s) may unlock previously-quarantined fragments.
+        self.release_quarantined();
         self.sort_tips();
 
         let mut delta = ChangeSet::<D>::default();
@@ -362,7 +362,7 @@ where
     }
 
     /// Derive a [`ChangeSet`] that, applied to an empty graph (via [`from_changeset`]),
-    /// recovers this graph's full state — including staged fragments.
+    /// recovers this graph's full state — including quarantined fragments.
     ///
     /// [`from_changeset`]: Self::from_changeset
     pub fn initial_changeset(&self) -> ChangeSet<D> {
@@ -374,7 +374,7 @@ where
             cs.branches
                 .extend_branch(tip.block_id(), tip.iter().map(|cp| cp.block_id()));
         }
-        for (tip_id, frag) in &self.staged {
+        for (tip_id, frag) in &self.quarantined {
             // Always emit the anchor BlockId so future reconstructions can find it; the
             // anchor's *data* may not be in `frag.blocks` (the original producer may have
             // omitted it because their pre-state already had it), in which case the
@@ -433,7 +433,7 @@ where
 
         let mut graph = Self {
             tips: alloc::vec![CheckPoint::new(0, genesis_data)],
-            staged: BTreeMap::new(),
+            quarantined: BTreeMap::new(),
         };
         let genesis_hash = graph.genesis_hash();
 
@@ -472,12 +472,12 @@ where
                         })
                         .collect();
                     graph
-                        .staged
-                        .insert(*tip_id, StagedFragment { anchor, blocks });
+                        .quarantined
+                        .insert(*tip_id, QuarantinedFragment { anchor, blocks });
                 }
             }
         }
-        graph.cascade_staged();
+        graph.release_quarantined();
         graph.sort_tips();
         Ok(graph)
     }
@@ -491,12 +491,12 @@ where
         })
     }
 
-    /// Promote staged fragments whose anchor is now reachable from a live tip. Loops to a
+    /// Promote quarantined fragments whose anchor is now reachable from a live tip. Loops to a
     /// fixed point because one promotion may unlock another fragment (cascade).
-    fn cascade_staged(&mut self) {
+    fn release_quarantined(&mut self) {
         loop {
             let promotable: Vec<BlockId> = self
-                .staged
+                .quarantined
                 .iter()
                 .filter_map(|(tip_id, frag)| {
                     self.find_predecessor_at(frag.anchor).map(|_| *tip_id)
@@ -506,7 +506,7 @@ where
                 return;
             }
             for tip_id in promotable {
-                let frag = self.staged.remove(&tip_id).expect("just listed");
+                let frag = self.quarantined.remove(&tip_id).expect("just listed");
                 let pred = self
                     .find_predecessor_at(frag.anchor)
                     .expect("just verified reachable");

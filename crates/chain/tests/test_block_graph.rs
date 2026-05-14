@@ -930,7 +930,7 @@ fn apply_update_delta_is_linear_in_chain_length_not_quadratic_in_update_count() 
 }
 
 #[test]
-fn out_of_order_delta_stages_then_promotes() {
+fn out_of_order_delta_quarantines_then_releases() {
     // Persistor A: synced genesis → (1, A) → (2, B). Two deltas emitted.
     let (mut graph_a, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
     let delta1 = graph_a
@@ -945,9 +945,9 @@ fn out_of_order_delta_stages_then_promotes() {
     graph_b.apply_changeset(&delta2);
     // delta2's branch is anchored at (1, A) — not present in graph_b yet → must stage.
     assert_eq!(
-        graph_b.staged_count(),
+        graph_b.quarantined_count(),
         1,
-        "delta2 should stage because anchor (1, A) is unreachable",
+        "delta2 should be quarantined because anchor (1, A) is unreachable",
     );
     assert_eq!(graph_b.tip_count(), 1, "still only the genesis tip live");
     assert_eq!(graph_b.get_chain_tip().unwrap(), block(0, "G"));
@@ -955,8 +955,8 @@ fn out_of_order_delta_stages_then_promotes() {
     // Now deliver delta1 — supplies the (1, A) anchor.
     graph_b.apply_changeset(&delta1);
 
-    // Both fragments should now be live; the staged (2, B) should have promoted.
-    assert_eq!(graph_b.staged_count(), 0);
+    // Both fragments should now be live; the quarantined (2, B) should have promoted.
+    assert_eq!(graph_b.quarantined_count(), 0);
     assert_eq!(graph_b.get_chain_tip().unwrap(), block(2, "B"));
 
     // Order-equivalent state to graph_a (canonical).
@@ -964,7 +964,7 @@ fn out_of_order_delta_stages_then_promotes() {
 }
 
 #[test]
-fn stranded_staged_fragment_survives_roundtrip() {
+fn stranded_quarantined_fragment_survives_roundtrip() {
     // Build a changeset that *only* describes an anchor-non-genesis branch — no
     // predecessor entry. `from_changeset` should stage it and the round-trip should
     // preserve it.
@@ -986,10 +986,10 @@ fn stranded_staged_fragment_survives_roundtrip() {
     let graph = BlockGraph::<BlockHash>::from_changeset(stranded)
         .expect("genesis is present");
     assert_eq!(graph.tip_count(), 1, "only genesis is reachable");
-    assert_eq!(graph.staged_count(), 1, "stranded fragment is staged");
+    assert_eq!(graph.quarantined_count(), 1, "stranded fragment is quarantined");
     assert_eq!(graph.get_chain_tip().unwrap(), block(0, "G"));
 
-    // Round-trip via initial_changeset → from_changeset preserves the staged fragment.
+    // Round-trip via initial_changeset → from_changeset preserves the quarantined fragment.
     let cs = graph.initial_changeset();
     let rebuilt = BlockGraph::<BlockHash>::from_changeset(cs).unwrap();
     assert_eq!(graph, rebuilt);
@@ -1029,9 +1029,9 @@ fn apply_update_delta_shape_uses_anchor_not_full_chain() {
 }
 
 #[test]
-fn ported_local_chain_disjoint_chains_through_staging() {
+fn ported_local_chain_disjoint_chains_through_quarantine() {
     // Re-run a `LocalChain` "two disjoint chains cannot merge" case through the
-    // staged-then-resolved path: deliver the divergent update to a fresh persistor
+    // quarantined-then-released path: deliver the divergent update to a fresh persistor
     // as a CHANGESET (not an update), and confirm we stage rather than reject.
     let (mut graph_a, _) = BlockGraph::<BlockHash>::from_genesis(hash!("_"));
     let delta_a = graph_a
@@ -1049,7 +1049,7 @@ fn ported_local_chain_disjoint_chains_through_staging() {
     graph_c.apply_changeset(&delta_b);
     graph_c.apply_changeset(&delta_a);
     assert_eq!(graph_c.tip_count(), 2);
-    assert_eq!(graph_c.staged_count(), 0);
+    assert_eq!(graph_c.quarantined_count(), 0);
 
     // Best tip is by `(max height, lowest hash)`.
     let a_hash: BlockHash = hash!("A");
@@ -1065,8 +1065,8 @@ fn ported_local_chain_disjoint_chains_through_staging() {
 }
 
 #[test]
-fn cascade_promotes_chained_staged_fragments() {
-    // A is staged anchored at B; B is staged anchored at (1, X) where X is genesis-rooted.
+fn release_promotes_chained_quarantined_fragments() {
+    // A is quarantined anchored at B; B is quarantined anchored at (1, X) where X is genesis-rooted.
     // Once X is delivered, the cascade should promote B then A.
     let (mut graph, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
 
@@ -1089,13 +1089,13 @@ fn cascade_promotes_chained_staged_fragments() {
 
     // Deliver in reverse order: A first, then B, then X.
     graph.apply_changeset(&delta_a);
-    assert_eq!(graph.staged_count(), 1);
+    assert_eq!(graph.quarantined_count(), 1);
     graph.apply_changeset(&delta_b);
-    assert_eq!(graph.staged_count(), 2);
+    assert_eq!(graph.quarantined_count(), 2);
     graph.apply_changeset(&delta_x);
 
     // X unlocks B which unlocks A — cascade.
-    assert_eq!(graph.staged_count(), 0, "all promoted via cascade");
+    assert_eq!(graph.quarantined_count(), 0, "all promoted via cascade");
     assert_eq!(graph.get_chain_tip().unwrap(), block(3, "A"));
     assert_eq!(graph, graph_a);
 }
