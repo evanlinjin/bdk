@@ -5,19 +5,36 @@
 //! [`ChangeSet`] is strictly additive: applying the same changeset twice — or applying two
 //! changesets in either order — yields the same graph state.
 //!
-//! State is held as a `Vec<CheckPoint<D>>` of tips. Shared ancestry between tips is shared
-//! through `Arc<CPInner>` automatically — the [`CheckPoint`] linked list is the parent
-//! index.
+//! Reachable tips (chains that link back to genesis) live in `Vec<CheckPoint<D>>`. Shared
+//! ancestry between tips is shared through `Arc<CPInner>` automatically — the
+//! [`CheckPoint`] linked list is the parent index.
 //!
-//! The [`ChangeSet`] is split into two maps so the `D` payload is stored exactly once per
+//! ## The implicit-anchor `ChangeSet` shape
+//!
+//! [`ChangeSet`] is split into two maps so the `D` payload is stored exactly once per
 //! block regardless of how many branches contain it:
 //!
 //! - [`ChangeSet::blocks`] is content-addressed by [`BlockHash`]. Bitcoin consensus
 //!   guarantees the hash uniquely determines the block and its entire ancestry, so the
 //!   height is recoverable from [`ChangeSet::branches`].
-//! - [`ChangeSet::branches`] is a per-tip set of [`BlockId`]s. A `BTreeSet<BlockId>`
-//!   orders entries lexicographically by `(height, hash)`, i.e. height order on a valid
-//!   chain.
+//! - [`ChangeSet::branches`] is a per-tip [`Branches`] index mapping each branch tip to
+//!   the [`BlockId`]s in that branch's sparse chain. **The smallest [`BlockId`] in each
+//!   branch's set is the *anchor*** — either genesis (height 0) or a non-genesis BlockId
+//!   that links this fragment to a predecessor branch.
+//!
+//! `apply_update` emits **anchored deltas**: only BlockIds from the anchor (the highest
+//! BlockId in the update's chain that was already known to `self`) up to the new tip,
+//! not the full genesis-to-tip set. This keeps the persisted changeset linear in chain
+//! length even when a wallet syncs incrementally over many sessions — without requiring
+//! the persistor to ever compact.
+//!
+//! Reconstruction looks up each branch's anchor via [`Branches::containing`] (an
+//! `O(log)` reverse index). If a reachable predecessor exists, the fragment is spliced
+//! onto its chain and absorbed. Otherwise the fragment goes to a [`StagedFragment`] in
+//! [`BlockGraph`] and waits — until a future merge supplies the missing predecessor,
+//! at which point [`BlockGraph::cascade_staged`] promotes it. This makes the design
+//! tolerant of out-of-order multi-source merges without sacrificing monotonicity or
+//! order-independence.
 
 use alloc::vec::Vec;
 use core::cmp::Reverse;

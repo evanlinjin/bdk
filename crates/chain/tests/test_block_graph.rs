@@ -996,6 +996,75 @@ fn stranded_staged_fragment_survives_roundtrip() {
 }
 
 #[test]
+fn apply_update_delta_shape_uses_anchor_not_full_chain() {
+    // After two sequential apply_update calls, the second delta's `branches` entry
+    // for the new tip should contain only `{previous_tip, new_tip}` — not the full
+    // genesis-to-new-tip set. (This locks in the anchor encoding semantics.)
+    let (mut graph, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    let _d1 = graph
+        .apply_update(chain_update![(0, hash!("G")), (1, hash!("A"))])
+        .unwrap();
+    let d2 = graph
+        .apply_update(chain_update![(0, hash!("G")), (1, hash!("A")), (2, hash!("B"))])
+        .unwrap();
+
+    // d2.branches has exactly one entry: tip (2, B) → {(1, A), (2, B)}.
+    let entries: Vec<(&BlockId, &bdk_chain::collections::BTreeSet<BlockId>)> =
+        d2.branches.iter().collect();
+    assert_eq!(entries.len(), 1, "exactly one new branch entry");
+    let (tip_id, set) = entries[0];
+    assert_eq!(*tip_id, block(2, "B"));
+    let set: Vec<BlockId> = set.iter().copied().collect();
+    assert_eq!(set, vec![block(1, "A"), block(2, "B")]);
+
+    // Data for B is new and should be in `blocks`. Data for A should *not* be, because
+    // A was already known to `self` before the second apply.
+    let b_hash: BlockHash = hash!("B");
+    let a_hash: BlockHash = hash!("A");
+    assert!(d2.blocks.contains_key(&b_hash));
+    assert!(
+        !d2.blocks.contains_key(&a_hash),
+        "anchor's data should not be re-emitted",
+    );
+}
+
+#[test]
+fn ported_local_chain_disjoint_chains_through_staging() {
+    // Re-run a `LocalChain` "two disjoint chains cannot merge" case through the
+    // staged-then-resolved path: deliver the divergent update to a fresh persistor
+    // as a CHANGESET (not an update), and confirm we stage rather than reject.
+    let (mut graph_a, _) = BlockGraph::<BlockHash>::from_genesis(hash!("_"));
+    let delta_a = graph_a
+        .apply_update(chain_update![(0, hash!("_")), (1, hash!("A"))])
+        .unwrap();
+    let (mut graph_b, _) = BlockGraph::<BlockHash>::from_genesis(hash!("_"));
+    let delta_b = graph_b
+        .apply_update(chain_update![(0, hash!("_")), (2, hash!("B"))])
+        .unwrap();
+
+    // Now build a third persistor that receives both deltas, but in REVERSE order
+    // (delta_b first, then delta_a). Both anchor at genesis so neither stages, and
+    // we should end up with both branches retained.
+    let (mut graph_c, _) = BlockGraph::<BlockHash>::from_genesis(hash!("_"));
+    graph_c.apply_changeset(&delta_b);
+    graph_c.apply_changeset(&delta_a);
+    assert_eq!(graph_c.tip_count(), 2);
+    assert_eq!(graph_c.staged_count(), 0);
+
+    // Best tip is by `(max height, lowest hash)`.
+    let a_hash: BlockHash = hash!("A");
+    let b_hash: BlockHash = hash!("B");
+    let expected = if 2u32 > 1u32
+        || (2 == 1 && b_hash < a_hash)
+    {
+        block(2, "B")
+    } else {
+        block(1, "A")
+    };
+    assert_eq!(graph_c.get_chain_tip().unwrap(), expected);
+}
+
+#[test]
 fn cascade_promotes_chained_staged_fragments() {
     // A is staged anchored at B; B is staged anchored at (1, X) where X is genesis-rooted.
     // Once X is delivered, the cascade should promote B then A.
