@@ -4,7 +4,7 @@ use bdk_chain::{
     block_graph::{BlockGraph, CannotConnectError, ChangeSet, MissingGenesisError},
     BlockId, ChainOracle, Merge,
 };
-use bdk_testenv::{chain_update, hash};
+use bdk_testenv::{chain_update, hash, local_chain};
 use bitcoin::BlockHash;
 
 fn block(height: u32, h: &str) -> BlockId {
@@ -12,6 +12,361 @@ fn block(height: u32, h: &str) -> BlockId {
         height,
         hash: bitcoin::hashes::Hash::hash(h.as_bytes()),
     }
+}
+
+/// Ported from `test_local_chain::update_local_chain`. Same 18 input cases, but instead
+/// of asserting the exact `LocalChain` changeset shape, we assert the **best tip** —
+/// because `BlockGraph` retains diverging forks rather than rejecting them.
+///
+/// There are four observable outcomes:
+///
+/// - [`SameBest`]: `LocalChain::apply_update` returns `Ok` *without invalidating any
+///   existing blocks*. `BlockGraph` also returns `Ok` with a single tip, and
+///   `graph.tip()` equals `LocalChain`'s tip.
+/// - [`ForkBgWinsLong`]: `LocalChain` returns `Ok` *via invalidation* (it overwrites
+///   some existing blocks and shortens the chain). `BlockGraph` keeps both branches as
+///   tips, and `(max height, lowest hash)` selects the longer existing branch — so
+///   `BlockGraph`'s best tip differs from `LocalChain`'s. This is the fundamental
+///   semantic difference: `LocalChain` invalidates; `BlockGraph` preserves.
+/// - [`Diverge`]: `LocalChain` returns `CannotConnectError`. `BlockGraph` accepts the
+///   update as a coexisting tip. Best is `(max height, lowest hash)` over the two tips.
+/// - [`GenesisMismatch`]: both reject with `CannotConnectError { try_include_height: 0 }`.
+///
+/// [`SameBest`]: LocalChainOutcome::SameBest
+/// [`ForkBgWinsLong`]: LocalChainOutcome::ForkBgWinsLong
+/// [`Diverge`]: LocalChainOutcome::Diverge
+/// [`GenesisMismatch`]: LocalChainOutcome::GenesisMismatch
+#[derive(Debug)]
+enum LocalChainOutcome {
+    SameBest,
+    ForkBgWinsLong,
+    Diverge,
+    GenesisMismatch,
+}
+
+struct PortedCase {
+    name: &'static str,
+    chain: bdk_chain::local_chain::LocalChain,
+    update: bdk_chain::local_chain::CheckPoint,
+    local_chain_outcome: LocalChainOutcome,
+}
+
+impl PortedCase {
+    /// Return the `(max height, lowest hash)` winner across `prior_tip` and `update_tip`.
+    fn bg_best_of_two(prior: BlockId, update: BlockId) -> BlockId {
+        // (max height, then lowest hash) ⇒ rank by (height, Reverse(hash)).
+        if (prior.height, core::cmp::Reverse(prior.hash))
+            > (update.height, core::cmp::Reverse(update.hash))
+        {
+            prior
+        } else {
+            update
+        }
+    }
+
+    fn run(self) {
+        let prior_tip = self.chain.tip();
+        let update_tip = self.update.clone();
+
+        let mut graph =
+            BlockGraph::<BlockHash>::from_tip(prior_tip.clone()).expect("chain has genesis");
+
+        match self.local_chain_outcome {
+            LocalChainOutcome::SameBest => {
+                graph
+                    .apply_update(update_tip.clone())
+                    .unwrap_or_else(|e| panic!("[{}] expected Ok, got {e:?}", self.name));
+
+                let mut reference = self.chain.clone();
+                reference
+                    .apply_update(update_tip)
+                    .expect("LocalChain accepts this case");
+                assert_eq!(
+                    graph.tip().block_id(),
+                    reference.tip().block_id(),
+                    "[{}] best tip should match LocalChain's tip",
+                    self.name,
+                );
+                assert_eq!(
+                    graph.tip_count(),
+                    1,
+                    "[{}] no divergence expected, so only one tip",
+                    self.name,
+                );
+            }
+            LocalChainOutcome::ForkBgWinsLong => {
+                // LocalChain accepts via invalidation. BlockGraph keeps both branches.
+                let mut reference = self.chain.clone();
+                reference
+                    .apply_update(update_tip.clone())
+                    .expect("LocalChain accepts (via invalidation) this case");
+
+                graph.apply_update(update_tip.clone()).unwrap_or_else(|e| {
+                    panic!("[{}] BlockGraph should accept, got {e:?}", self.name)
+                });
+
+                assert_eq!(
+                    graph.tip_count(),
+                    2,
+                    "[{}] fork expected: existing tip + update tip",
+                    self.name,
+                );
+                let expected_best =
+                    Self::bg_best_of_two(prior_tip.block_id(), update_tip.block_id());
+                assert_eq!(
+                    graph.tip().block_id(),
+                    expected_best,
+                    "[{}] best tip should follow (max height, lowest hash)",
+                    self.name,
+                );
+                // And it should be strictly *different* from LocalChain's tip (LC
+                // shortened the chain via invalidation; BG kept the longer existing
+                // branch).
+                assert_ne!(
+                    graph.tip().block_id(),
+                    reference.tip().block_id(),
+                    "[{}] this case is meant to demonstrate BG/LC divergence",
+                    self.name,
+                );
+            }
+            LocalChainOutcome::Diverge => {
+                let mut reference = self.chain.clone();
+                let _ = reference
+                    .apply_update(update_tip.clone())
+                    .expect_err("LocalChain should reject this case");
+
+                graph.apply_update(update_tip.clone()).unwrap_or_else(|e| {
+                    panic!(
+                        "[{}] BlockGraph should accept the divergent update, got {e:?}",
+                        self.name,
+                    )
+                });
+
+                assert_eq!(
+                    graph.tip_count(),
+                    2,
+                    "[{}] both diverging branches should be retained",
+                    self.name,
+                );
+                let expected_best =
+                    Self::bg_best_of_two(prior_tip.block_id(), update_tip.block_id());
+                assert_eq!(
+                    graph.tip().block_id(),
+                    expected_best,
+                    "[{}] best tip should follow (max height, lowest hash)",
+                    self.name,
+                );
+            }
+            LocalChainOutcome::GenesisMismatch => {
+                let err = graph.apply_update(update_tip).unwrap_err();
+                assert_eq!(
+                    err,
+                    CannotConnectError {
+                        try_include_height: 0,
+                    },
+                    "[{}] expected genesis-mismatch error",
+                    self.name,
+                );
+                return;
+            }
+        }
+
+        let cs = graph.initial_changeset();
+        let rebuilt = BlockGraph::<BlockHash>::from_changeset(cs)
+            .unwrap_or_else(|e| panic!("[{}] round-trip failed: {e:?}", self.name));
+        assert_eq!(graph, rebuilt, "[{}] round-trip equality", self.name);
+    }
+}
+
+#[test]
+fn ported_from_test_local_chain_update_cases() {
+    [
+        PortedCase {
+            name: "add first tip",
+            chain: local_chain![(0, hash!("A"))],
+            update: chain_update![(0, hash!("A"))],
+            local_chain_outcome: LocalChainOutcome::SameBest,
+        },
+        PortedCase {
+            name: "add second tip",
+            chain: local_chain![(0, hash!("A"))],
+            update: chain_update![(0, hash!("A")), (1, hash!("B"))],
+            local_chain_outcome: LocalChainOutcome::SameBest,
+        },
+        PortedCase {
+            name: "two disjoint chains cannot merge",
+            chain: local_chain![(0, hash!("_")), (1, hash!("A"))],
+            update: chain_update![(0, hash!("_")), (2, hash!("B"))],
+            local_chain_outcome: LocalChainOutcome::Diverge,
+        },
+        PortedCase {
+            name: "two disjoint chains, existing longer",
+            chain: local_chain![(0, hash!("_")), (2, hash!("A"))],
+            update: chain_update![(0, hash!("_")), (1, hash!("B"))],
+            local_chain_outcome: LocalChainOutcome::Diverge,
+        },
+        PortedCase {
+            name: "duplicate chains should merge",
+            chain: local_chain![(0, hash!("A"))],
+            update: chain_update![(0, hash!("A"))],
+            local_chain_outcome: LocalChainOutcome::SameBest,
+        },
+        PortedCase {
+            name: "can introduce older checkpoint",
+            chain: local_chain![(0, hash!("_")), (2, hash!("C")), (3, hash!("D"))],
+            update: chain_update![(0, hash!("_")), (1, hash!("B")), (2, hash!("C"))],
+            local_chain_outcome: LocalChainOutcome::SameBest,
+        },
+        PortedCase {
+            name: "can introduce older checkpoint 2",
+            chain: local_chain![(0, hash!("_")), (3, hash!("B")), (4, hash!("C"))],
+            update: chain_update![(0, hash!("_")), (2, hash!("A")), (4, hash!("C"))],
+            local_chain_outcome: LocalChainOutcome::SameBest,
+        },
+        PortedCase {
+            name: "can introduce older checkpoint 3",
+            chain: local_chain![(0, hash!("_")), (1, hash!("A")), (3, hash!("C"))],
+            update: chain_update![(0, hash!("_")), (2, hash!("B")), (3, hash!("C"))],
+            local_chain_outcome: LocalChainOutcome::SameBest,
+        },
+        PortedCase {
+            name: "introduce two older checkpoints below PoA",
+            chain: local_chain![(0, hash!("_")), (3, hash!("C"))],
+            update: chain_update![
+                (0, hash!("_")),
+                (1, hash!("A")),
+                (2, hash!("B")),
+                (3, hash!("C"))
+            ],
+            local_chain_outcome: LocalChainOutcome::SameBest,
+        },
+        PortedCase {
+            name: "fix blockhash before agreement point",
+            chain: local_chain![
+                (0, hash!("_")),
+                (1, hash!("im-wrong")),
+                (2, hash!("we-agree"))
+            ],
+            update: chain_update![(0, hash!("_")), (1, hash!("fix")), (2, hash!("we-agree"))],
+            local_chain_outcome: LocalChainOutcome::SameBest,
+        },
+        PortedCase {
+            name: "two points of agreement",
+            chain: local_chain![(0, hash!("_")), (2, hash!("B")), (3, hash!("C"))],
+            update: chain_update![
+                (0, hash!("_")),
+                (1, hash!("A")),
+                (2, hash!("B")),
+                (3, hash!("C")),
+                (4, hash!("D"))
+            ],
+            local_chain_outcome: LocalChainOutcome::SameBest,
+        },
+        PortedCase {
+            name: "update and chain does not connect",
+            chain: local_chain![(0, hash!("_")), (2, hash!("B")), (3, hash!("C"))],
+            update: chain_update![
+                (0, hash!("_")),
+                (1, hash!("A")),
+                (2, hash!("B")),
+                (4, hash!("D"))
+            ],
+            local_chain_outcome: LocalChainOutcome::Diverge,
+        },
+        PortedCase {
+            name: "transitive invalidation with PoA",
+            chain: local_chain![
+                (0, hash!("_")),
+                (2, hash!("B")),
+                (3, hash!("C")),
+                (5, hash!("E"))
+            ],
+            update: chain_update![
+                (0, hash!("_")),
+                (2, hash!("B'")),
+                (3, hash!("C'")),
+                (4, hash!("D"))
+            ],
+            // LocalChain accepts via invalidation: new tip = (4, D), height 5 is
+            // erased. BlockGraph keeps (5, E) as best — the longer existing branch
+            // wins by (max height, lowest hash) — and (4, D) becomes a fork tip.
+            local_chain_outcome: LocalChainOutcome::ForkBgWinsLong,
+        },
+        PortedCase {
+            name: "transitive invalidation no PoA",
+            chain: local_chain![
+                (0, hash!("_")),
+                (1, hash!("B")),
+                (2, hash!("C")),
+                (4, hash!("E"))
+            ],
+            update: chain_update![
+                (0, hash!("_")),
+                (1, hash!("B'")),
+                (2, hash!("C'")),
+                (3, hash!("D"))
+            ],
+            // Same shape as the previous case but with no PoA. LC still accepts via
+            // invalidation; BG keeps the longer (4, E) branch as best.
+            local_chain_outcome: LocalChainOutcome::ForkBgWinsLong,
+        },
+        PortedCase {
+            name: "invalidation but no connection",
+            chain: local_chain![
+                (0, hash!("_")),
+                (1, hash!("A")),
+                (2, hash!("B")),
+                (3, hash!("C")),
+                (5, hash!("E"))
+            ],
+            update: chain_update![
+                (0, hash!("_")),
+                (2, hash!("B'")),
+                (3, hash!("C'")),
+                (4, hash!("D"))
+            ],
+            local_chain_outcome: LocalChainOutcome::Diverge,
+        },
+        PortedCase {
+            name: "introduce blocks between two points of agreement",
+            chain: local_chain![
+                (0, hash!("A")),
+                (1, hash!("B")),
+                (3, hash!("D")),
+                (4, hash!("E"))
+            ],
+            update: chain_update![
+                (0, hash!("A")),
+                (2, hash!("C")),
+                (4, hash!("E")),
+                (5, hash!("F"))
+            ],
+            local_chain_outcome: LocalChainOutcome::SameBest,
+        },
+        PortedCase {
+            name: "shorter update on same chain prefix",
+            chain: local_chain![
+                (0, hash!("_")),
+                (2, hash!("C")),
+                (3, hash!("D")),
+                (4, hash!("E")),
+                (5, hash!("F"))
+            ],
+            update: chain_update![(0, hash!("_")), (2, hash!("C")), (3, hash!("D'"))],
+            // LocalChain invalidates D, E, F and replaces with D'. BlockGraph sees a
+            // height-3 fork → keeps the longer existing (5, F) as best, and (3, D')
+            // as a non-canonical tip.
+            local_chain_outcome: LocalChainOutcome::ForkBgWinsLong,
+        },
+        PortedCase {
+            name: "conflicting genesis without agreement point",
+            chain: local_chain![(0, hash!("_")), (2, hash!("B"))],
+            update: chain_update![(0, hash!("_'")), (2, hash!("B'"))],
+            local_chain_outcome: LocalChainOutcome::GenesisMismatch,
+        },
+    ]
+    .into_iter()
+    .for_each(PortedCase::run);
 }
 
 #[test]
