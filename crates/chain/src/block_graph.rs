@@ -1,39 +1,30 @@
-//! The [`BlockGraph`] is a multi-tip, monotone implementation of [`ChainOracle`].
+//! Multi-tip, monotone implementation of [`ChainOracle`].
 //!
-//! Compared to [`LocalChain`](crate::local_chain::LocalChain), a `BlockGraph` keeps every
-//! observed branch tip simultaneously rather than only the canonical tip. Its
-//! [`ChangeSet`] is strictly additive: applying the same changeset twice — or applying two
-//! changesets in either order — yields the same graph state.
+//! Unlike [`LocalChain`](crate::local_chain::LocalChain), [`BlockGraph`] keeps every
+//! observed branch tip rather than only the canonical one. Its [`ChangeSet`] is strictly
+//! additive: applying the same changeset twice — or two changesets in either order —
+//! yields the same state.
 //!
-//! Reachable tips (chains that link back to genesis) live in `Vec<CheckPoint<D>>`. Shared
-//! ancestry between tips is shared through `Arc<CPInner>` automatically — the
-//! [`CheckPoint`] linked list is the parent index.
+//! Reachable tips live in `Vec<CheckPoint<D>>`; shared ancestry is shared through
+//! `Arc<CPInner>` (the linked list *is* the parent index).
 //!
-//! ## The implicit-anchor `ChangeSet` shape
+//! ## ChangeSet shape
 //!
-//! [`ChangeSet`] is split into two maps so the `D` payload is stored exactly once per
-//! block regardless of how many branches contain it:
+//! Split into two maps so each block's `D` is stored exactly once:
 //!
-//! - [`ChangeSet::blocks`] is content-addressed by [`BlockHash`]. Bitcoin consensus
-//!   guarantees the hash uniquely determines the block and its entire ancestry, so the
-//!   height is recoverable from [`ChangeSet::branches`].
-//! - [`ChangeSet::branches`] is a per-tip [`Branches`] index mapping each branch tip to
-//!   the [`BlockId`]s in that branch's sparse chain. **The smallest [`BlockId`] in each
-//!   branch's set is the *anchor*** — either genesis (height 0) or a non-genesis BlockId
-//!   that links this fragment to a predecessor branch.
+//! - [`ChangeSet::blocks`]: content-addressed `BlockHash → D`.
+//! - [`ChangeSet::branches`]: per-tip [`Branches`] index — a `BlockId` set per tip.
+//!   BlockIds strictly below the tip are *candidate anchors* (potential splice points).
 //!
-//! `apply_update` emits **anchored deltas**: only BlockIds from the anchor (the highest
-//! BlockId in the update's chain that was already known to `self`) up to the new tip,
-//! not the full genesis-to-tip set. This keeps the persisted changeset linear in chain
-//! length even when a wallet syncs incrementally over many sessions — without requiring
-//! the persistor to ever compact.
+//! [`BlockGraph::apply_update`] emits **anchored deltas**: only BlockIds from the highest
+//! splice point already known to `self` up to the new tip, not the full genesis-to-tip
+//! set. The persisted changeset stays linear in chain length without compaction.
 //!
-//! Reconstruction looks up each branch's anchor via [`Branches::containing`] (an
-//! `O(log)` reverse index). If a reachable predecessor exists, the fragment is spliced
-//! onto its chain and absorbed. Otherwise the fragment goes to a [`QuarantinedFragment`] in
-//! [`BlockGraph`] and waits — until a future merge supplies the missing predecessor,
-//! at which point [`BlockGraph::release_quarantined`] promotes it. This makes the design
-//! tolerant of out-of-order multi-source merges without sacrificing monotonicity or
+//! Reconstruction tries each branch's candidate anchors highest-first via
+//! [`Branches::containing`] (an `O(log)` reverse index). If a live tip contains one, the
+//! fragment splices onto it. Otherwise the fragment becomes a [`QuarantinedFragment`] and
+//! waits — until a future merge lands on any candidate, at which point it's promoted.
+//! This tolerates out-of-order multi-source merges without sacrificing monotonicity or
 //! order-independence.
 
 use alloc::vec::Vec;
@@ -50,49 +41,26 @@ use bitcoin::BlockHash;
 
 pub use crate::local_chain::{CannotConnectError, MissingGenesisError};
 
-/// A chain-segment observation whose splice point isn't (yet) reachable from any live tip.
+/// A chain segment whose splice point isn't (yet) reachable from any live tip.
 ///
-/// `anchors` is the set of candidate splice points — every [`BlockId`] in the producer's
-/// `branches[tip]` set that sits below the fragment's tip. At release time the cascade
-/// tries them highest-first and splices at the first one reachable from a live tip.
-/// Carrying the full candidate set (rather than a single "smallest" anchor) is robust to
-/// multi-source merges that produce overlapping but not-fully-overlapping chains: any
-/// future tip that lands on *any* candidate suffices to release the fragment.
-///
-/// `blocks` is the height → data map for the fragment's stored heights. Heights are
-/// `< tip.height + 1`. The anchors' own data may or may not appear in `blocks` — a
-/// producer commonly omits anchor data because the consumer already had it.
+/// Released when any [`anchor`](Self::anchors) becomes reachable; the cascade tries them
+/// highest-first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuarantinedFragment<D> {
-    /// Candidate splice points — BlockIds at heights strictly below the fragment's tip.
-    /// Always non-empty (a fragment with no anchors below its tip would just be a
-    /// genesis-rooted CheckPoint and would live in [`BlockGraph::tips`] instead).
+    /// Candidate splice points — BlockIds strictly below the fragment's tip. Non-empty.
     pub anchors: BTreeSet<BlockId>,
-    /// Height → data for the fragment's stored heights, including the tip if its data
-    /// was available. May overlap `anchors` in height when an anchor's data was shipped.
+    /// Height → data for stored heights. Anchor data may be absent (producers often omit
+    /// it).
     pub blocks: BTreeMap<u32, D>,
 }
 
-/// Multi-tip, monotone chain tracker.
-///
-/// Maintains every observed branch tip in `tips`. Branches that share history share the
-/// underlying `Arc<CPInner>` nodes for free.
-///
-/// Observations whose chain does not (yet) reach genesis are kept in `quarantined` until a
-/// future merge supplies the missing predecessor. They are then promoted via
-/// [`BlockGraph::release_quarantined`].
+/// Multi-tip, monotone chain tracker. See [module docs](self) for the full design.
 #[derive(Debug, Clone)]
 pub struct BlockGraph<D = BlockHash> {
-    /// Reachable tips — chain bottoms reach genesis. Always non-empty. Sorted by
-    /// `(Reverse(height), hash)` so `tips[0]` is the best (canonical) tip.
-    ///
-    /// Invariants: (a) no tip is a strict ancestor of another tip; (b) no two tips share a
-    /// [`BlockId`] (same-BlockId tips are merged at absorb time, with the union of their
-    /// sparse coverage); (c) every tip's chain reaches genesis at `iter().last()`.
+    /// Reachable tips, sorted `(Reverse(height), hash)` so `tips[0]` is canonical.
+    /// Non-empty. No tip is an ancestor of another, and tip BlockIds are unique.
     tips: Vec<CheckPoint<D>>,
-    /// Fragments whose anchor is not currently reachable from any live tip. Outer key =
-    /// fragment's tip BlockId; value = the [`QuarantinedFragment`] (anchor + height → data).
-    /// Promoted to `tips` once a predecessor arrives.
+    /// Fragments awaiting a reachable anchor. Keyed by the fragment's tip BlockId.
     quarantined: BTreeMap<BlockId, QuarantinedFragment<D>>,
 }
 
@@ -112,16 +80,13 @@ where
 pub use crate::branches::Branches;
 
 /// Strictly-additive changeset for [`BlockGraph`].
-///
-/// See the module docs for the rationale on the two-map shape.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct ChangeSet<D = BlockHash> {
-    /// Every observed block's payload, content-addressed by [`BlockHash`].
+    /// Block payloads, content-addressed by [`BlockHash`].
     pub blocks: BTreeMap<BlockHash, D>,
-    /// Per-tip branch index. The smallest [`BlockId`] in each branch's set is the
-    /// *anchor* — either genesis (height 0) or a BlockId that links this fragment to a
-    /// predecessor branch.
+    /// Per-tip branch index. BlockIds below a branch's tip are candidate anchors;
+    /// genesis-rooted branches have an anchor at height 0.
     pub branches: Branches,
 }
 
@@ -136,12 +101,10 @@ impl<D> Default for ChangeSet<D> {
 
 impl<D> Merge for ChangeSet<D> {
     fn merge(&mut self, other: Self) {
-        // First-write-wins on `blocks`. Key equality (`BlockHash == BlockHash`) implies
-        // block equality by consensus; on malformed input we still stay strictly additive.
+        // First-write-wins on `blocks` — consensus says hash determines block.
         for (hash, data) in other.blocks {
             self.blocks.entry(hash).or_insert(data);
         }
-        // Branch union (the wrapper keeps its reverse index in sync automatically).
         self.branches.merge(other.branches);
     }
 
@@ -195,13 +158,8 @@ impl<D> BlockGraph<D> {
         self.tips[0].range(range)
     }
 
-    /// Iterate over quarantined fragments — observations whose chain does not (yet) reach
-    /// genesis. Each entry is `(tip_BlockId, &QuarantinedFragment)`. Quarantined fragments are not
-    /// visible through [`tips`], [`tip`], or [`ChainOracle`] until their anchor becomes
-    /// reachable and they promote via the cascade.
-    ///
-    /// [`tips`]: Self::tips
-    /// [`tip`]: Self::tip
+    /// Iterate quarantined fragments. Not visible through [`tips`](Self::tips) or
+    /// [`ChainOracle`] until released.
     pub fn quarantined(&self) -> impl Iterator<Item = (&BlockId, &QuarantinedFragment<D>)> {
         self.quarantined.iter()
     }
@@ -264,27 +222,23 @@ where
         })
     }
 
-    /// Construct a `BlockGraph` from a complete [`ChangeSet`].
+    /// Reconstruct a `BlockGraph` from a complete [`ChangeSet`].
     ///
-    /// Fails only with [`MissingGenesisError`] if no `branches` entry contains a
-    /// height-0 [`BlockId`] whose hash is present in [`ChangeSet::blocks`] with
-    /// self-consistent data. All other malformations in `changeset` — dangling refs,
-    /// non-linking `prev_blockhash`, branches whose bottom doesn't reach genesis — are
-    /// silently skipped so a corrupted persisted changeset still produces the largest
-    /// recoverable graph.
+    /// Fails with [`MissingGenesisError`] iff no `branches` entry has a height-0
+    /// [`BlockId`] with self-consistent data in [`ChangeSet::blocks`]. Other
+    /// malformations (dangling refs, non-linking `prev_blockhash`, etc.) are silently
+    /// skipped so a corrupted changeset still yields the largest recoverable graph.
     pub fn from_changeset(changeset: ChangeSet<D>) -> Result<Self, MissingGenesisError> {
         Self::reconstruct(&changeset)
     }
 
-    /// Apply an `update` tip to the graph.
+    /// Apply an `update` tip and return an anchored delta [`ChangeSet`].
     ///
-    /// Returns a delta [`ChangeSet`] describing newly observed blocks and branch entries.
-    /// For a brand-new tip the branch entry contains only BlockIds from the **anchor**
-    /// (the highest BlockId in `update`'s chain already known to `self`) up to the new
-    /// tip — *not* the entire genesis-to-tip set. Reconstruction reattaches at the anchor.
+    /// For a new tip the delta's branch entry covers only the BlockIds from the anchor
+    /// (the highest BlockId in `update`'s chain already known to `self`) to the new tip
+    /// — keeping persisted state linear in chain length.
     ///
-    /// Fails with [`CannotConnectError`] only when `update` does not descend from this
-    /// graph's genesis.
+    /// Fails with [`CannotConnectError`] iff `update` doesn't descend from genesis.
     pub fn apply_update(
         &mut self,
         update: CheckPoint<D>,
@@ -351,24 +305,16 @@ where
         Ok(delta)
     }
 
-    /// Apply a [`ChangeSet`] to the graph.
-    ///
-    /// The changeset may be a complete or partial (delta) representation. It is merged
-    /// onto the current state and the graph is reconstructed. Malformed entries in the
-    /// changeset (dangling refs, non-linking `prev_blockhash`, non-genesis-reaching
-    /// branches) are silently skipped.
+    /// Merge a [`ChangeSet`] (complete or delta) into the graph. Malformed entries are
+    /// silently skipped (see [`from_changeset`](Self::from_changeset)).
     pub fn apply_changeset(&mut self, changeset: &ChangeSet<D>) {
         let mut combined = self.initial_changeset();
         combined.merge(changeset.clone());
-        // `combined` is guaranteed to carry self's genesis, so reconstruction cannot
-        // fail with `MissingGenesisError`.
-        *self = Self::reconstruct(&combined).expect("self has genesis ⇒ combined has genesis");
+        *self = Self::reconstruct(&combined).expect("self has genesis ⇒ combined does");
     }
 
-    /// Derive a [`ChangeSet`] that, applied to an empty graph (via [`from_changeset`]),
-    /// recovers this graph's full state — including quarantined fragments.
-    ///
-    /// [`from_changeset`]: Self::from_changeset
+    /// Snapshot the full state as a [`ChangeSet`] — recovers via
+    /// [`from_changeset`](Self::from_changeset). Quarantined fragments included.
     pub fn initial_changeset(&self) -> ChangeSet<D> {
         let mut cs = ChangeSet::<D>::default();
         for tip in &self.tips {
@@ -500,8 +446,7 @@ where
         Ok(graph)
     }
 
-    /// Find a live tip whose chain contains `anchor` at exactly `anchor.height`.
-    /// Returns the `CheckPoint` at that point of the matching tip's chain.
+    /// `CheckPoint` at `anchor` if any live tip's chain contains it.
     fn find_predecessor_at(&self, anchor: BlockId) -> Option<CheckPoint<D>> {
         self.tips.iter().find_map(|tip| {
             let cp = tip.get(anchor.height)?;
@@ -509,9 +454,8 @@ where
         })
     }
 
-    /// Promote quarantined fragments whose anchor candidates are now reachable from a
-    /// live tip. Each fragment tries its anchors highest-first and splices at the first
-    /// reachable one. Loops to a fixed point because one promotion may unlock another.
+    /// Fixed-point promotion of quarantined fragments — each tries its anchors
+    /// highest-first and splices at the first reachable one.
     fn release_quarantined(&mut self) {
         loop {
             let promotable: Vec<(BlockId, BlockId)> = self
@@ -654,21 +598,17 @@ where
     cp
 }
 
-/// Build a [`CheckPoint`] from a branch's [`BlockId`] set, leniently skipping malformed
-/// entries.
+/// Build a genesis-rooted [`CheckPoint`] from a branch's [`BlockId`] set, skipping
+/// malformed entries.
 ///
-/// - A [`BlockId`] whose `hash` is missing from `cs.blocks` is skipped.
-/// - An entry whose stored data does not hash back to the [`BlockId`]'s `hash` is skipped.
-/// - At each height, candidates are tried in `(height, hash)` order; the first that
-///   [`CheckPoint::push`]es successfully is taken. This realises "If there are two blocks
-///   at that height where one has a linked `prev_blockhash` and one does not, ignore the
-///   one that does not".
-/// - **If no candidate at a given height links, the branch is truncated at the prior
-///   height — heights at and above the failure are dropped.** This prevents a
-///   non-adjacent `push` from silently skipping `prev_blockhash` validation against a
+/// Lenience rules:
+/// - Dangling refs and data-hash mismatches are skipped.
+/// - At each height, candidates are tried in `(height, hash)` order; first to
+///   [`CheckPoint::push`] wins (resolves "non-linking sibling" ambiguity).
+/// - **If no candidate at height `h` links, the branch is truncated below `h`** —
+///   otherwise a non-adjacent push could skip `prev_blockhash` validation against a
 ///   block we just dropped.
-/// - The reconstructed checkpoint is only returned if its bottom reaches the graph's
-///   genesis hash. Otherwise the branch is dropped entirely.
+/// - Returns `None` if the bottom doesn't reach genesis.
 fn build_branch_lenient<D>(
     cs: &ChangeSet<D>,
     bid_set: &BTreeSet<BlockId>,
