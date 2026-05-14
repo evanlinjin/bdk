@@ -260,28 +260,48 @@ where
         for tip in &self.tips {
             match pre_branches.get(&tip.block_id()) {
                 Some(pre_set) => {
-                    // Existing tip: emit only newly-added BlockIds + their data.
+                    // Existing tip: emit only newly-added BlockIds + their data. Data is
+                    // emitted unconditionally so the delta is self-contained for
+                    // out-of-order receivers; `Merge` dedupes data via first-write-wins.
                     let post_bids: BTreeSet<BlockId> =
                         tip.iter().map(|cp| cp.block_id()).collect();
                     let new_bids: BTreeSet<BlockId> =
                         post_bids.difference(pre_set).copied().collect();
                     for bid in &new_bids {
-                        if !pre_hashes.contains(&bid.hash) {
-                            let data = tip
-                                .get(bid.height)
-                                .expect("bid is in tip's chain")
-                                .data();
-                            delta.blocks.insert(bid.hash, data);
-                        }
+                        let data = tip
+                            .get(bid.height)
+                            .expect("bid is in tip's chain")
+                            .data();
+                        delta.blocks.insert(bid.hash, data);
                     }
                     if !new_bids.is_empty() {
                         delta.branches.insert(tip.block_id(), new_bids);
                     }
                 }
                 None => {
-                    // New tip: find the anchor — highest BlockId in tip.iter() whose
-                    // hash is in `pre_hashes`. Emit `{anchor, …, tip}` and the data for
-                    // every block at-or-above the anchor that's not in `pre_hashes`.
+                    // New tip. The delta emits BlockIds in the chain that need to be
+                    // attributed to *this* tip in the persisted state. A BlockId is
+                    // covered by a surviving pre-tip's branches entry (its own
+                    // persisted record) — no need to repeat — UNLESS it's an absorbed
+                    // pre-tip's tip BlockId (its branches entry is now orphaned and
+                    // reconstruction needs `branches[T]` to reference it so the splice
+                    // pulls in its history).
+                    let post_tip_ids: BTreeSet<BlockId> =
+                        self.tips.iter().map(|cp| cp.block_id()).collect();
+                    let absorbed_pre_tip_ids: BTreeSet<BlockId> = pre_branches
+                        .keys()
+                        .filter(|t| !post_tip_ids.contains(t))
+                        .copied()
+                        .collect();
+                    // Internal chain BlockIds of absorbed pre-tips that aren't tip
+                    // BlockIds themselves — those still live under the pre-tip's own
+                    // branches entry (persisted state retains it monotonically).
+                    let absorbed_internal: BTreeSet<BlockId> = pre_branches
+                        .iter()
+                        .filter(|(t, _)| !post_tip_ids.contains(t))
+                        .flat_map(|(_, set)| set.iter().copied())
+                        .filter(|bid| !absorbed_pre_tip_ids.contains(bid))
+                        .collect();
                     let anchor = tip
                         .iter()
                         .find(|cp| pre_hashes.contains(&cp.hash()))
@@ -291,13 +311,14 @@ where
                             hash: self.genesis_hash(),
                         });
                     let mut delta_bids = BTreeSet::<BlockId>::new();
+                    delta_bids.insert(anchor);
                     for cp in tip.iter() {
-                        if cp.height() < anchor.height {
-                            break;
-                        }
-                        delta_bids.insert(cp.block_id());
-                        if !pre_hashes.contains(&cp.hash()) {
-                            delta.blocks.insert(cp.hash(), cp.data());
+                        let bid = cp.block_id();
+                        if !absorbed_internal.contains(&bid) {
+                            delta_bids.insert(bid);
+                            // Always include data so the delta is self-contained for
+                            // out-of-order receivers (Merge first-write-wins dedupes).
+                            delta.blocks.insert(bid.hash, cp.data());
                         }
                     }
                     delta.branches.insert(tip.block_id(), delta_bids);
@@ -367,6 +388,45 @@ where
             .sort_by_key(|cp| (Reverse(cp.height()), cp.hash()));
     }
 
+    /// Expand each branch's `bid_set` with the transitive union of branches entries it
+    /// references. If `branches[T]` contains a BlockId that is itself a key in
+    /// `branches`, that key's entire entry is merged into `branches[T]` — and the
+    /// expansion is repeated until fixed point. This lets reconstruction pick up
+    /// sparse history that's "vouched for" by another branch's entry.
+    fn expand_transitively(
+        branches: &BTreeMap<BlockId, BTreeSet<BlockId>>,
+    ) -> BTreeMap<BlockId, BTreeSet<BlockId>> {
+        let mut out = branches.clone();
+        loop {
+            let mut changed = false;
+            let keys: Vec<BlockId> = out.keys().copied().collect();
+            for tip in keys {
+                let set = out.get(&tip).expect("just listed").clone();
+                let mut additions = BTreeSet::<BlockId>::new();
+                for bid in &set {
+                    if bid == &tip {
+                        continue;
+                    }
+                    if let Some(other) = branches.get(bid) {
+                        for o in other {
+                            if !set.contains(o) {
+                                additions.insert(*o);
+                            }
+                        }
+                    }
+                }
+                if !additions.is_empty() {
+                    out.get_mut(&tip).expect("just listed").extend(additions);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        out
+    }
+
     fn reconstruct(cs: &ChangeSet<D>) -> Result<Self, MissingGenesisError> {
         // Find a usable genesis: a height-0 BlockId whose hash is present in `blocks`
         // and whose data hashes back to that key (self-consistent).
@@ -386,9 +446,16 @@ where
         };
         let genesis_hash = graph.genesis_hash();
 
+        // Transitively expand branches: any BlockId in a branch's set that's also a tip
+        // key brings in its own branches entry. Required for out-of-order delta merging
+        // where one delta records (e.g.) `branches[T] = {anchor}` while a later delta
+        // adds detail to `branches[anchor]` — reconstruction needs that detail merged
+        // into T's bid_set when splicing.
+        let expanded = Self::expand_transitively(&cs.branches);
+
         // Iterate branches in tip BlockId order — predecessors (lower tips) come first
         // in the no-reorg / append-only case, which matches typical anchor walks.
-        for (tip_id, bid_set) in cs.branches.iter() {
+        for (tip_id, bid_set) in expanded.iter() {
             // Candidate anchors: every BlockId in `bid_set` strictly below the tip.
             let anchors: BTreeSet<BlockId> = bid_set
                 .iter()
@@ -410,21 +477,24 @@ where
             }
 
             // Non-genesis: try to splice at the highest reachable candidate anchor.
+            // The splice only counts as a successful release if the resulting chain
+            // actually reaches `tip_id` (data for every height in the chain must be
+            // available); otherwise we quarantine so a future merge can complete it.
             let reachable = anchors.iter().rev().find_map(|a| {
                 graph.find_predecessor_at(*a).map(|pred| (*a, pred))
             });
-            match reachable {
-                Some((anchor, pred)) => {
-                    if let Some(cp) = lenient_extend_above_anchor(pred, cs, bid_set, anchor) {
-                        graph.absorb_tip(cp);
-                    }
+            let materialized = reachable.and_then(|(anchor, pred)| {
+                lenient_extend_above_anchor(pred, cs, bid_set, anchor)
+                    .filter(|cp| cp.block_id() == *tip_id)
+            });
+            match materialized {
+                Some(cp) => {
+                    graph.absorb_tip(cp);
                 }
                 None => {
-                    // No reachable predecessor yet — quarantine. We keep all anchor
-                    // candidates so a future merge that lands on *any* of them can release
-                    // the fragment. The anchors' data may not be present in `cs.blocks`
-                    // (common in deltas where the producer's pre-state already had it);
-                    // anchors are stored as BlockIds either way.
+                    // No reachable predecessor — or splice couldn't reach `tip_id`.
+                    // Quarantine and keep all candidate anchors so a future merge that
+                    // lands on any of them can complete the splice.
                     let blocks: BTreeMap<u32, D> = bid_set
                         .iter()
                         .filter_map(|bid| {
@@ -452,40 +522,58 @@ where
     }
 
     /// Fixed-point promotion of quarantined fragments — each tries its anchors
-    /// highest-first and splices at the first reachable one.
+    /// highest-first and splices at the first reachable one. A fragment is only
+    /// released if the spliced chain actually materializes its claimed tip BlockId;
+    /// otherwise it stays quarantined (so its splice info isn't lost from the
+    /// persisted state).
     fn release_quarantined(&mut self) {
         loop {
-            let promotable: Vec<(BlockId, BlockId)> = self
+            let promotable: Vec<(BlockId, CheckPoint<D>)> = self
                 .quarantined
                 .iter()
                 .filter_map(|(tip_id, frag)| {
-                    frag.anchors
-                        .iter()
-                        .rev()
-                        .find_map(|a| self.find_predecessor_at(*a).map(|_| (*tip_id, *a)))
+                    for anchor in frag.anchors.iter().rev() {
+                        let pred = match self.find_predecessor_at(*anchor) {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                        let mut cp = pred;
+                        for (h, d) in &frag.blocks {
+                            if let Ok(extended) = cp.clone().push(*h, d.clone()) {
+                                cp = extended;
+                            }
+                        }
+                        if cp.block_id() == *tip_id {
+                            return Some((*tip_id, cp));
+                        }
+                    }
+                    None
                 })
                 .collect();
             if promotable.is_empty() {
-                return;
+                break;
             }
-            for (tip_id, anchor) in promotable {
-                let frag = self.quarantined.remove(&tip_id).expect("just listed");
-                let pred = self
-                    .find_predecessor_at(anchor)
-                    .expect("just verified reachable");
-                // Lenient-push every block in the fragment. `push`'s height check
-                // naturally skips entries at or below the chosen anchor's height, so we
-                // don't need to pre-filter — and any spurious low-height block silently
-                // drops away.
-                let mut cp = pred;
-                for (h, d) in &frag.blocks {
-                    cp = match cp.clone().push(*h, d.clone()) {
-                        Ok(extended) => extended,
-                        Err(_) => cp,
-                    };
-                }
+            for (tip_id, cp) in promotable {
+                self.quarantined.remove(&tip_id);
                 self.absorb_tip(cp);
             }
+        }
+        // Cleanup: any quarantined frag whose tip BlockId is already in a live tip's
+        // chain is redundant (the history is captured elsewhere). Drop them.
+        let absorbed_into_tips: Vec<BlockId> = self
+            .quarantined
+            .keys()
+            .filter(|tip_id| {
+                self.tips.iter().any(|tip| {
+                    tip.get(tip_id.height)
+                        .map(|cp| cp.block_id() == **tip_id)
+                        .unwrap_or(false)
+                })
+            })
+            .copied()
+            .collect();
+        for tip_id in absorbed_into_tips {
+            self.quarantined.remove(&tip_id);
         }
     }
 
@@ -493,79 +581,159 @@ where
     fn absorb_tip(&mut self, update: CheckPoint<D>) {
         let old_tips = core::mem::take(&mut self.tips);
         let mut new_tips: Vec<CheckPoint<D>> = Vec::with_capacity(old_tips.len() + 1);
-        let mut absorbed = false;
-        let mut update_dropped = false;
         let mut update_cur = update;
+        // Tips for which `t` strictly extends `update_cur` are deferred until after the
+        // loop so they pick up `update_cur`'s final enrichment from later iterations.
+        let mut deferred_t_extends_u: Vec<CheckPoint<D>> = Vec::new();
 
+        // For each existing tip, find the deepest shared BlockId with `update_cur` and
+        // merge their sparse coverages on either side of that point.
         for t in old_tips {
-            match relate(&t, &update_cur) {
-                Relation::Equal => {
+            let shared_h = match deepest_shared_height(&t, &update_cur) {
+                Some(h) => h,
+                None => {
+                    // No common BlockId between t and update_cur — keep t as-is.
                     new_tips.push(t);
-                    absorbed = true;
+                    continue;
                 }
-                Relation::SameTipIdMerge => {
-                    let merged = merge_sparse(t, update_cur.clone());
-                    update_cur = merged.clone();
-                    new_tips.push(merged);
-                    absorbed = true;
-                }
-                Relation::UpdateExtendsT => {
-                    // t is a strict ancestor of update — drop t.
-                }
-                Relation::TExtendsUpdate => {
-                    new_tips.push(t);
-                    update_dropped = true;
-                }
-                Relation::Diverge => {
-                    new_tips.push(t);
-                }
+            };
+            let t_tip = t.block_id();
+            let u_tip = update_cur.block_id();
+
+            if t_tip == u_tip || (shared_h == t_tip.height && shared_h < u_tip.height) {
+                // Same tip OR `update_cur` strictly extends `t`. Fold t into update_cur.
+                // (Both cases produce a single tip with u's BlockId at the top.)
+                update_cur = merge_sparse(t, update_cur);
+            } else if shared_h == u_tip.height && shared_h < t_tip.height {
+                // `t` strictly extends `update_cur`. Defer — we'll merge after the loop
+                // so t picks up enrichment that later iterations may add to update_cur.
+                deferred_t_extends_u.push(t);
+            } else {
+                // Diverge above the shared height. Enrich both with the union of
+                // at-or-below `shared_h` heights — this is the order-independent rule
+                // that makes two tips sharing history carry the same sparse view of it.
+                let t_enriched = enrich_at_and_below(t, &update_cur, shared_h);
+                let u_enriched = enrich_at_and_below(update_cur.clone(), &t_enriched, shared_h);
+                update_cur = u_enriched;
+                new_tips.push(t_enriched);
             }
         }
-        if !absorbed && !update_dropped {
+        // Now merge deferred t-extends-u tips with the final update_cur (containing all
+        // accumulated enrichments). update_cur is subsumed by each deferred tip's
+        // resulting chain, so we don't push it separately.
+        let had_deferred = !deferred_t_extends_u.is_empty();
+        for t in deferred_t_extends_u {
+            new_tips.push(merge_sparse(t, update_cur.clone()));
+        }
+        if !had_deferred {
             new_tips.push(update_cur);
         }
         self.tips = new_tips;
+
+        // Fixed-point pass: enrich pairs of remaining tips with each other's coverage
+        // at-or-below their deepest shared BlockId. Required because the first pass
+        // only enriches tips against the incoming update, not against each other.
+        loop {
+            let mut changed = false;
+            for i in 0..self.tips.len() {
+                for j in 0..self.tips.len() {
+                    if i == j {
+                        continue;
+                    }
+                    let ti = self.tips[i].clone();
+                    let tj = self.tips[j].clone();
+                    let sh = match deepest_shared_height(&ti, &tj) {
+                        Some(h) => h,
+                        None => continue,
+                    };
+                    let new_ti = enrich_at_and_below(ti.clone(), &tj, sh);
+                    if new_ti != ti {
+                        self.tips[i] = new_ti;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Enrichment may have promoted one tip to be a strict ancestor of another;
+        // drop ancestors so the no-strict-ancestor invariant holds.
+        let mut keep = vec![true; self.tips.len()];
+        for i in 0..self.tips.len() {
+            for j in 0..self.tips.len() {
+                if i == j || !keep[i] {
+                    continue;
+                }
+                let ti = &self.tips[i];
+                let tj = &self.tips[j];
+                if ti.height() < tj.height() {
+                    if let Some(at_ti) = tj.get(ti.height()) {
+                        if at_ti.block_id() == ti.block_id() {
+                            keep[i] = false;
+                        }
+                    }
+                }
+            }
+        }
+        let kept: Vec<CheckPoint<D>> = core::mem::take(&mut self.tips)
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(t, k)| k.then_some(t))
+            .collect();
+        self.tips = kept;
         debug_assert!(!self.tips.is_empty(), "BlockGraph must always have a tip");
     }
 }
 
-#[derive(Debug)]
-enum Relation {
-    Equal,
-    SameTipIdMerge,
-    UpdateExtendsT,
-    TExtendsUpdate,
-    Diverge,
-}
-
-fn relate<D>(t: &CheckPoint<D>, u: &CheckPoint<D>) -> Relation
+/// The deepest (highest-height) BlockId shared by `t` and `u`. Returns `None` if their
+/// chains share no BlockIds.
+fn deepest_shared_height<D>(t: &CheckPoint<D>, u: &CheckPoint<D>) -> Option<u32>
 where
     D: ToBlockHash + fmt::Debug + Clone,
 {
-    if t.eq_ptr(u) {
-        return Relation::Equal;
-    }
-    let tb = t.block_id();
-    let ub = u.block_id();
-    if tb == ub {
-        return Relation::SameTipIdMerge;
-    }
-    if ub.height > tb.height {
-        if let Some(at_t) = u.get(tb.height) {
-            if at_t.block_id() == tb {
-                return Relation::UpdateExtendsT;
+    // `iter()` walks descending, so the first match is the deepest in chain terms.
+    for u_cp in u.iter() {
+        if let Some(t_cp) = t.get(u_cp.height()) {
+            if t_cp.block_id() == u_cp.block_id() {
+                return Some(u_cp.height());
             }
-            return Relation::Diverge;
-        }
-    } else if tb.height > ub.height {
-        if let Some(at_u) = t.get(ub.height) {
-            if at_u.block_id() == ub {
-                return Relation::TExtendsUpdate;
-            }
-            return Relation::Diverge;
         }
     }
-    Relation::Diverge
+    None
+}
+
+/// Build a new [`CheckPoint`] with the same tip as `base` but whose sparse coverage at
+/// heights `<= ceiling_height` is the union of `base`'s and `other`'s. Heights above
+/// `ceiling_height` come from `base` only.
+fn enrich_at_and_below<D>(
+    base: CheckPoint<D>,
+    other: &CheckPoint<D>,
+    ceiling_height: u32,
+) -> CheckPoint<D>
+where
+    D: ToBlockHash + fmt::Debug + Clone,
+{
+    let mut union: BTreeMap<u32, D> = BTreeMap::new();
+    for cp in base.iter() {
+        union.insert(cp.height(), cp.data());
+    }
+    for cp in other.iter() {
+        if cp.height() <= ceiling_height {
+            union.entry(cp.height()).or_insert_with(|| cp.data());
+        }
+    }
+    let mut iter = union.into_iter();
+    let (h0, d0) = iter.next().expect("base is non-empty");
+    let mut cp = CheckPoint::new(h0, d0);
+    for (h, d) in iter {
+        cp = match cp.clone().push(h, d) {
+            Ok(extended) => extended,
+            Err(_) => cp,
+        };
+    }
+    cp
 }
 
 fn merge_sparse<D>(base: CheckPoint<D>, other: CheckPoint<D>) -> CheckPoint<D>
@@ -652,49 +820,43 @@ where
     Some(cp)
 }
 
-/// Extend a predecessor [`CheckPoint`] at `anchor` with the BlockIds in `bid_set` that
-/// are strictly above the anchor, leniently skipping malformed entries (dangling refs,
-/// data-hash mismatch, non-linking pushes).
+/// Splice a branch's `bid_set` onto `pred`. Builds a chain that's the union of pred's
+/// heights and bid_set's heights (where data is available), rebuilt via `push`.
 ///
-/// Mirrors the lenience rules of [`build_branch_lenient`] but starts from a known
-/// predecessor instead of building from scratch.
+/// `_anchor` is the splice point chosen by the caller — retained for signature
+/// compatibility. The union-based build handles BlockIds both above and below the anchor:
+/// pred's data wins on collision; non-linking entries (push failure) are skipped.
 fn lenient_extend_above_anchor<D>(
     pred: CheckPoint<D>,
     cs: &ChangeSet<D>,
     bid_set: &BTreeSet<BlockId>,
-    anchor: BlockId,
+    _anchor: BlockId,
 ) -> Option<CheckPoint<D>>
 where
     D: ToBlockHash + fmt::Debug + Clone,
 {
-    // Group entries strictly above the anchor by height.
-    let mut by_height: BTreeMap<u32, Vec<&BlockId>> = BTreeMap::new();
-    for bid in bid_set {
-        if bid.height > anchor.height {
-            by_height.entry(bid.height).or_default().push(bid);
-        }
+    let mut union: BTreeMap<u32, D> = BTreeMap::new();
+    for cp in pred.iter() {
+        union.insert(cp.height(), cp.data());
     }
-
-    let mut cp = pred;
-    'heights: for (h, candidates) in by_height {
-        for bid in candidates {
-            let data = match cs.blocks.get(&bid.hash) {
-                Some(d) => d.clone(),
-                None => continue,
-            };
-            if data.to_blockhash() != bid.hash {
-                continue;
-            }
-            match cp.clone().push(h, data) {
-                Ok(extended) => {
-                    cp = extended;
-                    continue 'heights;
-                }
-                Err(_) => continue,
-            }
+    for bid in bid_set {
+        let data = match cs.blocks.get(&bid.hash) {
+            Some(d) => d.clone(),
+            None => continue,
+        };
+        if data.to_blockhash() != bid.hash {
+            continue;
         }
-        // No candidate at `h` linked successfully ⇒ stop extending here.
-        break;
+        union.entry(bid.height).or_insert(data);
+    }
+    let mut iter = union.into_iter();
+    let (h0, d0) = iter.next().expect("pred is non-empty");
+    let mut cp = CheckPoint::new(h0, d0);
+    for (h, d) in iter {
+        cp = match cp.clone().push(h, d) {
+            Ok(extended) => extended,
+            Err(_) => cp,
+        };
     }
     Some(cp)
 }

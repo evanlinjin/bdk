@@ -165,9 +165,10 @@ fn check_invariants(graph: &BlockGraph<BlockHash>) -> Result<(), TestCaseError> 
         }
     }
 
-    // (f) every quarantined fragment has its outer-key tip matching a real
-    //     fragment, anchors are below the tip, and *no anchor is reachable from a
-    //     live tip* (cascade is at fixed point).
+    // (f) every quarantined fragment has its outer-key tip matching a real fragment
+    //     and anchors below the tip. Cascade is at fixed point: every fragment is
+    //     either (i) anchor-unreachable or (ii) reachable but the splice can't
+    //     materialise the tip (data missing) — in which case it correctly waits.
     for (tip_id, frag) in graph.quarantined() {
         prop_assert!(!frag.anchors.is_empty(), "quarantined fragment has no anchors");
         for anchor in &frag.anchors {
@@ -175,16 +176,27 @@ fn check_invariants(graph: &BlockGraph<BlockHash>) -> Result<(), TestCaseError> 
                 anchor.height < tip_id.height,
                 "anchor {anchor:?} not below tip {tip_id:?}",
             );
-            let reachable = graph.tips().any(|tip| {
-                tip.get(anchor.height)
-                    .map(|cp| cp.block_id() == *anchor)
-                    .unwrap_or(false)
-            });
-            prop_assert!(
-                !reachable,
-                "quarantined fragment {tip_id:?} has reachable anchor {anchor:?} — cascade failed",
-            );
         }
+        let releasable = frag.anchors.iter().rev().any(|anchor| {
+            let pred = match graph
+                .tips()
+                .find_map(|tip| tip.get(anchor.height).filter(|cp| cp.block_id() == *anchor))
+            {
+                Some(p) => p,
+                None => return false,
+            };
+            let mut cp = pred;
+            for (h, d) in &frag.blocks {
+                if let Ok(extended) = cp.clone().push(*h, d.clone()) {
+                    cp = extended;
+                }
+            }
+            cp.block_id() == *tip_id
+        });
+        prop_assert!(
+            !releasable,
+            "quarantined fragment {tip_id:?} could be released but wasn't — cascade failed",
+        );
     }
 
     Ok(())
@@ -200,7 +212,6 @@ proptest! {
     /// the `Diverge` branch doesn't enrich tips with shared common-ancestor history.
     /// Resulting sparse coverage of tip chains depends on the order updates arrived.
     #[test]
-    #[ignore = "known order-dependence in absorb_tip; see bottom-of-file notes"]
     fn apply_update_order_independence(
         updates in prop::collection::vec(arb_checkpoint(), 1..10),
         seed: u64,
@@ -238,7 +249,6 @@ proptest! {
     /// live tip's chain after the original anchored delta was computed, and absorbed
     /// tips lack tombstones in the persisted state. See bottom-of-file notes.
     #[test]
-    #[ignore = "known: deltas don't carry merged-in heights or tombstones"]
     fn delta_accumulation_matches_direct_apply(
         updates in prop::collection::vec(arb_checkpoint(), 1..10),
     ) {
@@ -322,9 +332,15 @@ proptest! {
     /// then applying them via `apply_changeset` in any order should produce the same
     /// final graph as direct application. Quarantine + cascade are what make this work.
     ///
-    /// **CURRENTLY FAILS** for the same reason as `delta_accumulation_matches_direct_apply`.
+    /// **CURRENTLY FAILS in an edge-case shuffle.** Most shuffled orders converge;
+    /// some interleavings of multi-tip merges with sparse-coverage chains end up with
+    /// the canonical graph having a tip absorbed (via `TExtendsUpdate`/cross-tip
+    /// merge) that the replay reconstructs as a separate tip. The structural cause is
+    /// that the per-delta diff doesn't fully describe absorptions across deltas; a
+    /// proper fix likely requires either richer delta emission (full chain-bid set
+    /// for absorbing tips) or tombstones for absorbed tips in the changeset.
     #[test]
-    #[ignore = "known: deltas don't carry merged-in heights or tombstones"]
+    #[ignore = "shuffled-replay edge case; needs richer absorption tracking in deltas"]
     fn out_of_order_delta_application_converges(
         updates in prop::collection::vec(arb_checkpoint(), 1..8),
         seed: u64,
@@ -353,41 +369,33 @@ proptest! {
 }
 
 // ============================================================================
-// Known bugs documented by the three `#[ignore]`'d properties above
+// Remaining gap documented by the one `#[ignore]`'d property above
 // ============================================================================
 //
-// Three distinct order-dependence bugs surface under proptest fuzzing. They
-// share a root cause: the live tip representation is a per-tip independent
-// sparse chain, with no shared "all observed BlockIds at each height" structure.
+// `absorb_tip` was rewritten to merge sparse coverage across all tips with a
+// fixed-point enrichment pass (resolving the original three order-dependence
+// bugs proptest surfaced — `UpdateExtendsT` / `TExtendsUpdate` dropping
+// coverage; `Diverge` not unifying shared-ancestor history; and the missing
+// tombstone path that left stale tips after reconstruction).
 //
-// 1. `absorb_tip` drops sparse coverage on `UpdateExtendsT` / `TExtendsUpdate`.
-//    When relate() says one CheckPoint strictly extends another, the loop drops
-//    the shorter one — losing heights the shorter one has but the longer one
-//    doesn't. Example: tip G→5→6 absorbed by update G→6→7 → result G→6→7,
-//    height 5 lost.
+// The remaining `#[ignore]`'d test — `out_of_order_delta_application_converges`
+// — hits a deeper edge case: when deltas are applied in shuffled order via
+// `apply_changeset`, certain intermediate states drop a tip that was absorbed
+// in canonical apply but lives separately in replay. Concretely: when delta
+// emission writes branches[T] = chain_bids - absorbed_internal, the diff may
+// exclude transitively-referenced BlockIds that aren't in any directly-named
+// branches set. A reconstruct-time transitive expansion (`expand_transitively`)
+// partly closes this, but adversarial shuffles still find cases where the
+// final live-tip set differs by one absorbed-vs-separate tip.
 //
-// 2. `absorb_tip` Diverge case doesn't enrich shared history.
-//    When two tips diverge above a common ancestor, each maintains its own
-//    sparse view of the heights at-or-below the common ancestor. Observations
-//    of heights below the divergence point made in one tip don't propagate to
-//    the other.
+// The robust fix likely requires either tombstones for absorbed tips in the
+// changeset (so reconstruction can drop them) or richer delta emission that
+// re-asserts the full chain-bid set for absorbing tips. Both have monotone-
+// CRDT design considerations to work out.
 //
-// 3. Anchored deltas lose merged-in heights and lack tombstones.
-//    `apply_update` emits a delta based on the chain at apply time. Heights
-//    later merged into a tip's chain don't get re-emitted in any delta. Also,
-//    no tombstone is emitted when a tip is absorbed, so reconstruction sees
-//    stale tips that direct apply has long since dropped.
-//
-// Resolution options sketched:
-// - Global observation index (`BTreeMap<u32, BTreeSet<BlockHash>>` on
-//   `BlockGraph`) — sparse coverage becomes a single shared structure, tip
-//   chains materialize from it. Fixes all three.
-// - Tombstoning in `ChangeSet` — fixes (3) directly.
-// - Post-absorb enrichment fixed-point — fixes (1) and (2).
-// - Revert implicit-anchor deltas to full-chain emission — fixes (3) at the
-//   cost of restoring quadratic storage growth.
-//
-// The 5 properties above that pass exercise: invariants under arbitrary apply
-// sequences, invariants under fuzzy changesets, `Merge` commutativity +
-// idempotence, round-trip via `initial_changeset`, and panic-freedom on
-// malformed input.
+// The 7 passing properties exercise: order independence of `apply_update`,
+// `Merge` commutativity + idempotence on built changesets, round-trip via
+// `initial_changeset`, panic-freedom on malformed input, invariants under
+// arbitrary apply sequences, invariants under fuzzy changesets, and the
+// "delta accumulation matches direct apply" property (where both proceed in
+// the same order).

@@ -1023,15 +1023,12 @@ fn apply_update_delta_shape_uses_anchor_not_full_chain() {
     let set: Vec<BlockId> = set.iter().copied().collect();
     assert_eq!(set, vec![block(1, "A"), block(2, "B")]);
 
-    // Data for B is new and should be in `blocks`. Data for A should *not* be, because
-    // A was already known to `self` before the second apply.
+    // Data for every referenced BlockId is included so the delta is self-contained for
+    // out-of-order receivers; `Merge` first-write-wins dedupes data on accumulation.
     let b_hash: BlockHash = hash!("B");
     let a_hash: BlockHash = hash!("A");
     assert!(d2.blocks.contains_key(&b_hash));
-    assert!(
-        !d2.blocks.contains_key(&a_hash),
-        "anchor's data should not be re-emitted",
-    );
+    assert!(d2.blocks.contains_key(&a_hash));
 }
 
 #[test]
