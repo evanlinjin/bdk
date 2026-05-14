@@ -421,6 +421,91 @@ fn changeset_size_is_linear_in_chain_length() {
 }
 
 #[test]
+fn apply_update_fast_path_does_not_touch_unrelated_tips() {
+    // Create a graph with two tips: T at height 20 (canonical) and S at height 10
+    // (lower fork). Apply an update extending T to T21. S's CheckPoint Arc must
+    // remain unchanged (Arc::ptr_eq) — the fast path touches only T's tip slot.
+    let g = genesis();
+    let (mut graph, _) = BlockGraph::from_genesis(g);
+    let (u_long, hs_long) = dense_chain(g, &(1..=20).collect::<Vec<u32>>());
+    let (u_short, _) = dense_chain(g, &(100..=109).collect::<Vec<u32>>()); // height 10, distinct hashes
+    graph.apply_update(u_long).unwrap();
+    graph.apply_update(u_short).unwrap();
+    assert_eq!(graph.tip_count(), 2);
+
+    // Find the height-10 (non-canonical) tip and snapshot its Arc identity.
+    let short_tip_before = graph
+        .tips()
+        .find(|cp| cp.height() == 10)
+        .expect("short tip present")
+        .clone();
+
+    // Extend the long tip to height 21.
+    let mut chain_to_21 = hs_long.clone();
+    let h21 = header(hs_long[20].block_hash(), 21);
+    chain_to_21.push(h21);
+    let blocks_to_21: Vec<(u32, Header)> = chain_to_21
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (i as u32, *h))
+        .collect();
+    let extend = CheckPoint::from_blocks(blocks_to_21).unwrap();
+    graph.apply_update(extend).unwrap();
+
+    // Long tip should now be at 21; short tip is unchanged.
+    let new_long_tip = graph
+        .tips()
+        .find(|cp| cp.height() == 21)
+        .expect("long tip extended");
+    assert_eq!(new_long_tip.height(), 21);
+    let short_tip_after = graph
+        .tips()
+        .find(|cp| cp.height() == 10)
+        .expect("short tip still present");
+    // The Arc backing the short tip's CheckPoint must be the same identity —
+    // the fast path didn't re-materialise it.
+    assert!(
+        short_tip_before.eq_ptr(short_tip_after),
+        "short tip's CheckPoint Arc should be untouched by extension of unrelated tip",
+    );
+}
+
+#[test]
+fn apply_update_falls_back_to_recompute_on_fork() {
+    // Apply a chain extending the canonical tip, then a divergent fork —
+    // the fork lands via the recompute fallback. Verify final state matches
+    // what `from_changeset` produces.
+    let g = genesis();
+    let (mut graph_a, _) = BlockGraph::from_genesis(g);
+    let (u1, _) = dense_chain(g, &[1, 2, 3]);
+    let (u2, _) = dense_chain(g, &[10, 20]); // different markers ⇒ fork at heights 1, 2
+    graph_a.apply_update(u1.clone()).unwrap();
+    graph_a.apply_update(u2.clone()).unwrap();
+    assert_eq!(graph_a.tip_count(), 2);
+
+    // Compare with a graph built by from_changeset.
+    let cs = graph_a.initial_changeset();
+    let graph_b = BlockGraph::from_changeset(cs).unwrap();
+    assert_eq!(graph_a, graph_b);
+}
+
+#[test]
+fn apply_update_sparse_link_addition_triggers_recompute() {
+    // Apply a dense chain G→1→…→5, then a sparse update G→3→5 (which adds
+    // sparse_links to existing blocks). Verify final state matches what
+    // `from_changeset` produces from the accumulated state.
+    let g = genesis();
+    let (mut graph_a, _) = BlockGraph::from_genesis(g);
+    let (u_dense, hs) = dense_chain(g, &[1, 2, 3, 4, 5]);
+    graph_a.apply_update(u_dense).unwrap();
+    let u_sparse = sparse_chain(&hs, &[0, 3, 5]);
+    graph_a.apply_update(u_sparse).unwrap();
+    let cs = graph_a.initial_changeset();
+    let graph_b = BlockGraph::from_changeset(cs).unwrap();
+    assert_eq!(graph_a, graph_b);
+}
+
+#[test]
 fn is_block_in_chain_against_intermediate_chain_tip() {
     // chain_tip doesn't have to be a current live tip — it can be any BlockId
     // on a live tip's chain. Queries should answer against the prefix of the

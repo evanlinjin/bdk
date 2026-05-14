@@ -173,6 +173,13 @@ impl BlockGraph {
     ///
     /// Fails with [`CannotConnectError`] iff `update`'s bottom isn't this
     /// graph's genesis.
+    ///
+    /// Fast path: when every newly-inserted block extends an existing live tip
+    /// via `Header::prev_blockhash` (or a sparse_link target that's itself a
+    /// live tip), update `self.tips` incrementally with `CheckPoint::push` in
+    /// `O(m)` for `m` new blocks. Falls back to full [`recompute`](Self::recompute)
+    /// on any structural change (fork attached below a current tip, orphan,
+    /// quarantine-affecting insert) — the fallback is always correct.
     pub fn apply_update(
         &mut self,
         update: CheckPoint<Header>,
@@ -185,11 +192,16 @@ impl BlockGraph {
         }
         let mut delta = ChangeSet::default();
         let chain: Vec<_> = update.iter().collect();
-        for (i, cp) in chain.iter().enumerate() {
+        let mut needs_recompute = false;
+        let mut newly_inserted_hashes = BTreeSet::<BlockHash>::new();
+        // Bottom-up iteration: parents land in `self.tips`/`tip_by_hash` before
+        // their children are processed, so each child's fast-path extension
+        // sees its parent as a live tip.
+        for (i, cp) in chain.iter().enumerate().rev() {
             let bid = cp.block_id();
             let header = cp.data();
-            // Determine sparse link to this cp's prev (the next CheckPoint in
-            // the descending iter, i.e., chain[i + 1]).
+            // Sparse link is to `chain[i + 1]` (the next-lower block in the
+            // descending iter) when non-adjacent or hash-mismatched.
             let mut new_sparse_links = BTreeSet::<BlockId>::new();
             if let Some(prev_cp) = chain.get(i + 1) {
                 let prev_bid = prev_cp.block_id();
@@ -197,12 +209,16 @@ impl BlockGraph {
                     new_sparse_links.insert(prev_bid);
                 }
             }
-            // Insert into self.blocks if absent; otherwise merge sparse links.
-            match self.blocks.get_mut(&bid) {
+            // Insert/merge into `self.blocks`; track newness for classification.
+            let (block_is_new, truly_new_links) = match self.blocks.get_mut(&bid) {
                 None => {
                     self.blocks
                         .insert(bid, (header, new_sparse_links.clone()));
-                    delta.blocks.insert(bid, (header, new_sparse_links));
+                    delta
+                        .blocks
+                        .insert(bid, (header, new_sparse_links.clone()));
+                    newly_inserted_hashes.insert(bid.hash);
+                    (true, new_sparse_links)
                 }
                 Some((_, existing_links)) => {
                     let truly_new: BTreeSet<BlockId> = new_sparse_links
@@ -211,12 +227,84 @@ impl BlockGraph {
                         .collect();
                     if !truly_new.is_empty() {
                         existing_links.extend(truly_new.iter().copied());
-                        delta.blocks.insert(bid, (header, truly_new));
+                        delta.blocks.insert(bid, (header, truly_new.clone()));
                     }
+                    (false, truly_new)
+                }
+            };
+            // Skip classification once we've decided to recompute, or for genesis.
+            if needs_recompute || bid.height == 0 {
+                continue;
+            }
+            // Adding sparse_links to a block we already had may turn it into a
+            // tip (or its ancestor) via paths we haven't checked. The fast path
+            // doesn't have enough local info to maintain invariants safely.
+            if !block_is_new {
+                if !truly_new_links.is_empty() {
+                    needs_recompute = true;
+                }
+                continue;
+            }
+            // Try fast-path: extend a current live tip.
+            //   1. Natural parent via `Header::prev_blockhash`.
+            //   2. Highest sparse_link target that's itself a live tip.
+            let chosen_tip_parent = self
+                .tip_by_hash
+                .get(&header.prev_blockhash)
+                .copied()
+                .or_else(|| {
+                    truly_new_links
+                        .iter()
+                        .filter(|sp| self.tip_by_hash.contains_key(&sp.hash))
+                        .max_by_key(|sp| sp.height)
+                        .copied()
+                });
+            match chosen_tip_parent {
+                Some(parent_bid) => {
+                    let parent_cp = self
+                        .tips
+                        .remove(&parent_bid)
+                        .expect("classified as live tip");
+                    self.tip_by_hash.remove(&parent_bid.hash);
+                    match parent_cp.clone().push(bid.height, header) {
+                        Ok(new_cp) => {
+                            self.tips.insert(bid, new_cp);
+                            self.tip_by_hash.insert(bid.hash, bid);
+                        }
+                        Err(_) => {
+                            // Push rejected the new block (shouldn't happen for
+                            // valid updates). Restore the tip and fall back.
+                            self.tips.insert(parent_bid, parent_cp);
+                            self.tip_by_hash.insert(parent_bid.hash, parent_bid);
+                            needs_recompute = true;
+                        }
+                    }
+                }
+                None => {
+                    // No live tip can absorb this block — fork, orphan, or
+                    // attachment to an already-absorbed ancestor. Defer to
+                    // `recompute` for the safe answer.
+                    needs_recompute = true;
                 }
             }
         }
-        self.recompute();
+        // If any newly-inserted hash is the missing parent of a currently
+        // quarantined block, that block could now be released — but the
+        // cascade may absorb existing tips in non-trivial ways. Safer to
+        // recompute.
+        if !needs_recompute
+            && !self.quarantined.is_empty()
+            && self.quarantined.iter().any(|bid| {
+                self.blocks
+                    .get(bid)
+                    .is_some_and(|(h, _)| newly_inserted_hashes.contains(&h.prev_blockhash))
+            })
+        {
+            needs_recompute = true;
+        }
+        if needs_recompute {
+            self.recompute();
+        }
         Ok(delta)
     }
 
