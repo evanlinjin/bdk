@@ -1,4 +1,7 @@
 //! The [`Branches`] index used by [`crate::block_graph::ChangeSet`].
+//!
+//! Lives as a crate-private module at the chain crate root and is re-exported through
+//! [`crate::block_graph::Branches`] (its semantic owner).
 
 use core::fmt;
 

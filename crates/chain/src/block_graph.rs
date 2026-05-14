@@ -104,8 +104,7 @@ where
     }
 }
 
-mod branches;
-pub use branches::Branches;
+pub use crate::branches::Branches;
 
 /// Strictly-additive changeset for [`BlockGraph`].
 ///
