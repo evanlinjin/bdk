@@ -419,3 +419,49 @@ fn changeset_size_is_linear_in_chain_length() {
     let expected = (n * m + 1) as usize;
     assert_eq!(persisted.blocks.len(), expected);
 }
+
+#[test]
+fn is_block_in_chain_against_intermediate_chain_tip() {
+    // chain_tip doesn't have to be a current live tip — it can be any BlockId
+    // on a live tip's chain. Queries should answer against the prefix of the
+    // chain ending at chain_tip.
+    let g = genesis();
+    let (mut graph, _) = BlockGraph::from_genesis(g);
+    let (update, hs) = dense_chain(g, &[1, 2, 3, 4, 5]);
+    graph.apply_update(update).unwrap();
+    // Live tip is at height 5. Use (3, hs[3]) as the chain_tip in the query.
+    let bid_g = BlockId {
+        height: 0,
+        hash: hs[0].block_hash(),
+    };
+    let bid2 = BlockId {
+        height: 2,
+        hash: hs[2].block_hash(),
+    };
+    let bid3 = BlockId {
+        height: 3,
+        hash: hs[3].block_hash(),
+    };
+    let bid4 = BlockId {
+        height: 4,
+        hash: hs[4].block_hash(),
+    };
+    // (3, hs[3]) is on the chain — query should resolve against the prefix.
+    assert_eq!(graph.is_block_in_chain(bid_g, bid3).unwrap(), Some(true));
+    assert_eq!(graph.is_block_in_chain(bid2, bid3).unwrap(), Some(true));
+    assert_eq!(graph.is_block_in_chain(bid3, bid3).unwrap(), Some(true));
+    // (4, hs[4]) is above bid3 — can't be on the chain ending at bid3.
+    assert_eq!(graph.is_block_in_chain(bid4, bid3).unwrap(), Some(false));
+    // Wrong hash at known height → Some(false).
+    let bid2_wrong = BlockId {
+        height: 2,
+        hash: BlockHash::all_zeros(),
+    };
+    assert_eq!(graph.is_block_in_chain(bid2_wrong, bid3).unwrap(), Some(false));
+    // Unknown chain_tip → Ok(None).
+    let unknown_tip = BlockId {
+        height: 99,
+        hash: BlockHash::all_zeros(),
+    };
+    assert_eq!(graph.is_block_in_chain(bid_g, unknown_tip).unwrap(), None);
+}

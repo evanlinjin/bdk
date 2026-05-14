@@ -416,14 +416,26 @@ impl ChainOracle for BlockGraph {
         block: BlockId,
         chain_tip: BlockId,
     ) -> Result<Option<bool>, Self::Error> {
-        let tip = match self.tips.get(&chain_tip) {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-        match tip.get(block.height) {
-            Some(cp) => Ok(Some(cp.hash() == block.hash)),
-            None => Ok(None),
+        // `block` is above `chain_tip` — it can't be on the chain that ends at
+        // `chain_tip`.
+        if block.height > chain_tip.height {
+            return Ok(Some(false));
         }
+        // Find any live tip whose chain contains `chain_tip` at `chain_tip.height`.
+        // `chain_tip` doesn't have to be a top-level tip — it can be any
+        // ancestor on some retained tip's chain.
+        for tip in self.tips.values() {
+            let at_chain_tip = match tip.get(chain_tip.height) {
+                Some(cp) => cp,
+                None => continue,
+            };
+            if at_chain_tip.block_id() != chain_tip {
+                continue;
+            }
+            // `chain_tip` is on this tip's chain. Use it to answer the query.
+            return Ok(tip.get(block.height).map(|cp| cp.block_id() == block));
+        }
+        Ok(None)
     }
 
     fn get_chain_tip(&self) -> Result<BlockId, Self::Error> {
