@@ -1,7 +1,7 @@
 #![cfg(feature = "miniscript")]
 
 use bdk_chain::{
-    block_graph::{ApplyChangeSetError, BlockGraph, CannotConnectError, ChangeSet},
+    block_graph::{BlockGraph, CannotConnectError, ChangeSet, MissingGenesisError},
     BlockId, ChainOracle, Merge,
 };
 use bdk_testenv::{chain_update, hash};
@@ -235,23 +235,84 @@ fn apply_changeset_order_independence() {
 fn from_changeset_rejects_empty() {
     let cs = ChangeSet::<BlockHash>::default();
     let err = BlockGraph::<BlockHash>::from_changeset(cs).unwrap_err();
-    assert_eq!(err, ApplyChangeSetError::MissingGenesis);
+    assert_eq!(err, MissingGenesisError);
 }
 
 #[test]
-fn from_changeset_rejects_dangling_branch_ref() {
+fn from_changeset_silently_skips_dangling_branch_refs() {
     use bdk_chain::collections::BTreeSet;
+    // A branch references a BlockId whose hash is not in `blocks`. Reconstruction should
+    // silently drop the dangling entry, the branch's effective tip falls back to whatever
+    // links cleanly (genesis here), so the resulting graph is just the genesis tip.
     let mut cs = ChangeSet::<BlockHash>::default();
     cs.blocks.insert(hash!("G"), hash!("G"));
     let mut set = BTreeSet::<BlockId>::new();
     set.insert(block(0, "G"));
     set.insert(block(1, "MISSING")); // no entry in `blocks` for hash!("MISSING")
     cs.branches.insert(block(1, "MISSING"), set);
-    let err = BlockGraph::<BlockHash>::from_changeset(cs).unwrap_err();
-    assert!(
-        matches!(err, ApplyChangeSetError::DanglingBranchRef { .. }),
-        "expected DanglingBranchRef, got {err:?}"
-    );
+    let graph = BlockGraph::<BlockHash>::from_changeset(cs)
+        .expect("dangling refs should be silently skipped, not errored");
+    assert_eq!(graph.tip_count(), 1);
+    assert_eq!(graph.get_chain_tip().unwrap(), block(0, "G"));
+}
+
+#[test]
+fn from_changeset_silently_skips_prev_blockhash_mismatch() {
+    use bdk_chain::collections::BTreeSet;
+    use bitcoin::block::Header;
+    use bitcoin::{hashes::Hash, CompactTarget, TxMerkleNode};
+
+    fn header(prev: BlockHash) -> Header {
+        Header {
+            version: bitcoin::block::Version::ONE,
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 0,
+            bits: CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        }
+    }
+    // Genesis header has prev=all_zeros.
+    let zero_hash = BlockHash::all_zeros();
+    let h0 = header(zero_hash);
+    let g_hash = h0.block_hash();
+    // h1 links to h0 properly.
+    let h1 = header(g_hash);
+    let h1_hash = h1.block_hash();
+    // h2_bad links to the *wrong* prev (zero_hash instead of h1_hash). When we try to
+    // push it onto the chain at h1, push must fail and the lenient builder must skip it.
+    let h2_bad = header(zero_hash);
+    let h2_bad_hash = h2_bad.block_hash();
+
+    let mut cs = ChangeSet::<Header>::default();
+    cs.blocks.insert(g_hash, h0);
+    cs.blocks.insert(h1_hash, h1);
+    cs.blocks.insert(h2_bad_hash, h2_bad);
+    let mut set = BTreeSet::<BlockId>::new();
+    set.insert(BlockId {
+        height: 0,
+        hash: g_hash,
+    });
+    set.insert(BlockId {
+        height: 1,
+        hash: h1_hash,
+    });
+    set.insert(BlockId {
+        height: 2,
+        hash: h2_bad_hash,
+    });
+    let claimed_tip = BlockId {
+        height: 2,
+        hash: h2_bad_hash,
+    };
+    cs.branches.insert(claimed_tip, set);
+
+    let graph =
+        BlockGraph::<Header>::from_changeset(cs).expect("non-linking entry should be skipped");
+    // The non-linking h2_bad must be dropped, leaving the tip at h1.
+    assert_eq!(graph.tip_count(), 1);
+    assert_eq!(graph.get_chain_tip().unwrap().height, 1);
+    assert_eq!(graph.get_chain_tip().unwrap().hash, h1_hash);
 }
 
 #[test]
