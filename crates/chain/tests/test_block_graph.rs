@@ -1106,3 +1106,214 @@ fn release_promotes_chained_quarantined_fragments() {
     assert_eq!(graph, graph_a);
 }
 
+
+#[test]
+fn apply_update_with_ancestor_update_is_noop() {
+    // `relate::TExtendsUpdate`: applying a strict ancestor of the current tip should
+    // leave the graph unchanged and produce an empty delta.
+    let (mut graph, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    graph
+        .apply_update(chain_update![(0, hash!("G")), (1, hash!("A")), (2, hash!("B"))])
+        .unwrap();
+    let pre_tip = graph.tip().block_id();
+
+    let delta = graph
+        .apply_update(chain_update![(0, hash!("G")), (1, hash!("A"))])
+        .unwrap();
+
+    assert_eq!(graph.tip_count(), 1);
+    assert_eq!(graph.tip().block_id(), pre_tip);
+    assert_eq!(graph.tip().block_id(), block(2, "B"));
+    // Nothing new — neither in blocks nor in branches.
+    assert!(delta.blocks.is_empty(), "no new block data in ancestor update");
+    assert!(
+        delta.branches.is_empty()
+            || delta.branches.values().all(|s| s.is_empty()),
+        "delta.branches should be empty, got {:?}",
+        delta.branches,
+    );
+}
+
+#[test]
+fn release_quarantined_promotes_multiple_fragments_at_same_anchor() {
+    // Two fragments share the same candidate anchor (5, B). When (5, B) becomes
+    // reachable, both must release in one cascade pass.
+    use bdk_chain::collections::BTreeSet;
+
+    let (mut graph, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    let mut cs = graph.initial_changeset();
+    cs.blocks.insert(hash!("X"), hash!("X"));
+    cs.blocks.insert(hash!("Y"), hash!("Y"));
+
+    let mut set_x = BTreeSet::<BlockId>::new();
+    set_x.insert(block(5, "B"));
+    set_x.insert(block(8, "X"));
+    cs.branches.insert(block(8, "X"), set_x);
+
+    let mut set_y = BTreeSet::<BlockId>::new();
+    set_y.insert(block(5, "B"));
+    set_y.insert(block(10, "Y"));
+    cs.branches.insert(block(10, "Y"), set_y);
+
+    graph.apply_changeset(&cs);
+    assert_eq!(graph.quarantined_count(), 2, "both fragments quarantined");
+
+    graph
+        .apply_update(chain_update![(0, hash!("G")), (5, hash!("B"))])
+        .unwrap();
+
+    assert_eq!(
+        graph.quarantined_count(),
+        0,
+        "both fragments should release on the shared anchor",
+    );
+    // Live tips: genesis is absorbed into (5,B); then (8,X) and (10,Y) on top.
+    assert!(graph.tip_count() >= 2);
+    // Best tip is (10, Y) — highest height.
+    assert_eq!(graph.get_chain_tip().unwrap(), block(10, "Y"));
+}
+
+#[test]
+fn is_block_in_chain_against_non_canonical_tip() {
+    // Two divergent chains both at height 5, sharing a height-2 ancestor.
+    // Queries against the non-canonical tip should follow that tip's chain, not the
+    // canonical one's.
+    let (mut graph, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    graph
+        .apply_update(chain_update![
+            (0, hash!("G")),
+            (2, hash!("A")),
+            (5, hash!("X"))
+        ])
+        .unwrap();
+    graph
+        .apply_update(chain_update![
+            (0, hash!("G")),
+            (2, hash!("A")),
+            (5, hash!("Y"))
+        ])
+        .unwrap();
+    assert_eq!(graph.tip_count(), 2);
+
+    let canonical = graph.get_chain_tip().unwrap();
+    let non_canonical = graph
+        .tips()
+        .map(|cp| cp.block_id())
+        .find(|bid| *bid != canonical)
+        .expect("two tips exist");
+
+    // Shared ancestors are on both chains.
+    assert_eq!(
+        graph.is_block_in_chain(block(0, "G"), canonical).unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        graph.is_block_in_chain(block(0, "G"), non_canonical).unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        graph.is_block_in_chain(block(2, "A"), canonical).unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        graph.is_block_in_chain(block(2, "A"), non_canonical).unwrap(),
+        Some(true)
+    );
+
+    // The non-canonical tip's own BlockId is on its chain but not on the canonical one.
+    assert_eq!(
+        graph.is_block_in_chain(non_canonical, non_canonical).unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        graph.is_block_in_chain(non_canonical, canonical).unwrap(),
+        Some(false)
+    );
+}
+
+#[test]
+fn from_changeset_skips_branch_with_no_anchors_below_tip() {
+    // Malformed entry: `branches[(5, X)] = {(5, X)}` — the set contains only the tip
+    // itself, no anchor below it. Reconstruction should silently skip the entry, not
+    // quarantine it (a fragment with no anchors can never release).
+    use bdk_chain::collections::BTreeSet;
+
+    let (_, init) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    let mut cs = init;
+    cs.blocks.insert(hash!("X"), hash!("X"));
+    let mut set = BTreeSet::<BlockId>::new();
+    set.insert(block(5, "X"));
+    cs.branches.insert(block(5, "X"), set);
+
+    let graph = BlockGraph::<BlockHash>::from_changeset(cs)
+        .expect("genesis is self-consistent; malformed entry doesn't fail reconstruct");
+    assert_eq!(graph.tip_count(), 1, "only genesis remains");
+    assert_eq!(
+        graph.quarantined_count(),
+        0,
+        "no anchors means nothing to quarantine — entry is dropped",
+    );
+}
+
+#[test]
+fn release_quarantined_with_anchor_data_in_blocks() {
+    // Overlap case: producer ships data for both the anchor and the tip. When the
+    // anchor becomes reachable, `push`'s height check naturally drops the anchor entry
+    // (height not greater than the predecessor's), and the tip pushes through.
+    use bdk_chain::collections::BTreeSet;
+
+    let (mut graph, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    let mut cs = graph.initial_changeset();
+    cs.blocks.insert(hash!("B"), hash!("B"));
+    cs.blocks.insert(hash!("X"), hash!("X"));
+    let mut set = BTreeSet::<BlockId>::new();
+    set.insert(block(5, "B"));
+    set.insert(block(10, "X"));
+    cs.branches.insert(block(10, "X"), set);
+
+    graph.apply_changeset(&cs);
+    assert_eq!(graph.quarantined_count(), 1);
+
+    // Confirm the overlap: both heights 5 (anchor) and 10 (tip) are in `blocks`.
+    let (_, frag) = graph.quarantined().next().unwrap();
+    assert!(frag.anchors.contains(&block(5, "B")));
+    assert!(
+        frag.blocks.contains_key(&5),
+        "anchor data is in `blocks` (overlap case)",
+    );
+    assert!(frag.blocks.contains_key(&10));
+
+    graph
+        .apply_update(chain_update![(0, hash!("G")), (5, hash!("B"))])
+        .unwrap();
+    assert_eq!(graph.quarantined_count(), 0);
+    assert_eq!(graph.get_chain_tip().unwrap(), block(10, "X"));
+}
+
+#[test]
+fn apply_changeset_is_idempotent() {
+    // Applying the same changeset twice should leave the graph in the same state as
+    // applying it once.
+    let (mut graph_once, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    graph_once
+        .apply_update(chain_update![(0, hash!("G")), (1, hash!("A")), (2, hash!("B"))])
+        .unwrap();
+    let cs = graph_once.initial_changeset();
+
+    let (mut graph_twice, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    graph_twice.apply_changeset(&cs);
+    graph_twice.apply_changeset(&cs); // again
+
+    assert_eq!(graph_once, graph_twice);
+}
+
+#[test]
+fn apply_empty_changeset_is_noop() {
+    let (mut graph, _) = BlockGraph::<BlockHash>::from_genesis(hash!("G"));
+    graph
+        .apply_update(chain_update![(0, hash!("G")), (1, hash!("A"))])
+        .unwrap();
+    let snapshot = graph.clone();
+    graph.apply_changeset(&ChangeSet::<BlockHash>::default());
+    assert_eq!(graph, snapshot);
+}
