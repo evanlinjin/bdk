@@ -5,6 +5,8 @@ use bitcoin::{OutPoint, Transaction, TxOut};
 #[cfg(feature = "miniscript")]
 pub mod keychain_txout;
 pub mod spk_txout;
+#[cfg(feature = "miniscript")]
+pub mod txout_index;
 
 /// Utilities for indexing transaction data.
 ///
