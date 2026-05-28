@@ -83,11 +83,13 @@ where
     )?;
 
     if let Some(chain_update) = update.chain_update.clone() {
-        let _ = chain
-            .apply_update(chain_update)
+        let mut cs = bdk_chain::local_chain::ChangeSet::default();
+        chain
+            .apply_update(chain_update, &mut cs)
             .map_err(|err| anyhow::anyhow!("LocalChain update error: {err:?}"))?;
     }
-    let _ = graph.apply_update(update.tx_update.clone());
+    let mut graph_cs = bdk_chain::indexed_tx_graph::ChangeSet::default();
+    graph.apply_update(update.tx_update.clone(), &mut graph_cs);
 
     Ok(update)
 }
@@ -187,7 +189,8 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
             .any(|tx| tx.compute_txid() == send_txid),
         "sync response must include the send_tx"
     );
-    let changeset = graph.apply_update(sync_response.tx_update.clone());
+    let mut changeset = bdk_chain::indexed_tx_graph::ChangeSet::default();
+    graph.apply_update(sync_response.tx_update.clone(), &mut changeset);
     assert!(
         changeset.tx_graph.txs.contains(&send_tx),
         "tx graph must deem send_tx relevant and include it"
@@ -217,7 +220,8 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
             .any(|(txid, _)| *txid == send_txid),
         "sync response must track send_tx as missing from mempool"
     );
-    let changeset = graph.apply_update(sync_response.tx_update.clone());
+    let mut changeset = bdk_chain::indexed_tx_graph::ChangeSet::default();
+    graph.apply_update(sync_response.tx_update.clone(), &mut changeset);
     assert!(
         changeset.tx_graph.last_evicted.contains_key(&send_txid),
         "tx graph must track send_tx as missing"

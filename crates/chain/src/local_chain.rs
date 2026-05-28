@@ -122,12 +122,16 @@ impl LocalChain<BlockHash> {
     /// [`ApplyHeaderError::CannotConnect`] occurs if the internal call to [`apply_update`] fails.
     ///
     /// [`apply_update`]: Self::apply_update
-    pub fn apply_header_connected_to(
+    pub fn apply_header_connected_to<C>(
         &mut self,
         header: &Header,
         height: u32,
         connected_to: BlockId,
-    ) -> Result<ChangeSet, ApplyHeaderError> {
+        out: &mut C,
+    ) -> Result<(), ApplyHeaderError>
+    where
+        C: AsMut<ChangeSet>,
+    {
         let this = BlockId {
             height,
             hash: header.block_hash(),
@@ -157,7 +161,7 @@ impl LocalChain<BlockHash> {
         )
         .expect("block ids must be in order");
 
-        self.apply_update(update)
+        self.apply_update(update, out)
             .map_err(ApplyHeaderError::CannotConnect)
     }
 
@@ -168,11 +172,15 @@ impl LocalChain<BlockHash> {
     /// use the current block as `connected_to`.
     ///
     /// [`apply_header_connected_to`]: LocalChain::apply_header_connected_to
-    pub fn apply_header(
+    pub fn apply_header<C>(
         &mut self,
         header: &Header,
         height: u32,
-    ) -> Result<ChangeSet, CannotConnectError> {
+        out: &mut C,
+    ) -> Result<(), CannotConnectError>
+    where
+        C: AsMut<ChangeSet>,
+    {
         let connected_to = match height.checked_sub(1) {
             Some(prev_height) => BlockId {
                 height: prev_height,
@@ -183,7 +191,7 @@ impl LocalChain<BlockHash> {
                 hash: header.block_hash(),
             },
         };
-        self.apply_header_connected_to(header, height, connected_to)
+        self.apply_header_connected_to(header, height, connected_to, out)
             .map_err(|err| match err {
                 ApplyHeaderError::InconsistentBlocks => {
                     unreachable!("connected_to is derived from the block so is always consistent")
@@ -296,7 +304,7 @@ where
 
     /// Applies the given `update` to the chain.
     ///
-    /// The method returns [`ChangeSet`] on success. This represents the changes applied to `self`.
+    /// Any changes applied to `self` are written into `out`.
     ///
     /// There must be no ambiguity about which of the existing chain's blocks are still valid and
     /// which are now invalid. That is, the new chain must implicitly connect to a definite block in
@@ -308,14 +316,19 @@ where
     /// An error will occur if the update does not correctly connect with `self`.
     ///
     /// [module-level documentation]: crate::local_chain
-    pub fn apply_update(
+    pub fn apply_update<C>(
         &mut self,
         update: CheckPoint<D>,
-    ) -> Result<ChangeSet<D>, CannotConnectError> {
+        out: &mut C,
+    ) -> Result<(), CannotConnectError>
+    where
+        C: AsMut<ChangeSet<D>>,
+    {
         let (new_tip, changeset) = merge_chains(self.tip.clone(), update)?;
         self.tip = new_tip;
         debug_assert!(self._check_changeset_is_applied(&changeset));
-        Ok(changeset)
+        out.as_mut().merge(changeset);
+        Ok(())
     }
 
     /// Apply the given `changeset`.
@@ -341,14 +354,20 @@ where
 
     /// Insert block into a [`LocalChain`].
     ///
+    /// Any changes applied to `self` are written into `out`.
+    ///
     /// # Errors
     ///
     /// Replacing the block hash of an existing checkpoint will result in an error.
-    pub fn insert_block(
+    pub fn insert_block<C>(
         &mut self,
         height: u32,
         data: D,
-    ) -> Result<ChangeSet<D>, AlterCheckPointError> {
+        out: &mut C,
+    ) -> Result<(), AlterCheckPointError>
+    where
+        C: AsMut<ChangeSet<D>>,
+    {
         if let Some(original_cp) = self.tip.get(height) {
             let original_hash = original_cp.hash();
             if original_hash != data.to_blockhash() {
@@ -358,7 +377,7 @@ where
                     update_hash: Some(data.to_blockhash()),
                 });
             }
-            return Ok(ChangeSet::default());
+            return Ok(());
         }
 
         let mut changeset = ChangeSet::<D>::default();
@@ -374,7 +393,8 @@ where
                     .flatten()
                     .map(|d| d.to_blockhash()),
             })?;
-        Ok(changeset)
+        out.as_mut().merge(changeset);
+        Ok(())
     }
 
     /// Removes blocks from (and inclusive of) the given `block_id`.
@@ -382,14 +402,20 @@ where
     /// This will remove blocks with a height equal or greater than `block_id`, but only if
     /// `block_id` exists in the chain.
     ///
+    /// Any changes applied to `self` are written into `out`.
+    ///
     /// # Errors
     ///
     /// This will fail with [`MissingGenesisError`] if the caller attempts to disconnect from the
     /// genesis block.
-    pub fn disconnect_from(
+    pub fn disconnect_from<C>(
         &mut self,
         block_id: BlockId,
-    ) -> Result<ChangeSet<D>, MissingGenesisError> {
+        out: &mut C,
+    ) -> Result<(), MissingGenesisError>
+    where
+        C: AsMut<ChangeSet<D>>,
+    {
         let mut remove_from = Option::<CheckPoint<D>>::None;
         let mut changeset = ChangeSet::default();
         for cp in self.tip().iter() {
@@ -409,10 +435,11 @@ where
             // "earliest checkpoint to remove" is the genesis block. We disallow removing the
             // genesis block.
             Some(None) => return Err(MissingGenesisError),
-            // If there is nothing to remove, we return an empty changeset.
-            None => return Ok(ChangeSet::default()),
+            // If there is nothing to remove, we leave `out` unchanged.
+            None => return Ok(()),
         };
-        Ok(changeset)
+        out.as_mut().merge(changeset);
+        Ok(())
     }
 
     fn _check_changeset_is_applied(&self, changeset: &ChangeSet<D>) -> bool {
@@ -464,6 +491,12 @@ impl<D> Merge for ChangeSet<D> {
 
     fn is_empty(&self) -> bool {
         self.blocks.is_empty()
+    }
+}
+
+impl<D> AsMut<ChangeSet<D>> for ChangeSet<D> {
+    fn as_mut(&mut self) -> &mut Self {
+        self
     }
 }
 

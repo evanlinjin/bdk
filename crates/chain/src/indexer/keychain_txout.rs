@@ -74,8 +74,9 @@ pub const DEFAULT_LOOKAHEAD: u32 = 25;
 ///
 /// # Change sets
 ///
-/// Methods that can update the last revealed index or add keychains will return [`ChangeSet`] to
-/// report these changes. This should be persisted for future recovery.
+/// Methods that can update the last revealed index or add keychains take a `&mut ChangeSet`
+/// argument and write their changes into it. The accumulated changeset should be persisted for
+/// future recovery.
 ///
 /// ## Synopsis
 ///
@@ -105,7 +106,9 @@ pub const DEFAULT_LOOKAHEAD: u32 = 25;
 /// let _ = txout_index.insert_descriptor(MyKeychain::Internal, internal_descriptor)?;
 /// let _ = txout_index.insert_descriptor(MyKeychain::MyAppUser { user_id: 42 }, descriptor_42)?;
 ///
-/// let new_spk_for_user = txout_index.reveal_next_spk(MyKeychain::MyAppUser{ user_id: 42 });
+/// let mut changeset = bdk_chain::keychain_txout::ChangeSet::default();
+/// let new_spk_for_user =
+///     txout_index.reveal_next_spk(MyKeychain::MyAppUser { user_id: 42 }, &mut changeset);
 /// # Ok::<_, bdk_chain::indexer::keychain_txout::InsertDescriptorError<_>>(())
 /// ```
 ///
@@ -537,8 +540,13 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     /// Store lookahead scripts until `target_index` (inclusive).
     ///
     /// This does not change the global `lookahead` setting.
-    pub fn lookahead_to_target(&mut self, keychain: K, target_index: u32) -> ChangeSet {
-        let mut changeset = ChangeSet::default();
+    ///
+    /// Any changes made by this method are written into `out`.
+    pub fn lookahead_to_target<C>(&mut self, keychain: K, target_index: u32, out: &mut C)
+    where
+        C: AsMut<ChangeSet>,
+    {
+        let changeset = out.as_mut();
         if let Some((next_index, _)) = self.next_index(keychain.clone()) {
             let temp_lookahead = (target_index + 1)
                 .checked_sub(next_index)
@@ -548,8 +556,7 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
                 self.replenish_inner_index_keychain(keychain, temp_lookahead);
             }
         }
-        self._empty_stage_into_changeset(&mut changeset);
-        changeset
+        self._empty_stage_into_changeset(changeset);
     }
 
     fn replenish_inner_index_did(&mut self, did: DescriptorId, lookahead: u32) {
@@ -793,15 +800,17 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     }
 
     /// Convenience method to call [`Self::reveal_to_target`] on multiple keychains.
-    pub fn reveal_to_target_multi(&mut self, keychains: &BTreeMap<K, u32>) -> ChangeSet {
-        let mut changeset = ChangeSet::default();
-
+    ///
+    /// Any changes made by this method are written into `out`.
+    pub fn reveal_to_target_multi<C>(&mut self, keychains: &BTreeMap<K, u32>, out: &mut C)
+    where
+        C: AsMut<ChangeSet>,
+    {
+        let changeset = out.as_mut();
         for (keychain, &index) in keychains {
-            self._reveal_to_target(&mut changeset, keychain.clone(), index);
+            self._reveal_to_target(changeset, keychain.clone(), index);
         }
-
-        self._empty_stage_into_changeset(&mut changeset);
-        changeset
+        self._empty_stage_into_changeset(changeset);
     }
 
     /// Reveals script pubkeys of the `keychain`'s descriptor **up to and including** the
@@ -811,21 +820,24 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     /// the `target_index` is in the hardened index range), this method will make a best-effort and
     /// reveal up to the last possible index.
     ///
-    /// This returns list of newly revealed indices (alongside their scripts) and a
-    /// [`ChangeSet`], which reports updates to the latest revealed index. If no new script
-    /// pubkeys are revealed, then both of these will be empty.
+    /// Returns the list of newly revealed indices (alongside their scripts). If no new script
+    /// pubkeys are revealed, the returned vector will be empty. Any changes to the latest
+    /// revealed index are written into `out`.
     ///
-    /// Returns None if the provided `keychain` doesn't exist.
-    #[must_use]
-    pub fn reveal_to_target(
+    /// Returns `None` if the provided `keychain` doesn't exist.
+    pub fn reveal_to_target<C>(
         &mut self,
         keychain: K,
         target_index: u32,
-    ) -> Option<(Vec<Indexed<ScriptBuf>>, ChangeSet)> {
-        let mut changeset = ChangeSet::default();
-        let revealed_spks = self._reveal_to_target(&mut changeset, keychain, target_index)?;
-        self._empty_stage_into_changeset(&mut changeset);
-        Some((revealed_spks, changeset))
+        out: &mut C,
+    ) -> Option<Vec<Indexed<ScriptBuf>>>
+    where
+        C: AsMut<ChangeSet>,
+    {
+        let changeset = out.as_mut();
+        let revealed_spks = self._reveal_to_target(changeset, keychain, target_index)?;
+        self._empty_stage_into_changeset(changeset);
+        Some(revealed_spks)
     }
     fn _reveal_to_target(
         &mut self,
@@ -849,21 +861,24 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
 
     /// Attempts to reveal the next script pubkey for `keychain`.
     ///
-    /// Returns the derivation index of the revealed script pubkey, the revealed script pubkey and a
-    /// [`ChangeSet`] which represents changes in the last revealed index (if any).
-    /// Returns None if the provided keychain doesn't exist.
+    /// Returns the derivation index of the revealed script pubkey and the revealed script pubkey.
+    /// Any changes to the last revealed index are written into `out`.
+    /// Returns `None` if the provided keychain doesn't exist.
     ///
-    /// When a new script cannot be revealed, we return the last revealed script and an empty
-    /// [`ChangeSet`]. There are two scenarios when a new script pubkey cannot be derived:
+    /// When a new script cannot be revealed, we return the last revealed script and nothing is
+    /// written into `out`. There are two scenarios when a new script pubkey cannot be derived:
     ///
     ///  1. The descriptor has no wildcard and already has one script revealed.
     ///  2. The descriptor has already revealed scripts up to the numeric bound.
     ///  3. There is no descriptor associated with the given keychain.
-    pub fn reveal_next_spk(&mut self, keychain: K) -> Option<(Indexed<ScriptBuf>, ChangeSet)> {
-        let mut changeset = ChangeSet::default();
-        let indexed_spk = self._reveal_next_spk(&mut changeset, keychain)?;
-        self._empty_stage_into_changeset(&mut changeset);
-        Some((indexed_spk, changeset))
+    pub fn reveal_next_spk<C>(&mut self, keychain: K, out: &mut C) -> Option<Indexed<ScriptBuf>>
+    where
+        C: AsMut<ChangeSet>,
+    {
+        let changeset = out.as_mut();
+        let indexed_spk = self._reveal_next_spk(changeset, keychain)?;
+        self._empty_stage_into_changeset(changeset);
+        Some(indexed_spk)
     }
     fn _reveal_next_spk(
         &mut self,
@@ -893,19 +908,24 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     /// has used all scripts up to the derivation bounds, then the last derived script pubkey will
     /// be returned.
     ///
+    /// Any changes to the last revealed index are written into `out`.
+    ///
     /// Returns `None` if there are no script pubkeys that have been used and no new script pubkey
     /// could be revealed (see [`reveal_next_spk`] for when this happens).
     ///
     /// [`reveal_next_spk`]: Self::reveal_next_spk
-    pub fn next_unused_spk(&mut self, keychain: K) -> Option<(Indexed<ScriptBuf>, ChangeSet)> {
-        let mut changeset = ChangeSet::default();
+    pub fn next_unused_spk<C>(&mut self, keychain: K, out: &mut C) -> Option<Indexed<ScriptBuf>>
+    where
+        C: AsMut<ChangeSet>,
+    {
+        let changeset = out.as_mut();
         let next_unused = self
             .unused_keychain_spks(keychain.clone())
             .next()
             .map(|(i, spk)| (i, spk.to_owned()));
-        let spk = next_unused.or_else(|| self._reveal_next_spk(&mut changeset, keychain))?;
-        self._empty_stage_into_changeset(&mut changeset);
-        Some((spk, changeset))
+        let spk = next_unused.or_else(|| self._reveal_next_spk(changeset, keychain))?;
+        self._empty_stage_into_changeset(changeset);
+        Some(spk)
     }
 
     /// Iterate over all [`OutPoint`]s that have `TxOut`s with script pubkeys derived from
@@ -1057,6 +1077,12 @@ pub struct ChangeSet {
     pub spk_cache: BTreeMap<DescriptorId, BTreeMap<u32, ScriptBuf>>,
 }
 
+impl AsMut<ChangeSet> for ChangeSet {
+    fn as_mut(&mut self) -> &mut Self {
+        self
+    }
+}
+
 impl Merge for ChangeSet {
     /// Merge another [`ChangeSet`] into self.
     fn merge(&mut self, other: Self) {
@@ -1169,8 +1195,9 @@ mod test {
         assert_eq!(index.next_index(0), Some((0, true)));
 
         // Now reveal some scripts
+        let mut cs = ChangeSet::default();
         for _ in 0..=reveal_to {
-            let _ = index.reveal_next_spk(0).unwrap();
+            let _ = index.reveal_next_spk(0, &mut cs).unwrap();
         }
         assert_eq!(index.last_revealed_index(0), Some(reveal_to));
 

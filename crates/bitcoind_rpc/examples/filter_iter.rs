@@ -39,7 +39,8 @@ fn main() -> anyhow::Result<()> {
     });
 
     // Assume a minimum birthday height
-    let _ = chain.insert_block(START_HEIGHT, START_HASH.parse()?)?;
+    let mut chain_cs = bdk_chain::local_chain::ChangeSet::default();
+    chain.insert_block(START_HEIGHT, START_HASH.parse()?, &mut chain_cs)?;
 
     // Configure RPC client
     let url = std::env::var("RPC_URL").context("must set RPC_URL")?;
@@ -56,12 +57,13 @@ fn main() -> anyhow::Result<()> {
 
     let start = Instant::now();
 
+    let mut graph_cs = bdk_chain::indexed_tx_graph::ChangeSet::default();
     for res in iter {
         let Event { cp, block } = res?;
         let height = cp.height();
-        let _ = chain.apply_update(cp)?;
+        chain.apply_update(cp, &mut chain_cs)?;
         if let Some(block) = block {
-            let _ = graph.apply_block_relevant(&block, height);
+            graph.apply_block_relevant(&block, height, &mut graph_cs);
             println!("Matched block {height}");
         }
     }

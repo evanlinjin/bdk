@@ -699,7 +699,8 @@ mod test {
                     &anchors,
                 )
                 .await?;
-                chain.apply_update(update)?;
+                let mut cs = bdk_chain::local_chain::ChangeSet::default();
+                chain.apply_update(update, &mut cs)?;
                 chain
             };
 
@@ -747,7 +748,8 @@ mod test {
 
             // apply update
             let mut updated_local_chain = local_chain.clone();
-            updated_local_chain.apply_update(update)?;
+            let mut cs = bdk_chain::local_chain::ChangeSet::default();
+            updated_local_chain.apply_update(update, &mut cs)?;
 
             assert!(
                 {

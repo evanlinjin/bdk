@@ -661,7 +661,8 @@ mod test {
                     &chain.tip(),
                     &anchors,
                 )?;
-                chain.apply_update(update)?;
+                let mut cs = bdk_chain::local_chain::ChangeSet::default();
+                chain.apply_update(update, &mut cs)?;
                 chain
             };
 
@@ -708,7 +709,8 @@ mod test {
 
             // apply update
             let mut updated_local_chain = local_chain.clone();
-            updated_local_chain.apply_update(update)?;
+            let mut cs = bdk_chain::local_chain::ChangeSet::default();
+            updated_local_chain.apply_update(update, &mut cs)?;
 
             assert!(
                 {
@@ -926,8 +928,9 @@ mod test {
                 t.name
             );
 
-            let _ = chain
-                .apply_update(chain_update)
+            let mut cs = bdk_chain::local_chain::ChangeSet::default();
+            chain
+                .apply_update(chain_update, &mut cs)
                 .unwrap_or_else(|err| panic!("[{}:{}] update failed to apply: {}", i, t.name, err));
 
             // all requested heights must exist in the final chain

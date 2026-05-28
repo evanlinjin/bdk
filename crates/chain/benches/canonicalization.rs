@@ -63,13 +63,15 @@ fn add_ancestor_tx(graph: &mut KeychainTxGraph, block_id: BlockId, locktime: u32
         ..new_tx(locktime)
     };
     let txid = tx.compute_txid();
-    let _ = graph.insert_tx(tx);
-    let _ = graph.insert_anchor(
+    let mut cs = bdk_chain::indexed_tx_graph::ChangeSet::default();
+    graph.insert_tx(tx, &mut cs);
+    graph.insert_anchor(
         txid,
         ConfirmationBlockTime {
             block_id,
             confirmation_time: 100,
         },
+        &mut cs,
     );
     OutPoint { txid, vout: 0 }
 }
@@ -145,7 +147,8 @@ pub fn many_conflicting_unconfirmed(c: &mut Criterion) {
             let mut update = TxUpdate::default();
             update.seen_ats = [(tx.compute_txid(), i as u64)].into();
             update.txs = vec![Arc::new(tx)];
-            let _ = tx_graph.apply_update(update);
+            let mut cs = bdk_chain::indexed_tx_graph::ChangeSet::default();
+            tx_graph.apply_update(update, &mut cs);
         }
     }));
     c.bench_function("many_conflicting_unconfirmed::list_canonical_txs", {
@@ -181,7 +184,8 @@ pub fn many_chained_unconfirmed(c: &mut Criterion) {
             let mut update = TxUpdate::default();
             update.seen_ats = [(txid, i as u64)].into();
             update.txs = vec![Arc::new(tx)];
-            let _ = tx_graph.apply_update(update);
+            let mut cs = bdk_chain::indexed_tx_graph::ChangeSet::default();
+            tx_graph.apply_update(update, &mut cs);
             // Store the next prevout.
             previous_output = OutPoint::new(txid, 0);
         }
@@ -213,7 +217,9 @@ pub fn nested_conflicts(c: &mut Criterion) {
                     if last_seen % 2 == 0 {
                         last_seen /= 2;
                     }
-                    let ((_, script_pubkey), _) = tx_graph.index.next_unused_spk(()).unwrap();
+                    let mut next_cs = bdk_chain::keychain_txout::ChangeSet::default();
+                    let (_, script_pubkey) =
+                        tx_graph.index.next_unused_spk((), &mut next_cs).unwrap();
                     let value =
                         Amount::ONE_BTC - Amount::from_sat(depth as u64 * 200 - conflict_i as u64);
                     let tx = Transaction {
@@ -229,8 +235,9 @@ pub fn nested_conflicts(c: &mut Criterion) {
                     };
                     let txid = tx.compute_txid();
                     prev_ops.push(OutPoint::new(txid, 0));
-                    let _ = tx_graph.insert_seen_at(txid, last_seen as _);
-                    let _ = tx_graph.insert_tx(tx);
+                    let mut cs = bdk_chain::indexed_tx_graph::ChangeSet::default();
+                    tx_graph.insert_seen_at(txid, last_seen as _, &mut cs);
+                    tx_graph.insert_tx(tx, &mut cs);
                 }
             }
         }

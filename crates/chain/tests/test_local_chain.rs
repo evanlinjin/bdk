@@ -37,18 +37,16 @@ where
     D: bdk_core::ToBlockHash + Copy + PartialEq + std::fmt::Debug,
 {
     fn run(mut self) {
-        let got_changeset = match self.chain.apply_update(self.update) {
-            Ok(changeset) => changeset,
-            Err(got_err) => {
-                assert_eq!(
-                    ExpectedResult::Err(got_err),
-                    self.exp,
-                    "{}: unexpected error",
-                    self.name
-                );
-                return;
-            }
-        };
+        let mut got_changeset = ChangeSet::<D>::default();
+        if let Err(got_err) = self.chain.apply_update(self.update, &mut got_changeset) {
+            assert_eq!(
+                ExpectedResult::Err(got_err),
+                self.exp,
+                "{}: unexpected error",
+                self.name
+            );
+            return;
+        }
 
         match self.exp {
             ExpectedResult::Ok {
@@ -386,9 +384,12 @@ fn local_chain_insert_block() {
     for (i, t) in test_cases.into_iter().enumerate() {
         let mut chain = t.original;
         let block_id: BlockId = t.insert.into();
+        let mut changeset = ChangeSet::default();
+        let result = chain
+            .insert_block(block_id.height, block_id.hash, &mut changeset)
+            .map(|()| changeset);
         assert_eq!(
-            chain.insert_block(block_id.height, block_id.hash),
-            t.expected_result,
+            result, t.expected_result,
             "[{i}] unexpected result when inserting block",
         );
         assert_eq!(chain, t.expected_final, "[{i}] unexpected final chain",);
@@ -481,9 +482,12 @@ fn local_chain_insert_header() {
 
     for (i, t) in test_cases.into_iter().enumerate() {
         let mut chain = t.original;
+        let mut changeset = ChangeSet::default();
+        let result = chain
+            .insert_block(t.insert.0, t.insert.1, &mut changeset)
+            .map(|()| changeset);
         assert_eq!(
-            chain.insert_block(t.insert.0, t.insert.1),
-            t.expected_result,
+            result, t.expected_result,
             "[{i}] unexpected result when inserting block",
         );
         assert_eq!(chain, t.expected_final, "[{i}] unexpected final chain",);
@@ -552,7 +556,10 @@ fn local_chain_disconnect_from() {
 
     for (i, t) in test_cases.into_iter().enumerate() {
         let mut chain = t.original;
-        let result = chain.disconnect_from(t.disconnect_from.into());
+        let mut changeset = ChangeSet::default();
+        let result = chain
+            .disconnect_from(t.disconnect_from.into(), &mut changeset)
+            .map(|()| changeset);
         assert_eq!(
             result, t.exp_result,
             "[{}:{}] unexpected changeset result",
@@ -589,7 +596,10 @@ fn test_apply_update_single_header() {
 
     // Apply 1 `CheckPoint<Header>` at a time
     for (height, header) in (1..).zip([header_1, header_2, header_3]) {
-        let changeset = chain.apply_update(CheckPoint::new(height, header)).unwrap();
+        let mut changeset = ChangeSet::default();
+        chain
+            .apply_update(CheckPoint::new(height, header), &mut changeset)
+            .unwrap();
         assert_eq!(
             changeset,
             ChangeSet {
@@ -609,7 +619,8 @@ fn test_apply_update_single_header() {
     chain = LocalChain::from_blocks([(0, header_0), (1, header_1)].into()).unwrap();
     let mut header_2_alt = header_2;
     header_2_alt.prev_blockhash = hash!("header_1_new");
-    let result = chain.apply_update(CheckPoint::new(2, header_2_alt));
+    let mut changeset = ChangeSet::default();
+    let result = chain.apply_update(CheckPoint::new(2, header_2_alt), &mut changeset);
     assert!(result.is_err(), "Failed to detect prev_blockhash conflict");
 }
 
@@ -961,7 +972,10 @@ fn local_chain_apply_header_connected_to() {
 
     for (i, t) in test_cases.into_iter().enumerate() {
         let mut chain = t.chain;
-        let result = chain.apply_header_connected_to(&t.header, t.height, t.connected_to);
+        let mut changeset = ChangeSet::default();
+        let result = chain
+            .apply_header_connected_to(&t.header, t.height, t.connected_to, &mut changeset)
+            .map(|()| changeset);
         let exp_result = t
             .exp_result
             .map(|cs| cs.iter().cloned().collect::<ChangeSet>());

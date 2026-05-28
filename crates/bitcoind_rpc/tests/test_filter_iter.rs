@@ -144,9 +144,10 @@ fn event_checkpoint_connects_to_local_chain() -> anyhow::Result<()> {
     let new_hashes: BTreeMap<u32, BlockHash> = (14..=16).zip(env.reorg(3)?).collect();
 
     // Expect events from height 14 on...
+    let mut chain_cs = bdk_chain::local_chain::ChangeSet::default();
     while let Some(event) = iter.next().transpose()? {
-        let _ = chain
-            .apply_update(event.cp)
+        chain
+            .apply_update(event.cp, &mut chain_cs)
             .expect("chain update should connect");
     }
 

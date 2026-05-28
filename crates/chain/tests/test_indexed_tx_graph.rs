@@ -123,10 +123,11 @@ fn relevant_conflicts() -> anyhow::Result<()> {
         /// Scans through all transactions in the blockchain + mempool.
         fn sync(&mut self) -> anyhow::Result<()> {
             let client = self.env.rpc_client();
+            let mut cs = indexed_tx_graph::ChangeSet::default();
             for height in 0..=client.get_block_count()?.into_model().0 {
                 let hash = client.get_block_hash(height)?.block_hash()?;
                 let block = client.get_block(hash)?;
-                let _ = self.graph.apply_block_relevant(&block, height as _);
+                self.graph.apply_block_relevant(&block, height as _, &mut cs);
             }
 
             let mempool_txids = client.get_raw_mempool()?.into_model()?.0;
@@ -137,9 +138,8 @@ fn relevant_conflicts() -> anyhow::Result<()> {
                     Ok((tx, 0))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let _ = self
-                .graph
-                .batch_insert_relevant_unconfirmed(unconfirmed_txs);
+            self.graph
+                .batch_insert_relevant_unconfirmed(unconfirmed_txs, &mut cs);
             Ok(())
         }
 
@@ -281,10 +281,12 @@ fn insert_relevant_txs() {
         },
     };
 
-    assert_eq!(
-        graph.batch_insert_relevant(txs.iter().cloned().map(|tx| (tx, None))),
-        changeset,
+    let mut got_changeset = indexed_tx_graph::ChangeSet::default();
+    graph.batch_insert_relevant(
+        txs.iter().cloned().map(|tx| (tx, None)),
+        &mut got_changeset,
     );
+    assert_eq!(got_changeset, changeset);
 
     // The initial changeset will also contain info about the keychain we added
     let initial_changeset = indexed_tx_graph::ChangeSet {
@@ -361,12 +363,13 @@ fn test_list_owned_txouts() {
     let mut trusted_spks: Vec<ScriptBuf> = Vec::new();
     let mut untrusted_spks: Vec<ScriptBuf> = Vec::new();
 
+    let mut reveal_cs = bdk_chain::keychain_txout::ChangeSet::default();
     {
         // we need to scope here to take immutable reference of the graph
         for _ in 0..10 {
-            let ((_, script), _) = graph
+            let (_, script) = graph
                 .index
-                .reveal_next_spk("keychain_1".to_string())
+                .reveal_next_spk("keychain_1".to_string(), &mut reveal_cs)
                 .unwrap();
             // TODO Assert indexes
             trusted_spks.push(script.to_owned());
@@ -374,9 +377,9 @@ fn test_list_owned_txouts() {
     }
     {
         for _ in 0..10 {
-            let ((_, script), _) = graph
+            let (_, script) = graph
                 .index
-                .reveal_next_spk("keychain_2".to_string())
+                .reveal_next_spk("keychain_2".to_string(), &mut reveal_cs)
                 .unwrap();
             untrusted_spks.push(script.to_owned());
         }
@@ -444,8 +447,9 @@ fn test_list_owned_txouts() {
     // Insert transactions into graph with respective anchors
     // Insert unconfirmed txs with a last_seen timestamp
 
-    let _ =
-        graph.batch_insert_relevant([&tx1, &tx2, &tx3, &tx6].iter().enumerate().map(|(i, &tx)| {
+    let mut tmp_cs = indexed_tx_graph::ChangeSet::default();
+    graph.batch_insert_relevant(
+        [&tx1, &tx2, &tx3, &tx6].iter().enumerate().map(|(i, &tx)| {
             let height = i as u32;
             (
                 tx.clone(),
@@ -457,10 +461,14 @@ fn test_list_owned_txouts() {
                         confirmation_time: 100,
                     }),
             )
-        }));
+        }),
+        &mut tmp_cs,
+    );
 
-    let _ =
-        graph.batch_insert_relevant_unconfirmed([&tx4, &tx5].iter().map(|&tx| (tx.clone(), 100)));
+    graph.batch_insert_relevant_unconfirmed(
+        [&tx4, &tx5].iter().map(|&tx| (tx.clone(), 100)),
+        &mut tmp_cs,
+    );
 
     // A helper lambda to extract and filter data from the graph.
     let fetch =
@@ -779,12 +787,13 @@ fn test_get_chain_position() {
 
         // add data to graph
         let txid = tx.compute_txid();
-        let _ = graph.insert_tx(tx);
+        let mut cs = indexed_tx_graph::ChangeSet::default();
+        graph.insert_tx(tx, &mut cs);
         if let Some(anchor) = anchor {
-            let _ = graph.insert_anchor(txid, anchor);
+            graph.insert_anchor(txid, anchor, &mut cs);
         }
         if let Some(seen_at) = last_seen {
-            let _ = graph.insert_seen_at(txid, seen_at);
+            graph.insert_seen_at(txid, seen_at, &mut cs);
         }
 
         // check chain position
