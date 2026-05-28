@@ -2,7 +2,7 @@
 
 use bdk_chain::{
     collections::BTreeMap,
-    indexer::txout_index::{ChangeSet, ExistingAssignment, InsertError, TxOutIndex},
+    indexer::txout_index::{ChangeSet, InsertError, TxOutIndex},
     DescriptorExt, Indexer, Merge, SpkIterator,
 };
 use bdk_testenv::{
@@ -95,16 +95,17 @@ fn reveals_for_non_wildcard_descriptor() {
     idx.insert_descriptor(TestKeychain::External, descriptor.clone())
         .unwrap();
 
-    // First reveal returns the single spk; the changeset records last_revealed=0.
+    // Non-wildcard descriptors are stored on the fixed side and have no derivation cursor —
+    // their single spk is available immediately and reveals never produce a changeset.
     let (spk, cs) = idx.reveal_next_spk(TestKeychain::External).unwrap();
     assert_eq!(spk, (0, only_spk.clone()));
-    assert_eq!(cs.last_revealed.get(&descriptor.descriptor_id()), Some(&0));
+    assert!(cs.is_empty());
 
-    // Second reveal returns the same spk; no new index is advanced.
     let (spk, cs) = idx.reveal_next_spk(TestKeychain::External).unwrap();
     assert_eq!(spk, (0, only_spk));
-    assert!(cs.is_empty(), "no advancement => empty changeset");
+    assert!(cs.is_empty());
     assert_eq!(idx.next_index(TestKeychain::External), Some((0, false)));
+    assert!(idx.is_fixed_keychain(TestKeychain::External));
 }
 
 #[test]
@@ -151,7 +152,8 @@ fn insert_spk_registers_a_raw_keychain() {
         .insert_spk(TestKeychain::RawWatched, spk.clone())
         .unwrap());
 
-    assert!(idx.is_raw_keychain(&TestKeychain::RawWatched));
+    assert!(idx.is_fixed_keychain(TestKeychain::RawWatched));
+    assert!(!idx.is_wildcard_keychain(TestKeychain::RawWatched));
     assert_eq!(
         idx.spk_at_index(TestKeychain::RawWatched, 0),
         Some(spk.clone())
@@ -306,14 +308,10 @@ fn reassigning_raw_keychain_to_descriptor_is_rejected() {
         .insert_descriptor(TestKeychain::External, desc)
         .unwrap_err();
     match err {
-        InsertError::KeychainAlreadyAssigned {
-            keychain,
-            existing_assignment,
-        } => {
+        InsertError::KeychainAlreadyAssigned { keychain } => {
             assert_eq!(keychain, TestKeychain::External);
-            assert_eq!(existing_assignment, ExistingAssignment::RawSpk);
         }
-        other => panic!("expected KeychainAlreadyAssigned (RawSpk), got {other:?}"),
+        other => panic!("expected KeychainAlreadyAssigned, got {other:?}"),
     }
 }
 
@@ -327,17 +325,10 @@ fn reassigning_descriptor_keychain_to_raw_spk_is_rejected() {
         .insert_spk(TestKeychain::External, fake_spk(0x10))
         .unwrap_err();
     match err {
-        InsertError::KeychainAlreadyAssigned {
-            keychain,
-            existing_assignment,
-        } => {
+        InsertError::KeychainAlreadyAssigned { keychain } => {
             assert_eq!(keychain, TestKeychain::External);
-            assert!(matches!(
-                existing_assignment,
-                ExistingAssignment::Descriptor(_)
-            ));
         }
-        other => panic!("expected KeychainAlreadyAssigned (Descriptor), got {other:?}"),
+        other => panic!("expected KeychainAlreadyAssigned, got {other:?}"),
     }
 }
 
@@ -579,7 +570,7 @@ fn descriptor_collision_across_keychains_is_rejected() {
 }
 
 #[test]
-fn raw_keychains_iterator_lists_only_raw_keys() {
+fn fixed_keychains_iterator_lists_only_fixed_keys() {
     let external = parse_descriptor(DESCRIPTORS[0]);
     let internal = parse_descriptor(DESCRIPTORS[1]);
     let mut idx = init_descriptor_index(external, internal, 0, false);
@@ -588,12 +579,12 @@ fn raw_keychains_iterator_lists_only_raw_keys() {
         .unwrap();
     idx.insert_spk(TestKeychain::RawSweep, fake_spk(2)).unwrap();
 
-    let raw: Vec<_> = idx.raw_keychains().cloned().collect();
-    assert_eq!(raw.len(), 2);
-    assert!(raw.contains(&TestKeychain::RawWatched));
-    assert!(raw.contains(&TestKeychain::RawSweep));
+    let fixed: Vec<_> = idx.fixed_keychains().map(|(k, _)| k).collect();
+    assert_eq!(fixed.len(), 2);
+    assert!(fixed.contains(&TestKeychain::RawWatched));
+    assert!(fixed.contains(&TestKeychain::RawSweep));
 
-    // The descriptor-backed iterator should still show the two descriptor keychains.
+    // The wildcard iterator should still show the two descriptor keychains.
     assert_eq!(idx.keychains().count(), 2);
 }
 
