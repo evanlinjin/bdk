@@ -592,11 +592,12 @@ fn test_apply_update_single_header() {
     let header_2 = headers[2];
     let header_3 = headers[3];
 
-    let (mut chain, _) = LocalChain::from_genesis(header_0);
+    let mut genesis_cs = ChangeSet::<Header>::default();
+    let mut chain = LocalChain::from_genesis(header_0, &mut genesis_cs);
 
     // Apply 1 `CheckPoint<Header>` at a time
     for (height, header) in (1..).zip([header_1, header_2, header_3]) {
-        let mut changeset = ChangeSet::default();
+        let mut changeset = ChangeSet::<Header>::default();
         chain
             .apply_update(CheckPoint::new(height, header), &mut changeset)
             .unwrap();

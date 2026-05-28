@@ -28,7 +28,8 @@ mod common;
 pub fn test_sync_local_chain() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
     let network_tip = env.rpc_client().get_block_count()?.into_model().0;
-    let (mut local_chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+    let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+    let mut local_chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
 
     let client = ClientExt::get_rpc_client(&env)?;
     let mut emitter = Emitter::new(&client, local_chain.tip(), 0, NO_EXPECTED_MEMPOOL_TXS);
@@ -165,7 +166,8 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
 
     env.mine_blocks(101, None)?;
 
-    let (mut chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+    let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+    let mut chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
     let mut indexed_tx_graph = IndexedTxGraph::<BlockId, _>::new({
         let mut index = SpkTxOutIndex::<usize>::default();
         index.insert_spk(0, addr_0.script_pubkey());
@@ -364,7 +366,8 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
     let addr_to_track = Address::from_script(&spk_to_track, Network::Regtest)?;
 
     // setup receiver
-    let (mut recv_chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+    let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+    let mut recv_chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
     let mut recv_graph = IndexedTxGraph::<BlockId, _>::new({
         let mut recv_index = SpkTxOutIndex::default();
         recv_index.insert_spk((), spk_to_track.clone());
@@ -581,7 +584,9 @@ fn test_expect_tx_evicted() -> anyhow::Result<()> {
         .0;
     let spk = desc.at_derivation_index(0)?.script_pubkey();
 
-    let mut chain = LocalChain::from_genesis(genesis_block(Network::Regtest).block_hash()).0;
+    let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+    let mut chain =
+        LocalChain::from_genesis(genesis_block(Network::Regtest).block_hash(), &mut genesis_cs);
     let chain_tip = chain.tip().block_id();
 
     let mut index = SpkTxOutIndex::default();
@@ -676,7 +681,8 @@ fn test_expect_tx_evicted() -> anyhow::Result<()> {
 #[test]
 fn test_sync_with_new_emitter_after_reorg() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
-    let (mut local_chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+    let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+    let mut local_chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
     let client = ClientExt::get_rpc_client(&env)?;
 
     env.mine_blocks(110, None)?;

@@ -155,8 +155,9 @@ impl<I, D> SyncRequestBuilder<I, D> {
     ///
     /// // Reveal spks for "descriptor_a", then build a sync request. Each spk will be indexed with
     /// // `u32`, which represents the derivation index of the associated spk from "descriptor_a".
-    /// let (newly_revealed_spks, _changeset) = indexer
-    ///     .reveal_to_target("descriptor_a", 21)
+    /// let mut _changeset = bdk_chain::keychain_txout::ChangeSet::default();
+    /// let newly_revealed_spks = indexer
+    ///     .reveal_to_target("descriptor_a", 21, &mut _changeset)
     ///     .expect("keychain must exist");
     /// let _request: SyncRequest<u32, BlockHash> = SyncRequest::builder()
     ///     .spks_with_indexes(newly_revealed_spks)
@@ -225,9 +226,10 @@ impl<I, D> SyncRequestBuilder<I, D> {
 ///
 /// ```rust
 /// # use std::io::{self, Write};
-/// # use bdk_chain::{bitcoin::{hashes::Hash, ScriptBuf}, local_chain::LocalChain};
+/// # use bdk_chain::{bitcoin::{hashes::Hash, ScriptBuf}, local_chain::{ChangeSet, LocalChain}};
 /// # use bdk_chain::spk_client::SyncRequest;
-/// # let (local_chain, _) = LocalChain::from_genesis(Hash::all_zeros());
+/// # let mut genesis_cs = ChangeSet::default();
+/// # let local_chain = LocalChain::from_genesis(Hash::all_zeros(), &mut genesis_cs);
 /// # let scripts = [ScriptBuf::default(), ScriptBuf::default()];
 /// // Construct a sync request.
 /// let sync_request = SyncRequest::builder()

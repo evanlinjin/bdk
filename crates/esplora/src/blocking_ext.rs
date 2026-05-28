@@ -633,7 +633,8 @@ mod test {
 
             // craft initial `local_chain`
             let local_chain = {
-                let (mut chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+                let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+                let mut chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
                 // force `chain_update_blocking` to add all checkpoints in `t.initial_cps`
                 let anchors = t
                     .initial_cps

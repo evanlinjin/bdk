@@ -29,7 +29,8 @@ fn main() -> anyhow::Result<()> {
     let secp = Secp256k1::new();
     let (descriptor, _) = Descriptor::parse_descriptor(&secp, EXTERNAL)?;
     let (change_descriptor, _) = Descriptor::parse_descriptor(&secp, INTERNAL)?;
-    let (mut chain, _) = LocalChain::from_genesis(genesis_block(NETWORK).block_hash());
+    let mut chain_cs = bdk_chain::local_chain::ChangeSet::default();
+    let mut chain = LocalChain::from_genesis(genesis_block(NETWORK).block_hash(), &mut chain_cs);
 
     let mut graph = IndexedTxGraph::<ConfirmationBlockTime, KeychainTxOutIndex<&str>>::new({
         let mut index = KeychainTxOutIndex::default();
@@ -39,7 +40,6 @@ fn main() -> anyhow::Result<()> {
     });
 
     // Assume a minimum birthday height
-    let mut chain_cs = bdk_chain::local_chain::ChangeSet::default();
     chain.insert_block(START_HEIGHT, START_HASH.parse()?, &mut chain_cs)?;
 
     // Configure RPC client

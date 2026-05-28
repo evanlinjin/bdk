@@ -29,7 +29,8 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     let client = Builder::new(base_url.as_str()).build_blocking();
 
     let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new(SpkTxOutIndex::<()>::default());
-    let (chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+    let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+    let chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
 
     // Get receiving address.
     let receiver_spk = common::get_test_spk();

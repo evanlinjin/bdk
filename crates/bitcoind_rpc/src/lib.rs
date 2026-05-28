@@ -415,7 +415,8 @@ mod test {
     #[test]
     fn test_expected_mempool_txids_accumulate_and_remove() -> anyhow::Result<()> {
         let env = TestEnv::new()?;
-        let (chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+        let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+        let chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
         let chain_tip = chain.tip();
 
         let rpc_client = bitcoincore_rpc::Client::new(

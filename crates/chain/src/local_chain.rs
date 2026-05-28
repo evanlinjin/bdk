@@ -249,14 +249,19 @@ where
     D: ToBlockHash + fmt::Debug + Clone,
 {
     /// Constructs a [`LocalChain`] from genesis data.
-    pub fn from_genesis(data: D) -> (Self, ChangeSet<D>) {
+    ///
+    /// The initial changeset (which the caller must persist to remember the genesis block on
+    /// reload) is written into `cs`.
+    pub fn from_genesis<C>(data: D, cs: &mut C) -> Self
+    where
+        C: AsMut<ChangeSet<D>>,
+    {
         let height = 0;
         let chain = Self {
             tip: CheckPoint::new(height, data),
         };
-        let changeset = chain.initial_changeset();
-
-        (chain, changeset)
+        cs.as_mut().merge(chain.initial_changeset());
+        chain
     }
 
     /// Constructs a [`LocalChain`] from a [`BTreeMap`] of height and data `D`.
@@ -286,7 +291,8 @@ where
             None => return Err(ApplyBlockError::MissingGenesis),
         };
 
-        let (mut chain, _) = Self::from_genesis(genesis_data);
+        let mut tmp = ChangeSet::<D>::default();
+        let mut chain = Self::from_genesis(genesis_data, &mut tmp);
         chain.apply_changeset(&changeset)?;
         debug_assert!(chain._check_changeset_is_applied(&changeset));
         Ok(chain)

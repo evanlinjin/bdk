@@ -92,11 +92,15 @@ where
 
     /// Reconstruct an [`IndexedTxGraph`] from persisted graph + indexer state.
     ///
-    /// 1. Rebuilds the `TxGraph` from `changeset.tx_graph`.
-    /// 2. Calls your `indexer_from_changeset` closure on `changeset.indexer` to restore any state
-    ///    your indexer needs beyond its raw changeset.
-    /// 3. Runs a full `.reindex()`, returning its `ChangeSet` to describe any additional updates
-    ///    applied.
+    /// `cs` is read for the persisted state to load from and is then **rewritten** with the
+    /// reconstructed state — which includes the original data plus any deltas produced by the
+    /// internal `.reindex()` pass. Save `cs` after this call to persist those deltas.
+    ///
+    /// 1. Rebuilds the `TxGraph` from `cs.tx_graph`.
+    /// 2. Calls your `indexer_from_changeset` closure on `cs.indexer` to restore any state your
+    ///    indexer needs beyond its raw changeset.
+    /// 3. Runs a full `.reindex()`.
+    /// 4. Writes the full reconstructed state back into `cs`.
     ///
     /// # Errors
     ///
@@ -112,12 +116,12 @@ where
     /// # use bdk_testenv::anyhow;
     /// # use miniscript::{Descriptor, DescriptorPublicKey};
     /// # use std::str::FromStr;
-    /// # let persisted_changeset = ChangeSet::<BlockId, _>::default();
+    /// # let mut persisted_changeset = ChangeSet::<BlockId, _>::default();
     /// # let persisted_desc = Some(Descriptor::<DescriptorPublicKey>::from_str("")?);
     /// # let persisted_change_desc = Some(Descriptor::<DescriptorPublicKey>::from_str("")?);
     ///
-    /// let (graph, reindex_cs) =
-    ///     IndexedTxGraph::from_changeset(persisted_changeset, move |idx_cs| -> anyhow::Result<_> {
+    /// let graph = IndexedTxGraph::from_changeset(
+    ///     move |idx_cs| -> anyhow::Result<_> {
     ///         // e.g. KeychainTxOutIndex needs descriptors that weren’t in its change set.
     ///         let mut idx = KeychainTxOutIndex::from_changeset(DEFAULT_LOOKAHEAD, true, idx_cs);
     ///         if let Some(desc) = persisted_desc {
@@ -127,22 +131,31 @@ where
     ///             idx.insert_descriptor("internal", desc)?;
     ///         }
     ///         Ok(idx)
-    ///     })?;
+    ///     },
+    ///     &mut persisted_changeset,
+    /// )?;
+    /// // `persisted_changeset` now contains the original data plus any reindex deltas.
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn from_changeset<F, E>(
-        changeset: ChangeSet<A, I::ChangeSet>,
+    pub fn from_changeset<F, E, C>(
         indexer_from_changeset: F,
-    ) -> Result<(Self, ChangeSet<A, I::ChangeSet>), E>
+        cs: &mut C,
+    ) -> Result<Self, E>
     where
         F: FnOnce(I::ChangeSet) -> Result<I, E>,
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
     {
-        let graph = TxGraph::<A>::from_changeset(changeset.tx_graph);
-        let index = indexer_from_changeset(changeset.indexer)?;
+        let inner = cs.as_mut();
+        let graph = TxGraph::<A>::from_changeset(core::mem::take(&mut inner.tx_graph));
+        let index = indexer_from_changeset(core::mem::take(&mut inner.indexer))?;
         let mut out = Self { graph, index };
-        let mut reindex_cs = ChangeSet::<A, I::ChangeSet>::default();
-        out.reindex(&mut reindex_cs);
-        Ok((out, reindex_cs))
+        // `reindex` mutates the indexer state to reflect matches against the loaded tx graph.
+        // Its delta is subsumed by `initial_changeset` below, so we discard the explicit delta
+        // here.
+        let mut reindex_delta = ChangeSet::<A, I::ChangeSet>::default();
+        out.reindex(&mut reindex_delta);
+        *inner = out.initial_changeset();
+        Ok(out)
     }
 
     /// Synchronizes the indexer to reflect every entry in the transaction graph.

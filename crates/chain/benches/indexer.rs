@@ -70,16 +70,18 @@ fn setup<F: Fn(&mut KeychainTxGraph, &LocalChain)>(f: F) -> (KeychainTxGraph, Lo
 /// Bench performance of recovering `KeychainTxOutIndex` from changeset.
 fn do_bench(indexed_tx_graph: &KeychainTxGraph, chain: &LocalChain) {
     let desc = indexed_tx_graph.index.get_descriptor(()).unwrap();
-    let changeset = indexed_tx_graph.initial_changeset();
+    let mut changeset = indexed_tx_graph.initial_changeset();
 
     // Now recover
-    let (graph, _cs) =
-        KeychainTxGraph::from_changeset(changeset, |cs| -> Result<_, InsertDescriptorError<_>> {
+    let graph = KeychainTxGraph::from_changeset(
+        |cs| -> Result<_, InsertDescriptorError<_>> {
             let mut index = KeychainTxOutIndex::from_changeset(LOOKAHEAD, USE_SPK_CACHE, cs);
             let _ = index.insert_descriptor((), desc.clone())?;
             Ok(index)
-        })
-        .unwrap();
+        },
+        &mut changeset,
+    )
+    .unwrap();
 
     // Check balance
     let chain_tip = chain.tip().block_id();
