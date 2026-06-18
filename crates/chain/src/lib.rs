@@ -63,6 +63,8 @@ mod spk_iter;
 #[cfg(feature = "miniscript")]
 pub use indexer::keychain_txout;
 #[cfg(feature = "miniscript")]
+pub use indexer::txout_index;
+#[cfg(feature = "miniscript")]
 pub use spk_iter::*;
 #[cfg(feature = "rusqlite")]
 pub mod rusqlite_impl;
