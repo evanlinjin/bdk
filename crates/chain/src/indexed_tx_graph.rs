@@ -91,11 +91,15 @@ where
 
     /// Reconstruct an [`IndexedTxGraph`] from persisted graph + indexer state.
     ///
-    /// 1. Rebuilds the `TxGraph` from `changeset.tx_graph`.
-    /// 2. Calls your `indexer_from_changeset` closure on `changeset.indexer` to restore any state
-    ///    your indexer needs beyond its raw changeset.
-    /// 3. Runs a full `.reindex()`, returning its `ChangeSet` to describe any additional updates
-    ///    applied.
+    /// `cs` is read for the persisted state to load from and is then **rewritten** with the
+    /// reconstructed state — which includes the original data plus any deltas produced by the
+    /// internal `.reindex()` pass. Save `cs` after this call to persist those deltas.
+    ///
+    /// 1. Rebuilds the `TxGraph` from `cs.tx_graph`.
+    /// 2. Calls your `indexer_from_changeset` closure on `cs.indexer` to restore any state your
+    ///    indexer needs beyond its raw changeset.
+    /// 3. Runs a full `.reindex()`.
+    /// 4. Writes the full reconstructed state back into `cs`.
     ///
     /// # Errors
     ///
@@ -111,12 +115,12 @@ where
     /// # use bdk_testenv::anyhow;
     /// # use miniscript::{Descriptor, DescriptorPublicKey};
     /// # use std::str::FromStr;
-    /// # let persisted_changeset = ChangeSet::<BlockId, _>::default();
+    /// # let mut persisted_changeset = ChangeSet::<BlockId, _>::default();
     /// # let persisted_desc = Some(Descriptor::<DescriptorPublicKey>::from_str("")?);
     /// # let persisted_change_desc = Some(Descriptor::<DescriptorPublicKey>::from_str("")?);
     ///
-    /// let (graph, reindex_cs) =
-    ///     IndexedTxGraph::from_changeset(persisted_changeset, move |idx_cs| -> anyhow::Result<_> {
+    /// let graph = IndexedTxGraph::from_changeset(
+    ///     move |idx_cs| -> anyhow::Result<_> {
     ///         // e.g. KeychainTxOutIndex needs descriptors that weren’t in its change set.
     ///         let mut idx = KeychainTxOutIndex::from_changeset(DEFAULT_LOOKAHEAD, true, idx_cs);
     ///         if let Some(desc) = persisted_desc {
@@ -126,37 +130,49 @@ where
     ///             idx.insert_descriptor("internal", desc)?;
     ///         }
     ///         Ok(idx)
-    ///     })?;
+    ///     },
+    ///     &mut persisted_changeset,
+    /// )?;
+    /// // `persisted_changeset` now contains the original data plus any reindex deltas.
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn from_changeset<F, E>(
-        changeset: ChangeSet<A, I::ChangeSet>,
+    pub fn from_changeset<F, E, C>(
         indexer_from_changeset: F,
-    ) -> Result<(Self, ChangeSet<A, I::ChangeSet>), E>
+        cs: &mut C,
+    ) -> Result<Self, E>
     where
         F: FnOnce(I::ChangeSet) -> Result<I, E>,
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
     {
-        let graph = TxGraph::<A>::from_changeset(changeset.tx_graph);
-        let index = indexer_from_changeset(changeset.indexer)?;
+        let inner = cs.as_mut();
+        let graph = TxGraph::<A>::from_changeset(core::mem::take(&mut inner.tx_graph));
+        let index = indexer_from_changeset(core::mem::take(&mut inner.indexer))?;
         let mut out = Self { graph, index };
-        let out_changeset = out.reindex();
-        Ok((out, out_changeset))
+        // `reindex` mutates the indexer state to reflect matches against the loaded tx graph.
+        // Its delta is subsumed by `initial_changeset` below, so we discard the explicit delta
+        // here.
+        let mut reindex_delta = ChangeSet::<A, I::ChangeSet>::default();
+        out.reindex(&mut reindex_delta);
+        *inner = out.initial_changeset();
+        Ok(out)
     }
 
     /// Synchronizes the indexer to reflect every entry in the transaction graph.
     ///
     /// Iterates over **all** full transactions and floating outputs in `self.graph`, passing each
     /// into `self.index`. Any indexer-side changes produced (via `index_tx` or `index_txout`) are
-    /// merged into a fresh `ChangeSet`, which is then returned.
-    pub fn reindex(&mut self) -> ChangeSet<A, I::ChangeSet> {
-        let mut changeset = ChangeSet::<A, I::ChangeSet>::default();
+    /// written into `out`.
+    pub fn reindex<C>(&mut self, out: &mut C)
+    where
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
+        let changeset = out.as_mut();
         for tx in self.graph.full_txs() {
             changeset.indexer.merge(self.index.index_tx(&tx));
         }
         for (op, txout) in self.graph.floating_txouts() {
             changeset.indexer.merge(self.index.index_txout(op, txout));
         }
-        changeset
     }
 
     fn index_tx_graph_changeset(
@@ -175,46 +191,74 @@ where
 
     /// Apply an `update` directly.
     ///
-    /// `update` is a [`tx_graph::TxUpdate<A>`] and the resultant changes is returned as
-    /// [`ChangeSet`].
+    /// `update` is a [`tx_graph::TxUpdate<A>`]. Any resultant changes are written into `out`.
     ///
     /// **Note**: Transactions in the `update` without temporal context (anchors or seen_ats)
     /// will be stored but will not be considered canonical. See [`tx_graph::TxUpdate`] for
     /// more details.
-    pub fn apply_update(&mut self, update: tx_graph::TxUpdate<A>) -> ChangeSet<A, I::ChangeSet> {
+    pub fn apply_update<C>(&mut self, update: tx_graph::TxUpdate<A>, out: &mut C)
+    where
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
+        let cs = out.as_mut();
         let tx_graph = self.graph.apply_update(update);
         let indexer = self.index_tx_graph_changeset(&tx_graph);
-        ChangeSet { tx_graph, indexer }
+        cs.tx_graph.merge(tx_graph);
+        cs.indexer.merge(indexer);
     }
 
     /// Insert a floating `txout` of given `outpoint`.
-    pub fn insert_txout(&mut self, outpoint: OutPoint, txout: TxOut) -> ChangeSet<A, I::ChangeSet> {
+    ///
+    /// Any resultant changes are written into `out`.
+    pub fn insert_txout<C>(&mut self, outpoint: OutPoint, txout: TxOut, out: &mut C)
+    where
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
+        let cs = out.as_mut();
         let graph = self.graph.insert_txout(outpoint, txout);
         let indexer = self.index_tx_graph_changeset(&graph);
-        ChangeSet {
-            tx_graph: graph,
-            indexer,
-        }
+        cs.tx_graph.merge(graph);
+        cs.indexer.merge(indexer);
     }
 
     /// Insert and index a transaction into the graph.
-    pub fn insert_tx<T: Into<Arc<Transaction>>>(&mut self, tx: T) -> ChangeSet<A, I::ChangeSet> {
+    ///
+    /// Any resultant changes are written into `out`.
+    pub fn insert_tx<T, C>(&mut self, tx: T, out: &mut C)
+    where
+        T: Into<Arc<Transaction>>,
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
+        let cs = out.as_mut();
         let tx_graph = self.graph.insert_tx(tx);
         let indexer = self.index_tx_graph_changeset(&tx_graph);
-        ChangeSet { tx_graph, indexer }
+        cs.tx_graph.merge(tx_graph);
+        cs.indexer.merge(indexer);
     }
 
     /// Insert an `anchor` for a given transaction.
-    pub fn insert_anchor(&mut self, txid: Txid, anchor: A) -> ChangeSet<A, I::ChangeSet> {
-        self.graph.insert_anchor(txid, anchor).into()
+    ///
+    /// Any resultant changes are written into `out`.
+    pub fn insert_anchor<C>(&mut self, txid: Txid, anchor: A, out: &mut C)
+    where
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
+        let tx_graph = self.graph.insert_anchor(txid, anchor);
+        out.as_mut().tx_graph.merge(tx_graph);
     }
 
     /// Insert a unix timestamp of when a transaction is seen in the mempool.
     ///
     /// This is used for transaction conflict resolution in [`TxGraph`] where the transaction with
     /// the later last-seen is prioritized.
-    pub fn insert_seen_at(&mut self, txid: Txid, seen_at: u64) -> ChangeSet<A, I::ChangeSet> {
-        self.graph.insert_seen_at(txid, seen_at).into()
+    ///
+    /// Any resultant changes are written into `out`.
+    pub fn insert_seen_at<C>(&mut self, txid: Txid, seen_at: u64, out: &mut C)
+    where
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
+        let tx_graph = self.graph.insert_seen_at(txid, seen_at);
+        out.as_mut().tx_graph.merge(tx_graph);
     }
 
     /// Inserts the given `evicted_at` for `txid`.
@@ -222,12 +266,14 @@ where
     /// The `evicted_at` timestamp represents the last known time when the transaction was observed
     /// to be missing from the mempool. If `txid` was previously recorded with an earlier
     /// `evicted_at` value, it is updated only if the new value is greater.
-    pub fn insert_evicted_at(&mut self, txid: Txid, evicted_at: u64) -> ChangeSet<A, I::ChangeSet> {
+    ///
+    /// Any resultant changes are written into `out`.
+    pub fn insert_evicted_at<C>(&mut self, txid: Txid, evicted_at: u64, out: &mut C)
+    where
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
         let tx_graph = self.graph.insert_evicted_at(txid, evicted_at);
-        ChangeSet {
-            tx_graph,
-            ..Default::default()
-        }
+        out.as_mut().tx_graph.merge(tx_graph);
     }
 
     /// Batch inserts `(txid, evicted_at)` pairs for `txid`s that the graph is tracking.
@@ -235,15 +281,17 @@ where
     /// The `evicted_at` timestamp represents the last known time when the transaction was observed
     /// to be missing from the mempool. If `txid` was previously recorded with an earlier
     /// `evicted_at` value, it is updated only if the new value is greater.
-    pub fn batch_insert_relevant_evicted_at(
+    ///
+    /// Any resultant changes are written into `out`.
+    pub fn batch_insert_relevant_evicted_at<C>(
         &mut self,
         evicted_ats: impl IntoIterator<Item = (Txid, u64)>,
-    ) -> ChangeSet<A, I::ChangeSet> {
+        out: &mut C,
+    ) where
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
         let tx_graph = self.graph.batch_insert_relevant_evicted_at(evicted_ats);
-        ChangeSet {
-            tx_graph,
-            ..Default::default()
-        }
+        out.as_mut().tx_graph.merge(tx_graph);
     }
 
     /// Batch insert transactions, filtering out those that are irrelevant.
@@ -253,10 +301,16 @@ where
     /// Relevancy is determined by the internal [`Indexer::is_tx_relevant`] implementation of `I`.
     /// A transaction that conflicts with a relevant transaction is also considered relevant.
     /// Irrelevant transactions in `txs` will be ignored.
-    pub fn batch_insert_relevant<T: Into<Arc<Transaction>>>(
+    ///
+    /// Any resultant changes are written into `out`.
+    pub fn batch_insert_relevant<T, C>(
         &mut self,
         txs: impl IntoIterator<Item = (T, impl IntoIterator<Item = A>)>,
-    ) -> ChangeSet<A, I::ChangeSet> {
+        out: &mut C,
+    ) where
+        T: Into<Arc<Transaction>>,
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
         // The algorithm below allows for non-topologically ordered transactions by using two loops.
         // This is achieved by:
         // 1. insert all txs into the index. If they are irrelevant then that's fine it will just
@@ -268,23 +322,20 @@ where
             .map(|(tx, anchors)| (<T as Into<Arc<Transaction>>>::into(tx), anchors))
             .collect::<Vec<_>>();
 
-        let mut indexer = I::ChangeSet::default();
+        let cs = out.as_mut();
         for (tx, _) in &txs {
-            indexer.merge(self.index.index_tx(tx));
+            cs.indexer.merge(self.index.index_tx(tx));
         }
 
-        let mut tx_graph = tx_graph::ChangeSet::default();
         for (tx, anchors) in txs {
             if self.is_tx_or_conflict_relevant(&tx) {
                 let txid = tx.compute_txid();
-                tx_graph.merge(self.graph.insert_tx(tx.clone()));
+                cs.tx_graph.merge(self.graph.insert_tx(tx.clone()));
                 for anchor in anchors {
-                    tx_graph.merge(self.graph.insert_anchor(txid, anchor));
+                    cs.tx_graph.merge(self.graph.insert_anchor(txid, anchor));
                 }
             }
         }
-
-        ChangeSet { tx_graph, indexer }
     }
 
     /// Batch insert unconfirmed transactions, filtering out those that are irrelevant.
@@ -296,10 +347,16 @@ where
     /// Items of `txs` are tuples containing the transaction and a *last seen* timestamp. The
     /// *last seen* communicates when the transaction is last seen in the mempool which is used for
     /// conflict-resolution in [`TxGraph`] (refer to [`TxGraph::insert_seen_at`] for details).
-    pub fn batch_insert_relevant_unconfirmed<T: Into<Arc<Transaction>>>(
+    ///
+    /// Any resultant changes are written into `out`.
+    pub fn batch_insert_relevant_unconfirmed<T, C>(
         &mut self,
         unconfirmed_txs: impl IntoIterator<Item = (T, u64)>,
-    ) -> ChangeSet<A, I::ChangeSet> {
+        out: &mut C,
+    ) where
+        T: Into<Arc<Transaction>>,
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
         // The algorithm below allows for non-topologically ordered transactions by using two loops.
         // This is achieved by:
         // 1. insert all txs into the index. If they are irrelevant then that's fine it will just
@@ -311,9 +368,9 @@ where
             .map(|(tx, last_seen)| (<T as Into<Arc<Transaction>>>::into(tx), last_seen))
             .collect::<Vec<_>>();
 
-        let mut indexer = I::ChangeSet::default();
+        let cs = out.as_mut();
         for (tx, _) in &txs {
-            indexer.merge(self.index.index_tx(tx));
+            cs.indexer.merge(self.index.index_tx(tx));
         }
 
         let graph = self.graph.batch_insert_unconfirmed(
@@ -323,10 +380,7 @@ where
                 .collect::<Vec<_>>(),
         );
 
-        ChangeSet {
-            tx_graph: graph,
-            indexer,
-        }
+        cs.tx_graph.merge(graph);
     }
 
     /// Batch insert unconfirmed transactions.
@@ -337,17 +391,22 @@ where
     ///
     /// To filter out irrelevant transactions, use [`batch_insert_relevant_unconfirmed`] instead.
     ///
+    /// Any resultant changes are written into `out`.
+    ///
     /// [`batch_insert_relevant_unconfirmed`]: IndexedTxGraph::batch_insert_relevant_unconfirmed
-    pub fn batch_insert_unconfirmed<T: Into<Arc<Transaction>>>(
+    pub fn batch_insert_unconfirmed<T, C>(
         &mut self,
         txs: impl IntoIterator<Item = (T, u64)>,
-    ) -> ChangeSet<A, I::ChangeSet> {
+        out: &mut C,
+    ) where
+        T: Into<Arc<Transaction>>,
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
+        let cs = out.as_mut();
         let graph = self.graph.batch_insert_unconfirmed(txs);
         let indexer = self.index_tx_graph_changeset(&graph);
-        ChangeSet {
-            tx_graph: graph,
-            indexer,
-        }
+        cs.tx_graph.merge(graph);
+        cs.indexer.merge(indexer);
     }
 }
 
@@ -366,18 +425,19 @@ where
     /// Relevancy is determined by the internal [`Indexer::is_tx_relevant`] implementation of `I`.
     /// A transaction that conflicts with a relevant transaction is also considered relevant.
     /// Irrelevant transactions in `block` will be ignored.
-    pub fn apply_block_relevant(
-        &mut self,
-        block: &Block,
-        height: u32,
-    ) -> ChangeSet<A, I::ChangeSet> {
+    ///
+    /// Any resultant changes are written into `out`.
+    pub fn apply_block_relevant<C>(&mut self, block: &Block, height: u32, out: &mut C)
+    where
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
         let block_id = BlockId {
             hash: block.block_hash(),
             height,
         };
-        let mut changeset = ChangeSet::<A, I::ChangeSet>::default();
+        let cs = out.as_mut();
         for (tx_pos, tx) in block.txdata.iter().enumerate() {
-            changeset.indexer.merge(self.index.index_tx(tx));
+            cs.indexer.merge(self.index.index_tx(tx));
             if self.is_tx_or_conflict_relevant(tx) {
                 let txid = tx.compute_txid();
                 let anchor = TxPosInBlock {
@@ -386,13 +446,10 @@ where
                     tx_pos,
                 }
                 .into();
-                changeset.tx_graph.merge(self.graph.insert_tx(tx.clone()));
-                changeset
-                    .tx_graph
-                    .merge(self.graph.insert_anchor(txid, anchor));
+                cs.tx_graph.merge(self.graph.insert_tx(tx.clone()));
+                cs.tx_graph.merge(self.graph.insert_anchor(txid, anchor));
             }
         }
-        changeset
     }
 
     /// Batch insert all transactions of the given `block` of `height`.
@@ -401,12 +458,18 @@ where
     ///
     /// To only insert relevant transactions, use [`apply_block_relevant`] instead.
     ///
+    /// Any resultant changes are written into `out`.
+    ///
     /// [`apply_block_relevant`]: IndexedTxGraph::apply_block_relevant
-    pub fn apply_block(&mut self, block: Block, height: u32) -> ChangeSet<A, I::ChangeSet> {
+    pub fn apply_block<C>(&mut self, block: Block, height: u32, out: &mut C)
+    where
+        C: AsMut<ChangeSet<A, I::ChangeSet>>,
+    {
         let block_id = BlockId {
             hash: block.block_hash(),
             height,
         };
+        let cs = out.as_mut();
         let mut graph = tx_graph::ChangeSet::default();
         for (tx_pos, tx) in block.txdata.iter().enumerate() {
             let anchor = TxPosInBlock {
@@ -419,10 +482,8 @@ where
             graph.merge(self.graph.insert_tx(tx.clone()));
         }
         let indexer = self.index_tx_graph_changeset(&graph);
-        ChangeSet {
-            tx_graph: graph,
-            indexer,
-        }
+        cs.tx_graph.merge(graph);
+        cs.indexer.merge(indexer);
     }
 }
 
@@ -489,6 +550,12 @@ impl<A: Anchor, IA: Merge> Merge for ChangeSet<A, IA> {
 
     fn is_empty(&self) -> bool {
         self.tx_graph.is_empty() && self.indexer.is_empty()
+    }
+}
+
+impl<A, IA> AsMut<ChangeSet<A, IA>> for ChangeSet<A, IA> {
+    fn as_mut(&mut self) -> &mut Self {
+        self
     }
 }
 

@@ -29,7 +29,8 @@ fn main() -> anyhow::Result<()> {
     let secp = Secp256k1::new();
     let (descriptor, _) = Descriptor::parse_descriptor(&secp, EXTERNAL)?;
     let (change_descriptor, _) = Descriptor::parse_descriptor(&secp, INTERNAL)?;
-    let (mut chain, _) = LocalChain::from_genesis(genesis_block(NETWORK).block_hash());
+    let mut chain_cs = bdk_chain::local_chain::ChangeSet::default();
+    let mut chain = LocalChain::from_genesis(genesis_block(NETWORK).block_hash(), &mut chain_cs);
 
     let mut graph = IndexedTxGraph::<ConfirmationBlockTime, KeychainTxOutIndex<&str>>::new({
         let mut index = KeychainTxOutIndex::default();
@@ -39,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     // Assume a minimum birthday height
-    let _ = chain.insert_block(START_HEIGHT, START_HASH.parse()?)?;
+    chain.insert_block(START_HEIGHT, START_HASH.parse()?, &mut chain_cs)?;
 
     // Configure RPC client
     let url = std::env::var("RPC_URL").context("must set RPC_URL")?;
@@ -56,12 +57,13 @@ fn main() -> anyhow::Result<()> {
 
     let start = Instant::now();
 
+    let mut graph_cs = bdk_chain::indexed_tx_graph::ChangeSet::default();
     for res in iter {
         let Event { cp, block } = res?;
         let height = cp.height();
-        let _ = chain.apply_update(cp)?;
+        chain.apply_update(cp, &mut chain_cs)?;
         if let Some(block) = block {
-            let _ = graph.apply_block_relevant(&block, height);
+            graph.apply_block_relevant(&block, height, &mut graph_cs);
             println!("Matched block {height}");
         }
     }

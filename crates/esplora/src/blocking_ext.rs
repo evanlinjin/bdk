@@ -633,7 +633,8 @@ mod test {
 
             // craft initial `local_chain`
             let local_chain = {
-                let (mut chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+                let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+                let mut chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
                 // force `chain_update_blocking` to add all checkpoints in `t.initial_cps`
                 let anchors = t
                     .initial_cps
@@ -661,7 +662,8 @@ mod test {
                     &chain.tip(),
                     &anchors,
                 )?;
-                chain.apply_update(update)?;
+                let mut cs = bdk_chain::local_chain::ChangeSet::default();
+                chain.apply_update(update, &mut cs)?;
                 chain
             };
 
@@ -708,7 +710,8 @@ mod test {
 
             // apply update
             let mut updated_local_chain = local_chain.clone();
-            updated_local_chain.apply_update(update)?;
+            let mut cs = bdk_chain::local_chain::ChangeSet::default();
+            updated_local_chain.apply_update(update, &mut cs)?;
 
             assert!(
                 {
@@ -926,8 +929,9 @@ mod test {
                 t.name
             );
 
-            let _ = chain
-                .apply_update(chain_update)
+            let mut cs = bdk_chain::local_chain::ChangeSet::default();
+            chain
+                .apply_update(chain_update, &mut cs)
                 .unwrap_or_else(|err| panic!("[{}:{}] update failed to apply: {}", i, t.name, err));
 
             // all requested heights must exist in the final chain

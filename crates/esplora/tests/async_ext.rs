@@ -29,7 +29,8 @@ pub async fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     let client = Builder::new(base_url.as_str()).build_async()?;
 
     let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new(SpkTxOutIndex::<()>::default());
-    let (chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+    let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+    let chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
 
     // Get receiving address.
     let receiver_spk = common::get_test_spk();
@@ -112,7 +113,8 @@ pub async fn detect_receive_tx_cancel() -> anyhow::Result<()> {
             .any(|tx| tx.compute_txid() == send_txid),
         "sync response must include the send_tx"
     );
-    let changeset = graph.apply_update(sync_response.tx_update.clone());
+    let mut changeset = bdk_chain::indexed_tx_graph::ChangeSet::default();
+    graph.apply_update(sync_response.tx_update.clone(), &mut changeset);
     assert!(
         changeset.tx_graph.txs.contains(&send_tx),
         "tx graph must deem send_tx relevant and include it"
@@ -141,7 +143,8 @@ pub async fn detect_receive_tx_cancel() -> anyhow::Result<()> {
             .any(|(txid, _)| *txid == send_txid),
         "sync response must track send_tx as missing from mempool"
     );
-    let changeset = graph.apply_update(sync_response.tx_update.clone());
+    let mut changeset = bdk_chain::indexed_tx_graph::ChangeSet::default();
+    graph.apply_update(sync_response.tx_update.clone(), &mut changeset);
     assert!(
         changeset.tx_graph.last_evicted.contains_key(&send_txid),
         "tx graph must track send_tx as missing"

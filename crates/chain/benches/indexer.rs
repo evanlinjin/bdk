@@ -70,16 +70,18 @@ fn setup<F: Fn(&mut KeychainTxGraph, &LocalChain)>(f: F) -> (KeychainTxGraph, Lo
 /// Bench performance of recovering `KeychainTxOutIndex` from changeset.
 fn do_bench(indexed_tx_graph: &KeychainTxGraph, chain: &LocalChain) {
     let desc = indexed_tx_graph.index.get_descriptor(()).unwrap();
-    let changeset = indexed_tx_graph.initial_changeset();
+    let mut changeset = indexed_tx_graph.initial_changeset();
 
     // Now recover
-    let (graph, _cs) =
-        KeychainTxGraph::from_changeset(changeset, |cs| -> Result<_, InsertDescriptorError<_>> {
+    let graph = KeychainTxGraph::from_changeset(
+        |cs| -> Result<_, InsertDescriptorError<_>> {
             let mut index = KeychainTxOutIndex::from_changeset(LOOKAHEAD, USE_SPK_CACHE, cs);
             let _ = index.insert_descriptor((), desc.clone())?;
             Ok(index)
-        })
-        .unwrap();
+        },
+        &mut changeset,
+    )
+    .unwrap();
 
     // Check balance
     let op = graph.index.outpoints().clone();
@@ -91,9 +93,11 @@ fn do_bench(indexed_tx_graph: &KeychainTxGraph, chain: &LocalChain) {
 
 pub fn reindex_tx_graph(c: &mut Criterion) {
     let (graph, chain) = std::hint::black_box(setup(|graph, _chain| {
+        let mut cs = bdk_chain::indexed_tx_graph::ChangeSet::default();
+        let mut idx_cs = bdk_chain::keychain_txout::ChangeSet::default();
         // Add relevant txs to graph
         for i in 0..TX_CT {
-            let script_pubkey = graph.index.reveal_next_spk(()).unwrap().0 .1;
+            let script_pubkey = graph.index.reveal_next_spk((), &mut idx_cs).unwrap().1;
             let tx = Transaction {
                 input: vec![TxIn::default()],
                 output: vec![TxOut {
@@ -106,10 +110,10 @@ pub fn reindex_tx_graph(c: &mut Criterion) {
             let mut update = TxUpdate::default();
             update.seen_ats = [(txid, i as u64)].into();
             update.txs = vec![Arc::new(tx)];
-            let _ = graph.apply_update(update);
+            graph.apply_update(update, &mut cs);
         }
         // Reveal some SPKs
-        let _ = graph.index.reveal_to_target((), LAST_REVEALED);
+        let _ = graph.index.reveal_to_target((), LAST_REVEALED, &mut idx_cs);
     }));
 
     c.bench_function("reindex_tx_graph", {

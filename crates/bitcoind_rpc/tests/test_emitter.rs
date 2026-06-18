@@ -28,7 +28,8 @@ mod common;
 pub fn test_sync_local_chain() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
     let network_tip = env.rpc_client().get_block_count()?.into_model().0;
-    let (mut local_chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+    let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+    let mut local_chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
 
     let client = ClientExt::get_rpc_client(&env)?;
     let mut emitter = Emitter::new(&client, local_chain.tip(), 0, NO_EXPECTED_MEMPOOL_TXS);
@@ -55,8 +56,10 @@ pub fn test_sync_local_chain() -> anyhow::Result<()> {
             "emitted block hash is unexpected"
         );
 
+        let mut changeset = bdk_chain::local_chain::ChangeSet::default();
+        local_chain.apply_update(emission.checkpoint, &mut changeset)?;
         assert_eq!(
-            local_chain.apply_update(emission.checkpoint,)?,
+            changeset,
             [(height, Some(hash))].into(),
             "chain update changeset is unexpected",
         );
@@ -100,8 +103,10 @@ pub fn test_sync_local_chain() -> anyhow::Result<()> {
             "emitted block is unexpected"
         );
 
+        let mut changeset = bdk_chain::local_chain::ChangeSet::default();
+        local_chain.apply_update(emission.checkpoint, &mut changeset)?;
         assert_eq!(
-            local_chain.apply_update(emission.checkpoint,)?,
+            changeset,
             if exp_height == exp_hashes.len() - reorged_blocks.len() {
                 bdk_chain::local_chain::ChangeSet {
                     blocks: core::iter::once((height, Some(hash)))
@@ -161,7 +166,8 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
 
     env.mine_blocks(101, None)?;
 
-    let (mut chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+    let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+    let mut chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
     let mut indexed_tx_graph = IndexedTxGraph::<BlockId, _>::new({
         let mut index = SpkTxOutIndex::<usize>::default();
         index.insert_spk(0, addr_0.script_pubkey());
@@ -173,10 +179,12 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
     let client = ClientExt::get_rpc_client(&env)?;
     let emitter = &mut Emitter::new(&client, chain.tip(), 0, NO_EXPECTED_MEMPOOL_TXS);
 
+    let mut chain_cs = bdk_chain::local_chain::ChangeSet::default();
     while let Some(emission) = emitter.next_block()? {
         let height = emission.block_height();
-        let _ = chain.apply_update(emission.checkpoint)?;
-        let indexed_additions = indexed_tx_graph.apply_block_relevant(&emission.block, height);
+        chain.apply_update(emission.checkpoint, &mut chain_cs)?;
+        let mut indexed_additions = bdk_chain::indexed_tx_graph::ChangeSet::default();
+        indexed_tx_graph.apply_block_relevant(&emission.block, height, &mut indexed_additions);
         assert!(indexed_additions.is_empty());
     }
 
@@ -199,7 +207,8 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
         assert!(emitter.next_block()?.is_none());
 
         let mempool_txs = emitter.mempool()?;
-        let indexed_additions = indexed_tx_graph.batch_insert_unconfirmed(mempool_txs.update);
+        let mut indexed_additions = bdk_chain::indexed_tx_graph::ChangeSet::default();
+        indexed_tx_graph.batch_insert_unconfirmed(mempool_txs.update, &mut indexed_additions);
         assert_eq!(
             indexed_additions
                 .tx_graph
@@ -234,8 +243,9 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
     {
         let emission = emitter.next_block()?.expect("must get mined block");
         let height = emission.block_height();
-        let _ = chain.apply_update(emission.checkpoint)?;
-        let indexed_additions = indexed_tx_graph.apply_block_relevant(&emission.block, height);
+        chain.apply_update(emission.checkpoint, &mut chain_cs)?;
+        let mut indexed_additions = bdk_chain::indexed_tx_graph::ChangeSet::default();
+        indexed_tx_graph.apply_block_relevant(&emission.block, height, &mut indexed_additions);
         assert!(indexed_additions.tx_graph.txs.is_empty());
         assert!(indexed_additions.tx_graph.txouts.is_empty());
         assert_eq!(indexed_additions.tx_graph.anchors, exp_anchors);
@@ -293,8 +303,10 @@ fn process_block(
     block: Block,
     block_height: u32,
 ) -> anyhow::Result<()> {
-    recv_chain.apply_header(&block.header, block_height)?;
-    let _ = recv_graph.apply_block(block, block_height);
+    let mut chain_cs = bdk_chain::local_chain::ChangeSet::default();
+    recv_chain.apply_header(&block.header, block_height, &mut chain_cs)?;
+    let mut graph_cs = bdk_chain::indexed_tx_graph::ChangeSet::default();
+    recv_graph.apply_block(block, block_height, &mut graph_cs);
     Ok(())
 }
 
@@ -357,7 +369,8 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
     let addr_to_track = Address::from_script(&spk_to_track, Network::Regtest)?;
 
     // setup receiver
-    let (mut recv_chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+    let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+    let mut recv_chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
     let mut recv_graph = IndexedTxGraph::<BlockId, _>::new({
         let mut recv_index = SpkTxOutIndex::default();
         recv_index.insert_spk((), spk_to_track.clone());
@@ -574,7 +587,9 @@ fn test_expect_tx_evicted() -> anyhow::Result<()> {
         .0;
     let spk = desc.at_derivation_index(0)?.script_pubkey();
 
-    let mut chain = LocalChain::from_genesis(genesis_block(Network::Regtest).block_hash()).0;
+    let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+    let mut chain =
+        LocalChain::from_genesis(genesis_block(Network::Regtest).block_hash(), &mut genesis_cs);
     let chain_tip = chain.tip().block_id();
 
     let mut index = SpkTxOutIndex::default();
@@ -591,12 +606,14 @@ fn test_expect_tx_evicted() -> anyhow::Result<()> {
 
     let client = ClientExt::get_rpc_client(&env)?;
     let mut emitter = Emitter::new(&client, chain.tip(), 1, core::iter::once(tx_1));
+    let mut chain_cs = bdk_chain::local_chain::ChangeSet::default();
     while let Some(emission) = emitter.next_block()? {
         let height = emission.block_height();
-        chain.apply_header(&emission.block.header, height)?;
+        chain.apply_header(&emission.block.header, height, &mut chain_cs)?;
     }
 
-    let changeset = graph.batch_insert_unconfirmed(emitter.mempool()?.update);
+    let mut changeset = bdk_chain::indexed_tx_graph::ChangeSet::default();
+    graph.batch_insert_unconfirmed(emitter.mempool()?.update, &mut changeset);
     assert!(changeset
         .tx_graph
         .txs
@@ -648,7 +665,7 @@ fn test_expect_tx_evicted() -> anyhow::Result<()> {
         .any(|(txid, _)| txid == &txid_1));
 
     // Update graph with evicted tx.
-    let _ = graph.batch_insert_relevant_evicted_at(mempool_event.evicted);
+    graph.batch_insert_relevant_evicted_at(mempool_event.evicted, &mut changeset);
 
     let canonical_txids = chain
         .canonical_view(graph.graph(), chain_tip, Default::default())
@@ -667,14 +684,16 @@ fn test_expect_tx_evicted() -> anyhow::Result<()> {
 #[test]
 fn test_sync_with_new_emitter_after_reorg() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
-    let (mut local_chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+    let mut genesis_cs = bdk_chain::local_chain::ChangeSet::default();
+    let mut local_chain = LocalChain::from_genesis(env.genesis_hash()?, &mut genesis_cs);
     let client = ClientExt::get_rpc_client(&env)?;
 
     env.mine_blocks(110, None)?;
 
     let mut emitter = Emitter::new(&client, local_chain.tip(), 0, NO_EXPECTED_MEMPOOL_TXS);
+    let mut chain_cs = bdk_chain::local_chain::ChangeSet::default();
     while let Some(emission) = emitter.next_block()? {
-        let _ = local_chain.apply_update(emission.checkpoint)?;
+        local_chain.apply_update(emission.checkpoint, &mut chain_cs)?;
     }
 
     let pre_reorg_tip = local_chain.tip();
@@ -691,8 +710,8 @@ fn test_sync_with_new_emitter_after_reorg() -> anyhow::Result<()> {
     );
 
     while let Some(emission) = emitter.next_block()? {
-        let _ = local_chain
-            .apply_update(emission.checkpoint)
+        local_chain
+            .apply_update(emission.checkpoint, &mut chain_cs)
             .expect("emission checkpoint must connect with local chain");
     }
 

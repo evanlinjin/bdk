@@ -138,16 +138,20 @@ fn test_set_all_derivation_indices() {
         ),
     ]
     .into();
+    let mut changeset = ChangeSet::default();
+    txout_index.reveal_to_target_multi(&derive_to, &mut changeset);
     assert_eq!(
-        txout_index.reveal_to_target_multi(&derive_to),
+        changeset,
         ChangeSet {
             last_revealed: last_revealed.clone(),
             spk_cache: spk_cache.clone(),
         }
     );
     assert_eq!(txout_index.last_revealed_indices(), derive_to);
+    let mut changeset = ChangeSet::default();
+    txout_index.reveal_to_target_multi(&derive_to, &mut changeset);
     assert_eq!(
-        txout_index.reveal_to_target_multi(&derive_to),
+        changeset,
         ChangeSet::default(),
         "no changes if we set to the same thing"
     );
@@ -174,8 +178,9 @@ fn test_lookahead() {
     // - scripts cached in spk_txout_index should increase correctly
     // - stored scripts of external keychain should be of expected counts
     for index in 0..20 {
-        let (revealed_spks, revealed_changeset) = txout_index
-            .reveal_to_target(TestKeychain::External, index)
+        let mut revealed_changeset = ChangeSet::default();
+        let revealed_spks = txout_index
+            .reveal_to_target(TestKeychain::External, index, &mut revealed_changeset)
             .unwrap();
         assert_eq!(
             revealed_spks,
@@ -243,8 +248,9 @@ fn test_lookahead() {
     // expect:
     // - scripts cached in spk_txout_index should increase correctly, a.k.a. no scripts are skipped
     let reveal_to = 24;
-    let (revealed_spks, revealed_changeset) = txout_index
-        .reveal_to_target(TestKeychain::Internal, reveal_to)
+    let mut revealed_changeset = ChangeSet::default();
+    let revealed_spks = txout_index
+        .reveal_to_target(TestKeychain::Internal, reveal_to, &mut revealed_changeset)
         .unwrap();
     assert_eq!(
         revealed_spks,
@@ -419,10 +425,12 @@ fn test_wildcard_derivations() {
     // - derive_new() == ((0, <spk>), keychain::ChangeSet)
     // - next_unused() == ((0, <spk>), keychain::ChangeSet:is_empty())
     assert_eq!(txout_index.next_index(TestKeychain::External).unwrap(), (0, true));
-    let (spk, changeset) = txout_index.reveal_next_spk(TestKeychain::External).unwrap();
+    let mut changeset = ChangeSet::default();
+    let spk = txout_index.reveal_next_spk(TestKeychain::External, &mut changeset).unwrap();
     assert_eq!(spk, (0_u32, external_spk_0.clone()));
     assert_eq!(&changeset.last_revealed, &[(external_descriptor.descriptor_id(), 0)].into());
-    let (spk, changeset) = txout_index.next_unused_spk(TestKeychain::External).unwrap();
+    let mut changeset = ChangeSet::default();
+    let spk = txout_index.next_unused_spk(TestKeychain::External, &mut changeset).unwrap();
     assert_eq!(spk, (0_u32, external_spk_0.clone()));
     assert_eq!(&changeset.last_revealed, &[].into());
 
@@ -434,7 +442,8 @@ fn test_wildcard_derivations() {
     // - next_derivation_index() = (26, true)
     // - derive_new() = ((26, <spk>), keychain::ChangeSet)
     // - next_unused() == ((16, <spk>), keychain::ChangeSet::is_empty())
-    let _ = txout_index.reveal_to_target(TestKeychain::External, 25);
+    let mut tmp = ChangeSet::default();
+    let _ = txout_index.reveal_to_target(TestKeychain::External, 25, &mut tmp);
 
     (0..=15)
         .chain([17, 20, 23])
@@ -442,12 +451,14 @@ fn test_wildcard_derivations() {
 
     assert_eq!(txout_index.next_index(TestKeychain::External).unwrap(), (26, true));
 
-    let (spk, changeset) = txout_index.reveal_next_spk(TestKeychain::External).unwrap();
+    let mut changeset = ChangeSet::default();
+    let spk = txout_index.reveal_next_spk(TestKeychain::External, &mut changeset).unwrap();
     assert_eq!(spk, (26, external_spk_26));
 
     assert_eq!(&changeset.last_revealed, &[(external_descriptor.descriptor_id(), 26)].into());
 
-    let (spk, changeset) = txout_index.next_unused_spk(TestKeychain::External).unwrap();
+    let mut changeset = ChangeSet::default();
+    let spk = txout_index.next_unused_spk(TestKeychain::External, &mut changeset).unwrap();
     assert_eq!(spk, (16, external_spk_16));
     assert_eq!(&changeset.last_revealed, &[].into());
 
@@ -457,7 +468,8 @@ fn test_wildcard_derivations() {
         txout_index.mark_used(TestKeychain::External, index);
     });
 
-    let (spk, changeset) = txout_index.next_unused_spk(TestKeychain::External).unwrap();
+    let mut changeset = ChangeSet::default();
+    let spk = txout_index.next_unused_spk(TestKeychain::External, &mut changeset).unwrap();
     assert_eq!(spk, (27, external_spk_27));
     assert_eq!(&changeset.last_revealed, &[(external_descriptor.descriptor_id(), 27)].into());
 }
@@ -488,14 +500,20 @@ fn test_non_wildcard_derivations() {
         txout_index.next_index(TestKeychain::External).unwrap(),
         (0, true)
     );
-    let (spk, changeset) = txout_index.reveal_next_spk(TestKeychain::External).unwrap();
+    let mut changeset = ChangeSet::default();
+    let spk = txout_index
+        .reveal_next_spk(TestKeychain::External, &mut changeset)
+        .unwrap();
     assert_eq!(spk, (0, external_spk.clone()));
     assert_eq!(
         &changeset.last_revealed,
         &[(no_wildcard_descriptor.descriptor_id(), 0)].into()
     );
 
-    let (spk, changeset) = txout_index.next_unused_spk(TestKeychain::External).unwrap();
+    let mut changeset = ChangeSet::default();
+    let spk = txout_index
+        .next_unused_spk(TestKeychain::External, &mut changeset)
+        .unwrap();
     assert_eq!(spk, (0, external_spk.clone()));
     assert_eq!(&changeset.last_revealed, &[].into());
 
@@ -511,15 +529,22 @@ fn test_non_wildcard_derivations() {
     );
     txout_index.mark_used(TestKeychain::External, 0);
 
-    let (spk, changeset) = txout_index.reveal_next_spk(TestKeychain::External).unwrap();
+    let mut changeset = ChangeSet::default();
+    let spk = txout_index
+        .reveal_next_spk(TestKeychain::External, &mut changeset)
+        .unwrap();
     assert_eq!(spk, (0, external_spk.clone()));
     assert_eq!(&changeset.last_revealed, &[].into());
 
-    let (spk, changeset) = txout_index.next_unused_spk(TestKeychain::External).unwrap();
+    let mut changeset = ChangeSet::default();
+    let spk = txout_index
+        .next_unused_spk(TestKeychain::External, &mut changeset)
+        .unwrap();
     assert_eq!(spk, (0, external_spk.clone()));
     assert_eq!(&changeset.last_revealed, &[].into());
-    let (revealed_spks, revealed_changeset) = txout_index
-        .reveal_to_target(TestKeychain::External, 200)
+    let mut revealed_changeset = ChangeSet::default();
+    let revealed_spks = txout_index
+        .reveal_to_target(TestKeychain::External, 200, &mut revealed_changeset)
         .unwrap();
     assert_eq!(revealed_spks.len(), 0);
     assert!(revealed_changeset.is_empty());
@@ -593,11 +618,12 @@ fn lookahead_to_target() {
             true,
         );
 
+        let mut tmp = ChangeSet::default();
         if let Some(last_revealed) = t.external_last_revealed {
-            let _ = index.reveal_to_target(TestKeychain::External, last_revealed);
+            let _ = index.reveal_to_target(TestKeychain::External, last_revealed, &mut tmp);
         }
         if let Some(last_revealed) = t.internal_last_revealed {
-            let _ = index.reveal_to_target(TestKeychain::Internal, last_revealed);
+            let _ = index.reveal_to_target(TestKeychain::Internal, last_revealed, &mut tmp);
         }
 
         let keychain_test_cases = [
@@ -624,7 +650,8 @@ fn lookahead_to_target() {
                     }
                     None => target,
                 };
-                let _ = index.lookahead_to_target(keychain.clone(), target);
+                let mut tmp = ChangeSet::default();
+                index.lookahead_to_target(keychain.clone(), target, &mut tmp);
                 let keys: Vec<_> = (0..)
                     .take_while(|&i| index.spk_at_index(keychain.clone(), i).is_some())
                     .collect();
@@ -717,12 +744,13 @@ fn when_querying_over_a_range_of_keychains_the_utxos_should_show_up() {
     let mut indexer = KeychainTxOutIndex::<usize>::new(0, true);
     let mut tx = new_tx(0);
 
+    let mut changeset = ChangeSet::default();
     for (i, descriptor) in DESCRIPTORS.iter().enumerate() {
         let descriptor = parse_descriptor(descriptor);
         let _ = indexer.insert_descriptor(i, descriptor.clone()).unwrap();
         if i != 4 {
             // skip one in the middle to see if uncovers any bugs
-            indexer.reveal_next_spk(i);
+            indexer.reveal_next_spk(i, &mut changeset);
         }
         tx.output.push(TxOut {
             script_pubkey: descriptor.at_derivation_index(0).unwrap().script_pubkey(),
