@@ -2110,3 +2110,58 @@ fn test_list_ordered_canonical_txs() {
         );
     }
 }
+
+/// A tx that repeats the same `previous_output` is consensus-invalid, but it decodes fine and can
+/// arrive from a malicious Electrum/Esplora server. Canonicalization's spend-tracking must tolerate
+/// it: it once asserted that no outpoint is spent twice, which aborted every balance/UTXO query.
+#[test]
+fn filter_chain_txouts_tolerates_tx_with_duplicate_inputs() {
+    let blocks: BTreeMap<u32, BlockHash> = [(0, hash!("genesis"))].into_iter().collect();
+    let chain = LocalChain::from_blocks(blocks).unwrap();
+    let chain_tip = chain.tip().block_id();
+
+    let dup = OutPoint::new(hash!("prevout"), 0);
+    let tx = Transaction {
+        input: vec![
+            TxIn {
+                previous_output: dup,
+                ..Default::default()
+            },
+            TxIn {
+                previous_output: dup,
+                ..Default::default()
+            },
+        ],
+        output: vec![TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: ScriptBuf::new(),
+        }],
+        ..new_tx(0)
+    };
+    let txid = tx.compute_txid();
+
+    let mut graph = TxGraph::<ConfirmationBlockTime>::default();
+    let _ = graph.insert_tx(tx);
+    // Both sync clients stamp `seen_at` from their own clock, which is what makes this canonical.
+    let _ = graph.insert_seen_at(txid, 123_456);
+
+    let outpoint = OutPoint::new(txid, 0);
+    let txouts = graph
+        .filter_chain_txouts(
+            &chain,
+            chain_tip,
+            CanonicalizationParams::default(),
+            [((), outpoint)],
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(txouts.len(), 1);
+
+    let balance = graph.balance(
+        &chain,
+        chain_tip,
+        CanonicalizationParams::default(),
+        [((), outpoint)],
+        |_, _| true,
+    );
+    assert_eq!(balance.trusted_pending, Amount::from_sat(10_000));
+}
