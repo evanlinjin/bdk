@@ -113,18 +113,22 @@ fn eligibility_of(
         .1
 }
 
+/// The settled boundary is whatever `is_settled` says: at the threshold the output is settled, one
+/// past it it is not — and it is then `Trusted`, because the walk stops at its settled parent
+/// rather than running off the edge of the graph.
 #[test]
 fn test_is_settled_boundary() {
     let chain = chain_to_height(10);
     let mut tx_graph = TxGraph::default();
 
+    // A parent settled below every threshold tested, so the ancestry walk always stops here.
     let parent = insert_anchored(
         &mut tx_graph,
         &chain,
         tx_spending(0, OutPoint::new(hash!("root"), 0), &[50_000]),
         1,
     );
-    // Transaction confirmed at height 5, tip at height 10 (6 confirmations)
+    // The output under test: mined at height 5, so 6 confirmations at tip 10.
     let txid = insert_anchored(
         &mut tx_graph,
         &chain,
@@ -135,36 +139,47 @@ fn test_is_settled_boundary() {
 
     let view = chain.canonical_view(&tx_graph, chain.tip().block_id(), Default::default());
     let tip_height = view.tip().height;
-    // Test min_confirmations = 1: Should be confirmed (has 6 confirmations)
-    let balance_1_conf = view.balance([outpoint], no_direct_taint, settled(tip_height, 1));
-    assert_eq!(balance_1_conf.confirmed, Amount::from_sat(50_000));
-    assert_eq!(balance_1_conf.trusted_pending, Amount::ZERO);
+    let balance_at =
+        |threshold| view.balance([outpoint], no_direct_taint, settled(tip_height, threshold));
 
-    // Test min_confirmations = 6: Should be confirmed (has exactly 6 confirmations)
-    let balance_6_conf = view.balance([outpoint], no_direct_taint, settled(tip_height, 6));
-    assert_eq!(balance_6_conf.confirmed, Amount::from_sat(50_000));
-    assert_eq!(balance_6_conf.trusted_pending, Amount::ZERO);
+    // Well under the threshold, and exactly at it: settled.
+    for threshold in [1, 6] {
+        let balance = balance_at(threshold);
+        assert_eq!(
+            balance.confirmed,
+            Amount::from_sat(50_000),
+            "{threshold} confirmations"
+        );
+        assert_eq!(
+            balance.trusted_pending,
+            Amount::ZERO,
+            "{threshold} confirmations"
+        );
+    }
 
-    // Test min_confirmations = 7: Should be trusted pending (only has 6 confirmations)
-    let balance_7_conf = view.balance([outpoint], no_direct_taint, settled(tip_height, 7));
-    assert_eq!(balance_7_conf.confirmed, Amount::ZERO);
-    assert_eq!(balance_7_conf.trusted_pending, Amount::from_sat(50_000));
+    // One past the threshold: unsettled, and `Trusted` via the settled parent. `Unknown` here
+    // (which lands in `untrusted_pending`) would mean the settled-ancestor cutoff regressed.
+    let balance = balance_at(7);
+    assert_eq!(balance.confirmed, Amount::ZERO);
+    assert_eq!(balance.trusted_pending, Amount::from_sat(50_000));
+    assert_eq!(balance.untrusted_pending, Amount::ZERO);
 }
 
+/// With ancestry fully known, `does_taint` alone decides `Trusted` vs `Untrusted`. Both directions
+/// are asserted so that ignoring the predicate cannot pass.
 #[test]
-fn test_min_confirmations_with_untrusted_tx() {
+fn test_taint_decides_trust_when_ancestry_is_known() {
     let chain = chain_to_height(10);
     let mut tx_graph = TxGraph::default();
 
-    // A settled parent, so ancestry alone would make the child trusted and `does_taint` is what
-    // decides the outcome.
+    // A settled parent, so ancestry alone would make the child trusted and `does_taint` decides.
     let parent = insert_anchored(
         &mut tx_graph,
         &chain,
         tx_spending(0, OutPoint::new(hash!("root"), 0), &[25_000]),
         1,
     );
-    // Anchor at height 8, tip at height 10 (3 confirmations)
+    // Mined at height 8, so 3 confirmations at tip 10: unsettled at a threshold of 5.
     let txid = insert_anchored(
         &mut tx_graph,
         &chain,
@@ -176,7 +191,6 @@ fn test_min_confirmations_with_untrusted_tx() {
     let view = chain.canonical_view(&tx_graph, chain.tip().block_id(), Default::default());
     let tip_height = view.tip().height;
 
-    // Test with min_confirmations = 5 and everything tainted
     let tainted = view.balance([outpoint], |_tx| true, settled(tip_height, 5));
     assert_eq!(tainted.confirmed, Amount::ZERO);
     assert_eq!(tainted.trusted_pending, Amount::ZERO);
@@ -188,8 +202,10 @@ fn test_min_confirmations_with_untrusted_tx() {
     assert_eq!(untainted.untrusted_pending, Amount::ZERO);
 }
 
+/// Several outputs at different depths, folded in one `balance` call: each lands in `confirmed`
+/// or `trusted_pending` per the same `is_settled`, and raising the threshold moves them across.
 #[test]
-fn test_min_confirmations_multiple_transactions() {
+fn test_balance_splits_outputs_by_settled_threshold() {
     let chain = chain_to_height(15);
     let mut tx_graph = TxGraph::default();
 
@@ -227,19 +243,13 @@ fn test_min_confirmations_multiple_transactions() {
     let view = chain.canonical_view(&tx_graph, chain.tip().block_id(), Default::default());
     let tip_height = view.tip().height;
 
-    // Test with min_confirmations = 5
-    // tx0: 11 confirmations -> confirmed
-    // tx1: 6 confirmations -> confirmed
-    // tx2: 3 confirmations -> trusted pending
+    // At a threshold of 5, only the 3-confirmation output is unsettled.
     let balance = view.balance(outpoints.clone(), no_direct_taint, settled(tip_height, 5));
     assert_eq!(balance.confirmed, Amount::from_sat(10_000 + 20_000));
     assert_eq!(balance.trusted_pending, Amount::from_sat(30_000));
     assert_eq!(balance.untrusted_pending, Amount::ZERO);
 
-    // Test with min_confirmations = 10
-    // tx0: 11 confirmations -> confirmed
-    // tx1: 6 confirmations -> trusted pending
-    // tx2: 3 confirmations -> trusted pending
+    // Raising it to 10 demotes the 6-confirmation output too.
     let balance = view.balance(outpoints, no_direct_taint, settled(tip_height, 10));
     assert_eq!(balance.confirmed, Amount::from_sat(10_000));
     assert_eq!(balance.trusted_pending, Amount::from_sat(20_000 + 30_000));
@@ -266,10 +276,18 @@ fn test_balance_taint_propagates_through_unconfirmed_ancestry() {
         tx_spending(1, OutPoint::new(coin, 0), &[40_000]),
         1000,
     );
-    // Unconfirmed, funded by a third party (spends a foreign outpoint) -> taints itself.
+    // A third party's coin: settled and present in the view, so `foreign` below is untrusted
+    // because of who owns it, not because its ancestry is missing.
+    let third_party = insert_anchored(
+        &mut tx_graph,
+        &chain,
+        tx_spending(4, OutPoint::new(hash!("their_root"), 0), &[30_000]),
+        1,
+    );
+    // Unconfirmed, funded by that third party (spends an outpoint we don't own) -> taints itself.
     let foreign = insert_unconfirmed(
         &mut tx_graph,
-        tx_spending(2, OutPoint::new(hash!("third_party"), 0), &[30_000]),
+        tx_spending(2, OutPoint::new(third_party, 0), &[30_000]),
         1000,
     );
     // Unconfirmed, spends our own `foreign` output -> tainted via its ancestor `foreign`.
@@ -333,12 +351,18 @@ fn test_balance_taint_stops_at_settled_ancestor() {
     let chain = chain_to_height(2);
     let mut tx_graph = TxGraph::<ConfirmationBlockTime>::default();
 
-    // A *settled* (confirmed) tx that itself spends a third-party coin — `does_taint` would flag
-    // it.
+    // A third party's coin, settled and present in the view.
+    let third_party = insert_anchored(
+        &mut tx_graph,
+        &chain,
+        tx_spending(2, OutPoint::new(hash!("their_root"), 0), &[50_000]),
+        1,
+    );
+    // A *settled* (confirmed) tx that itself spends that third-party coin — `does_taint` flags it.
     let settled_foreign = insert_anchored(
         &mut tx_graph,
         &chain,
-        tx_spending(0, OutPoint::new(hash!("third_party"), 0), &[50_000]),
+        tx_spending(0, OutPoint::new(third_party, 0), &[50_000]),
         1,
     );
     // Unconfirmed child spending our own (settled) output.
@@ -354,6 +378,14 @@ fn test_balance_taint_stops_at_settled_ancestor() {
         .collect::<HashSet<_>>();
 
     let view = chain.canonical_view(&tx_graph, chain.tip().block_id(), Default::default());
+
+    // The predicate really does flag `settled_foreign`; the walk simply never asks it, because it
+    // stops at settled ancestors. Without this the test would pass even if taint were ignored.
+    assert!(taints_outside(&owned)(
+        &view
+            .tx(settled_foreign)
+            .expect("settled_foreign is canonical")
+    ));
 
     // The foreign-spending ancestor is settled, so the walk stops there and never taints `child`.
     assert_eq!(
@@ -413,10 +445,18 @@ fn test_balance_taint_shared_ancestor() {
     let chain = chain_to_height(1);
     let mut tx_graph = TxGraph::<ConfirmationBlockTime>::default();
 
-    // Unconfirmed, funded by a third party -> taints itself. Two outputs.
+    // A third party's coin: settled and present, so the taint below comes from ownership rather
+    // than from ancestry running off the edge of the view.
+    let third_party = insert_anchored(
+        &mut tx_graph,
+        &chain,
+        tx_spending(3, OutPoint::new(hash!("their_root"), 0), &[50_000]),
+        1,
+    );
+    // Unconfirmed, funded by that third party -> taints itself. Two outputs.
     let foreign = insert_unconfirmed(
         &mut tx_graph,
-        tx_spending(0, OutPoint::new(hash!("third_party"), 0), &[30_000, 20_000]),
+        tx_spending(0, OutPoint::new(third_party, 0), &[30_000, 20_000]),
         1000,
     );
     // Two children, each spending one of `foreign`'s outputs, so both share the tainting ancestor.
