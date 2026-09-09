@@ -47,14 +47,20 @@ pub enum Eligibility {
 }
 
 /// Describes whether an [`Unsettled`](Eligibility::Unsettled) output is trusted, untrusted, or of
-/// unknown trust because the `CanonicalView` doesn't have its full ancestry.
+/// unknown trust.
+///
+/// Determined by walking back from the output's transaction through its unsettled ancestry,
+/// stopping at settled ancestors — so it never depends on history the caller already considers
+/// settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Trust {
-    /// Ancestors spend owned outputs.
+    /// The unsettled ancestry is fully present in the [`CanonicalView`] and nothing in it taints.
     Trusted,
-    /// Ancestors spend foreign outputs.
+    /// The transaction, or something in its unsettled ancestry, taints (typically by spending an
+    /// output the wallet doesn't own).
     Untrusted,
-    /// Some ancestor is not in Canonical set.
+    /// The unsettled ancestry reaches a transaction missing from the [`CanonicalView`], so whether
+    /// it taints cannot be determined.
     Unknown,
 }
 
@@ -568,6 +574,10 @@ impl<A: Anchor> CanonicalView<A> {
     /// added to the bucket matching its [`Eligibility`].
     ///
     /// See `classify_outpoints` for `does_taint` and `is_settled` meaning.
+    ///
+    /// [`Trust::Unknown`] folds into `untrusted_pending`, which matters for light clients: they
+    /// typically only have spk-filtered history, so ancestry runs out often. Callers who want to
+    /// bucket it differently must fold [`classify_outpoints`](Self::classify_outpoints) themselves.
     ///
     /// # Example
     ///
