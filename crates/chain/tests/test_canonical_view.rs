@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use bdk_chain::{
-    local_chain::LocalChain, BlockId, CanonicalTx, CanonicalView, ChainPosition,
-    ConfirmationBlockTime, Eligibility, Trust, TxGraph,
+    local_chain::LocalChain, spk_txout::SpkTxOutIndex, taints_unowned, BlockId, CanonicalTx,
+    CanonicalView, ChainPosition, ConfirmationBlockTime, Eligibility, Indexer, Trust, TxGraph,
 };
 use bdk_testenv::{hash, utils::new_tx};
 use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid};
@@ -74,6 +74,15 @@ fn insert_anchored(
         },
     );
     txid
+}
+
+/// A transaction with locktime `lt` spending `spends`, paying each of `values` to `spk`.
+fn tx_spending_to(lt: u32, spends: OutPoint, spk: &ScriptBuf, values: &[u64]) -> Transaction {
+    let mut tx = tx_spending(lt, spends, values);
+    for txout in &mut tx.output {
+        txout.script_pubkey = spk.clone();
+    }
+    tx
 }
 
 /// Inserts `tx` into `tx_graph` as unconfirmed, seen in the mempool at `seen_at`.
@@ -638,5 +647,66 @@ fn test_evicted_stale_anchored_tx_not_canonical() {
     assert!(
         !view.txs().any(|tx| tx.txid == txid),
         "evicted leftover tx must not be canonical"
+    );
+}
+
+/// `taints_unowned` treats an input it cannot resolve to one of our coins as tainting, so a
+/// transaction funded from outside the wallet is `Untrusted` rather than `Unknown` — the walk stops
+/// at it instead of running past it into ancestry we never had.
+#[test]
+fn test_taints_unowned_treats_unresolvable_inputs_as_tainting() {
+    let chain = chain_to_height(1);
+    let mut tx_graph = TxGraph::<ConfirmationBlockTime>::default();
+    let mut indexer = SpkTxOutIndex::<u32>::default();
+    let owned_spk = ScriptBuf::from_bytes(vec![0x51]); // OP_TRUE, so it differs from a foreign spk
+    indexer.insert_spk(0, owned_spk.clone());
+
+    // An incoming payment: unconfirmed, spending the sender's coin, which we neither own nor hold.
+    // Two outputs, so one can be spent below while the other stays a UTXO we can classify.
+    let incoming = tx_spending_to(
+        1,
+        OutPoint::new(hash!("senders_coin"), 0),
+        &owned_spk,
+        &[50_000, 10_000],
+    );
+    let incoming_txid = insert_unconfirmed(&mut tx_graph, incoming.clone(), 1000);
+    indexer.index_tx(&incoming);
+
+    // A self-transfer: unconfirmed, spending our own (unconfirmed) output.
+    let self_spend = tx_spending_to(2, OutPoint::new(incoming_txid, 0), &owned_spk, &[40_000]);
+    let self_spend_txid = insert_unconfirmed(&mut tx_graph, self_spend.clone(), 1000);
+    indexer.index_tx(&self_spend);
+
+    let view = chain.canonical_view(&tx_graph, chain.tip().block_id(), Default::default());
+
+    // `incoming` taints itself, so the missing `senders_coin` is never reached.
+    assert_eq!(
+        eligibility_of(
+            &view,
+            OutPoint::new(incoming_txid, 1),
+            taints_unowned(&indexer),
+            |pos| pos.is_confirmed()
+        ),
+        Eligibility::Unsettled(Trust::Untrusted)
+    );
+    // The descendant inherits that taint rather than reporting `Unknown`.
+    assert_eq!(
+        eligibility_of(
+            &view,
+            OutPoint::new(self_spend_txid, 0),
+            taints_unowned(&indexer),
+            |pos| pos.is_confirmed()
+        ),
+        Eligibility::Unsettled(Trust::Untrusted)
+    );
+    // A predicate that abstains instead is what yields `Unknown` — the contrast is the whole point.
+    assert_eq!(
+        eligibility_of(
+            &view,
+            OutPoint::new(self_spend_txid, 0),
+            no_direct_taint,
+            |pos| pos.is_confirmed()
+        ),
+        Eligibility::Unsettled(Trust::Unknown)
     );
 }

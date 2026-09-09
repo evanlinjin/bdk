@@ -64,6 +64,32 @@ pub enum Trust {
     Unknown,
 }
 
+/// Builds a `does_taint` predicate for [`classify_outpoints`] and [`balance`]: a transaction taints
+/// when any of its inputs spends a coin `indexer` doesn't recognise as ours.
+///
+/// An input whose previous output cannot be resolved counts as tainting, so a transaction funded
+/// from outside the wallet is [`Untrusted`](Trust::Untrusted) rather than
+/// [`Unknown`](Trust::Unknown) — the walk stops at it instead of running past it into ancestry we
+/// never had. Callers who would rather abstain on inputs they haven't synced want their own
+/// predicate; see [`Trust::Unknown`].
+///
+/// [`classify_outpoints`]: CanonicalView::classify_outpoints
+/// [`balance`]: CanonicalView::balance
+pub fn taints_unowned<'v, P, I>(
+    indexer: &'v impl AsRef<SpkTxOutIndex<I>>,
+) -> impl Fn(&CanonicalTx<P>) -> bool + 'v
+where
+    I: fmt::Debug + Clone + Ord + 'v,
+{
+    let indexer = indexer.as_ref();
+    move |c_tx| {
+        c_tx.tx.input.iter().any(|txin| {
+            // A coinbase input has no previous output to own.
+            !txin.previous_output.is_null() && indexer.txout(txin.previous_output).is_none()
+        })
+    }
+}
+
 /// A single canonical transaction with its position.
 ///
 /// This struct represents a transaction that has been determined to be canonical (not
@@ -582,7 +608,7 @@ impl<A: Anchor> CanonicalView<A> {
     /// # Example
     ///
     /// ```
-    /// # use bdk_chain::{CanonicalParams, ChainPosition, TxGraph, local_chain::LocalChain, keychain_txout::KeychainTxOutIndex};
+    /// # use bdk_chain::{CanonicalParams, ChainPosition, TxGraph, taints_unowned, local_chain::LocalChain, keychain_txout::KeychainTxOutIndex};
     /// # use bdk_core::BlockId;
     /// # use bitcoin::hashes::Hash;
     /// # let tx_graph = TxGraph::<BlockId>::default();
@@ -594,16 +620,7 @@ impl<A: Anchor> CanonicalView<A> {
     /// // Calculate balance requiring 6 confirmations.
     /// let balance = view.balance(
     ///     indexer.outpoints().iter().map(|(_, op)| *op),
-    ///     // A tx taints when it spends a coin we don't own.
-    ///     |c_tx| {
-    ///         c_tx.tx.input.iter().any(|txin| {
-    ///             let op = txin.previous_output;
-    ///             !op.is_null()
-    ///                 && view.txout(op).is_none_or(|txo| {
-    ///                     indexer.index_of_spk(txo.txout.script_pubkey.clone()).is_none()
-    ///                 })
-    ///         })
-    ///     },
+    ///     taints_unowned(&indexer),
     ///     |pos: &ChainPosition<_>| {
     ///         pos.confirmation_height_upper_bound()
     ///             .is_some_and(|h| tip_height.saturating_sub(h).saturating_add(1) >= 6)
