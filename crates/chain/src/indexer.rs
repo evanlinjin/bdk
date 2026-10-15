@@ -2,6 +2,8 @@
 
 use bitcoin::{OutPoint, Transaction, TxOut};
 
+use crate::{tx_graph::TxGraph, Merge};
+
 #[cfg(feature = "miniscript")]
 pub mod keychain_txout;
 pub mod spk_txout;
@@ -30,4 +32,27 @@ pub trait Indexer {
 
     /// Determines whether the transaction should be included in the index.
     fn is_tx_relevant(&self, tx: &Transaction) -> bool;
+
+    /// Index everything in `graph` that this indexer has not already accounted for.
+    ///
+    /// The default implementation offers every full transaction and floating output to
+    /// [`index_tx`](Self::index_tx) and [`index_txout`](Self::index_txout) exactly once, which is
+    /// all an indexer needs when what it recognizes is fixed up front.
+    ///
+    /// Override this when a match can *widen* what the indexer recognizes, so that an output
+    /// offered earlier in the walk could match on a later look. Only the indexer knows when its
+    /// recognition set has stopped growing, so only the indexer can decide when to stop looking.
+    fn rescan<A>(&mut self, graph: &TxGraph<A>) -> Self::ChangeSet
+    where
+        Self::ChangeSet: Merge,
+    {
+        let mut changeset = Self::ChangeSet::default();
+        for tx in graph.full_txs() {
+            changeset.merge(self.index_tx(&tx));
+        }
+        for (op, txout) in graph.floating_txouts() {
+            changeset.merge(self.index_txout(op, txout));
+        }
+        changeset
+    }
 }

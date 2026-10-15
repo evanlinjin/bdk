@@ -145,18 +145,16 @@ where
 
     /// Synchronizes the indexer to reflect every entry in the transaction graph.
     ///
-    /// Iterates over **all** full transactions and floating outputs in `self.graph`, passing each
-    /// into `self.index`. Any indexer-side changes produced (via `index_tx` or `index_txout`) are
-    /// merged into a fresh `ChangeSet`, which is then returned.
+    /// Hands the whole graph to [`Indexer::rescan`] and returns the indexer-side changes it
+    /// produces. How thoroughly the graph is walked is the indexer's decision: one whose set of
+    /// recognized outputs grows as it matches — `KeychainTxOutIndex` extends its lookahead past
+    /// each newly revealed index — has to look more than once to reach everything it can, and it is
+    /// the only party that knows when it is done.
     pub fn reindex(&mut self) -> ChangeSet<A, I::ChangeSet> {
-        let mut changeset = ChangeSet::<A, I::ChangeSet>::default();
-        for tx in self.graph.full_txs() {
-            changeset.indexer.merge(self.index.index_tx(&tx));
+        ChangeSet {
+            tx_graph: Default::default(),
+            indexer: self.index.rescan(&self.graph),
         }
-        for (op, txout) in self.graph.floating_txouts() {
-            changeset.indexer.merge(self.index.index_txout(op, txout));
-        }
-        changeset
     }
 
     fn index_tx_graph_changeset(

@@ -132,7 +132,11 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
         let start_time = request.start_time();
 
         let tip_and_latest_blocks = match request.chain_tip() {
-            Some(chain_tip) => Some(fetch_tip_and_latest_blocks(&self.inner, chain_tip)?),
+            Some(chain_tip) => Some(fetch_tip_and_latest_blocks(
+                &self.inner,
+                chain_tip,
+                &mut self.block_header_cache.lock().unwrap(),
+            )?),
             None => None,
         };
 
@@ -217,7 +221,11 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
         let start_time = request.start_time();
 
         let tip_and_latest_blocks = match request.chain_tip() {
-            Some(chain_tip) => Some(fetch_tip_and_latest_blocks(&self.inner, chain_tip)?),
+            Some(chain_tip) => Some(fetch_tip_and_latest_blocks(
+                &self.inner,
+                chain_tip,
+                &mut self.block_header_cache.lock().unwrap(),
+            )?),
             None => None,
         };
 
@@ -652,6 +660,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
 fn fetch_tip_and_latest_blocks(
     client: &impl ElectrumApi,
     prev_tip: CheckPoint<BlockHash>,
+    block_header_cache: &mut HashMap<u32, Header>,
 ) -> Result<(CheckPoint<BlockHash>, BTreeMap<u32, BlockHash>), Error> {
     let HeaderNotification { height, .. } = client.block_headers_subscribe()?;
     let new_tip_height = height as u32;
@@ -666,12 +675,14 @@ fn fetch_tip_and_latest_blocks(
     // to construct our checkpoint update.
     let mut new_blocks = {
         let start_height = new_tip_height.saturating_sub(CHAIN_SUFFIX_LENGTH - 1);
-        let hashes = client
+        let headers = client
             .block_headers(start_height as _, CHAIN_SUFFIX_LENGTH as _)?
-            .headers
-            .into_iter()
-            .map(|h| h.block_hash());
-        (start_height..).zip(hashes).collect::<BTreeMap<u32, _>>()
+            .headers;
+        block_header_cache.extend((start_height..).zip(headers.iter().copied()));
+
+        (start_height..)
+            .zip(headers.into_iter().map(|h| h.block_hash()))
+            .collect::<BTreeMap<u32, BlockHash>>()
     };
 
     // Find the "point of agreement" (if any).
@@ -686,7 +697,9 @@ fn fetch_tip_and_latest_blocks(
                         new_tip_height >= cp_block.height,
                         "already checked that electrum's tip cannot be smaller"
                     );
-                    let hash = client.block_header(cp_block.height as _)?.block_hash();
+                    let header = client.block_header(cp_block.height as _)?;
+                    block_header_cache.insert(cp_block.height, header);
+                    let hash = header.block_hash();
                     new_blocks.insert(cp_block.height, hash);
                     hash
                 }
@@ -836,7 +849,7 @@ mod test {
 
         // Mine block that confirms transaction.
         env.mine_blocks(1, None)?;
-        env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+        env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
         let height: u32 = env.rpc_client().get_block_count()?.into_model().0 as u32;
 
         // Add the pre-reorg block that the tx is confirmed in to the header cache.
@@ -851,7 +864,7 @@ mod test {
 
         // Reorg to create a new header and hash.
         env.reorg(1)?;
-        env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+        env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
 
         // Calling `batch_fetch_anchors` should fetch new header, replacing the pre-reorg header.
         let anchors = electrum_client.batch_fetch_anchors(&[(txid, height as usize)])?;

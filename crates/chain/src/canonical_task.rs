@@ -119,7 +119,12 @@ impl<'g, A: Anchor> ChainQuery for CanonicalTask<'g, A> {
                 }
                 CanonicalStage::LeftOverTxs => {
                     if let Some((txid, tx, height)) = self.unprocessed_leftover_txs.pop_front() {
-                        if !self.is_canonicalized(txid) && !tx.is_coinbase() {
+                        let is_evicted = self
+                            .tx_graph
+                            .get_tx_node(txid)
+                            .expect("leftover transaction must exist")
+                            .is_evicted();
+                        if !self.is_canonicalized(txid) && !tx.is_coinbase() && !is_evicted {
                             let observed_in = ObservedIn::Block(height);
                             self.mark_canonical(
                                 txid,
@@ -173,7 +178,8 @@ impl<'g, A: Anchor> ChainQuery for CanonicalTask<'g, A> {
                                     .expect(
                                         "tx taken from `unprocessed_anchored_txs` so it must have at least one anchor",
                                     )
-                                    .confirmation_height_upper_bound(),
+                                    .anchor_block()
+                                    .height,
                             ))
                         }
                     }

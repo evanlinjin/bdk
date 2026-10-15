@@ -8,6 +8,7 @@ use crate::{
     spk_client::{FullScanRequestBuilder, SyncRequestBuilder},
     spk_iter::BIP32_MAX_INDEX,
     spk_txout::SpkTxOutIndex,
+    tx_graph::TxGraph,
     DescriptorExt, DescriptorId, Indexed, Indexer, KeychainIndexed, SpkIterator,
 };
 use alloc::{borrow::ToOwned, vec::Vec};
@@ -197,6 +198,28 @@ impl<K: Clone + Ord + Debug> Indexer for KeychainTxOutIndex<K> {
 
     fn is_tx_relevant(&self, tx: &bitcoin::Transaction) -> bool {
         self.inner.is_relevant(tx)
+    }
+
+    /// Looks repeatedly, because a match here widens what the next look can find: revealing an
+    /// index replenishes the lookahead past it, bringing spks into the derived set that outputs
+    /// already walked past may pay to. Looking once would make the outcome depend on the order the
+    /// graph happens to yield its transactions.
+    fn rescan<A>(&mut self, graph: &TxGraph<A>) -> Self::ChangeSet {
+        let mut changeset = ChangeSet::default();
+        loop {
+            // The frontier, not `changeset.is_empty()`: the changeset also carries staged spk cache
+            // entries, which move without the frontier moving and would buy a pointless extra look.
+            let frontier = self.last_revealed.clone();
+            for tx in graph.full_txs() {
+                changeset.merge(self.index_tx(&tx));
+            }
+            for (op, txout) in graph.floating_txouts() {
+                changeset.merge(self.index_txout(op, txout));
+            }
+            if self.last_revealed == frontier {
+                return changeset;
+            }
+        }
     }
 }
 
