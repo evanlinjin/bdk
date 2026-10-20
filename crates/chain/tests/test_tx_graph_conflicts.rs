@@ -3,7 +3,7 @@
 #[macro_use]
 mod common;
 
-use bdk_chain::{local_chain::LocalChain, Balance, BlockId};
+use bdk_chain::{local_chain::LocalChain, Balance, BlockId, ChainPosition, TxGraph};
 use bdk_testenv::{block_id, hash, local_chain};
 use bitcoin::{Amount, BlockHash, OutPoint};
 use common::*;
@@ -116,10 +116,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("tx1", 0), ("tx_conflict_2", 0)]),
             exp_unspents: HashSet::from([("tx_conflict_2", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
                 trusted_pending: Amount::from_sat(30000),
-                untrusted_pending: Amount::ZERO,
-                confirmed: Amount::ZERO,
+                ..Default::default()
             },
         },
         Scenario {
@@ -152,10 +150,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("tx1", 0), ("tx1", 1), ("tx_conflict_2", 0)]),
             exp_unspents: HashSet::from([("tx_conflict_2", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
                 trusted_pending: Amount::from_sat(30000),
-                untrusted_pending: Amount::ZERO,
-                confirmed: Amount::ZERO,
+                ..Default::default()
             },
         },
         Scenario {
@@ -195,10 +191,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("tx1", 0), ("tx_conflict_3", 0)]),
             exp_unspents: HashSet::from([("tx_conflict_3", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
                 trusted_pending: Amount::from_sat(40000),
-                untrusted_pending: Amount::ZERO,
-                confirmed: Amount::ZERO,
+                ..Default::default()
             },
         },
         Scenario {
@@ -232,10 +226,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("tx1", 0), ("tx_orphaned_conflict", 0)]),
             exp_unspents: HashSet::from([("tx_orphaned_conflict", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
                 trusted_pending: Amount::from_sat(30000),
-                untrusted_pending: Amount::ZERO,
-                confirmed: Amount::ZERO,
+                ..Default::default()
             },
         },
         Scenario {
@@ -269,10 +261,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("tx1", 0), ("tx_conflict_1", 0)]),
             exp_unspents: HashSet::from([("tx_conflict_1", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
-                trusted_pending: Amount::from_sat(20000),
-                untrusted_pending: Amount::ZERO,
-                confirmed: Amount::ZERO,
+                untrusted_pending: Amount::from_sat(20000),
+                ..Default::default()
             },
         },
         Scenario {
@@ -319,10 +309,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("tx1", 0), ("tx_confirmed_conflict", 0)]),
             exp_unspents: HashSet::from([("tx_confirmed_conflict", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
-                trusted_pending: Amount::ZERO,
-                untrusted_pending: Amount::ZERO,
                 confirmed: Amount::from_sat(50000),
+                ..Default::default()
             },
         },
         Scenario {
@@ -364,10 +352,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("A", 0), ("B", 0), ("C", 0)]),
             exp_unspents: HashSet::from([("C", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
-                trusted_pending: Amount::from_sat(30000),
-                untrusted_pending: Amount::ZERO,
-                confirmed: Amount::ZERO,
+                untrusted_pending: Amount::from_sat(30000),
+                ..Default::default()
             },
         },
         Scenario {
@@ -406,10 +392,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("A", 0), ("B'", 0)]),
             exp_unspents: HashSet::from([("B'", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
-                trusted_pending: Amount::ZERO,
-                untrusted_pending: Amount::ZERO,
                 confirmed: Amount::from_sat(20000),
+                ..Default::default()
             },
         },
         Scenario {
@@ -453,10 +437,8 @@ fn test_tx_conflict_handling() {
             ]),
             exp_unspents: HashSet::from([("C", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
                 trusted_pending: Amount::from_sat(30000),
-                untrusted_pending: Amount::ZERO,
-                confirmed: Amount::ZERO,
+                ..Default::default()
             },
         },
         Scenario {
@@ -499,10 +481,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("A", 0), ("B'", 0)]),
             exp_unspents: HashSet::from([("B'", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
                 trusted_pending: Amount::from_sat(30000),
-                untrusted_pending: Amount::ZERO,
-                confirmed: Amount::ZERO,
+                ..Default::default()
             },
         },
         Scenario {
@@ -545,10 +525,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("A", 0), ("B'", 0)]),
             exp_unspents: HashSet::from([("B'", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
-                trusted_pending: Amount::ZERO,
-                untrusted_pending: Amount::ZERO,
                 confirmed: Amount::from_sat(50000),
+                ..Default::default()
             },
         },
         Scenario {
@@ -597,10 +575,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("A", 0), ("B'", 0)]),
             exp_unspents: HashSet::from([("B'", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
-                trusted_pending: Amount::ZERO,
-                untrusted_pending: Amount::ZERO,
                 confirmed: Amount::from_sat(50000),
+                ..Default::default()
             },
         },
         Scenario {
@@ -630,10 +606,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("first", 0), ("second", 0), ("anchored", 0)]),
             exp_unspents: HashSet::from([("anchored", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
-                trusted_pending: Amount::ZERO,
-                untrusted_pending: Amount::ZERO,
                 confirmed: Amount::from_sat(800),
+                ..Default::default()
             }
         },
         Scenario {
@@ -697,7 +671,7 @@ fn test_tx_conflict_handling() {
             exp_chain_txs: HashSet::from(["root", "tx"]),
             exp_chain_txouts: HashSet::from([("tx", 0)]),
             exp_unspents: HashSet::from([("tx", 0)]),
-            exp_balance: Balance { trusted_pending: Amount::from_sat(9000), ..Default::default() }
+            exp_balance: Balance { untrusted_pending: Amount::from_sat(9000), ..Default::default() }
         },
         Scenario {
             name: "tx spends from 2 conflicting transactions where a conflict spends another",
@@ -764,7 +738,7 @@ fn test_tx_conflict_handling() {
             exp_chain_txs: HashSet::from(["A", "S1", "B"]),
             exp_chain_txouts: HashSet::from([("A", 0), ("B", 0), ("S1", 0)]),
             exp_unspents: HashSet::from([("B", 0)]),
-            exp_balance: Balance { trusted_pending: Amount::from_sat(8_000), ..Default::default() },
+            exp_balance: Balance { untrusted_pending: Amount::from_sat(8_000), ..Default::default() },
         },
         Scenario {
             name: "tx spends from 2 conflicting transactions where the conflict is nested (different last_seens)",
@@ -801,7 +775,7 @@ fn test_tx_conflict_handling() {
             exp_chain_txs: HashSet::from(["A", "S1", "B"]),
             exp_chain_txouts: HashSet::from([("A", 0), ("B", 0), ("S1", 0)]),
             exp_unspents: HashSet::from([("B", 0)]),
-            exp_balance: Balance { trusted_pending: Amount::from_sat(8_000), ..Default::default() },
+            exp_balance: Balance { untrusted_pending: Amount::from_sat(8_000), ..Default::default() },
         },
         Scenario {
             name: "assume-canonical-tx displaces unconfirmed chain",
@@ -845,10 +819,9 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("root", 0), ("root", 1), ("assume_canonical", 0)]),
             exp_unspents: HashSet::from([("root", 1), ("assume_canonical", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
                 trusted_pending: Amount::from_sat(19_000),
-                untrusted_pending: Amount::ZERO,
                 confirmed: Amount::from_sat(21_000),
+                ..Default::default()
             },
         },
         Scenario {
@@ -893,10 +866,9 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("root", 0), ("root", 1), ("assume_canonical", 0)]),
             exp_unspents: HashSet::from([("root", 1), ("assume_canonical", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
                 trusted_pending: Amount::from_sat(19_000),
-                untrusted_pending: Amount::ZERO,
                 confirmed: Amount::from_sat(21_000),
+                ..Default::default()
             },
         },
         Scenario {
@@ -937,10 +909,8 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("root", 0), ("assume_c", 0)]),
             exp_unspents: HashSet::from([("assume_c", 0)]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
                 trusted_pending: Amount::from_sat(18_000),
-                untrusted_pending: Amount::ZERO,
-                confirmed: Amount::ZERO,
+                ..Default::default()
             },
         },
         Scenario {
@@ -959,10 +929,73 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([]),
             exp_unspents: HashSet::from([]),
             exp_balance: Balance {
-                immature: Amount::ZERO,
-                trusted_pending: Amount::ZERO,
-                untrusted_pending: Amount::ZERO,
-                confirmed: Amount::ZERO,
+                ..Default::default()
+            }
+        },
+        Scenario {
+            name: "coinbase tx with last_seen is not canonical",
+            tx_templates: &[
+                TxTemplate {
+                    tx_name: "coinbase",
+                    inputs: &[TxInTemplate::Coinbase],
+                    outputs: &[TxOutTemplate::new(21_000, Some(0))],
+                    // A coinbase cannot be in the mempool, so this is bad data.
+                    last_seen: Some(100),
+                    ..Default::default()
+                }
+            ],
+            exp_chain_txs: HashSet::from([]),
+            exp_chain_txouts: HashSet::from([]),
+            exp_unspents: HashSet::from([]),
+            exp_balance: Balance {
+                ..Default::default()
+            }
+        },
+        Scenario {
+            name: "unanchored coinbase tx is canonical via an unconfirmed spend",
+            tx_templates: &[
+                TxTemplate {
+                    tx_name: "coinbase",
+                    inputs: &[TxInTemplate::Coinbase],
+                    // The second output is unspent, so `balance` checks its maturity.
+                    outputs: &[TxOutTemplate::new(21_000, Some(0)), TxOutTemplate::new(4_000, Some(1))],
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "spend",
+                    inputs: &[TxInTemplate::PrevTx("coinbase", 0)],
+                    outputs: &[TxOutTemplate::new(20_000, Some(2))],
+                    last_seen: Some(100),
+                    ..Default::default()
+                }
+            ],
+            exp_chain_txs: HashSet::from(["coinbase", "spend"]),
+            exp_chain_txouts: HashSet::from([("coinbase", 0), ("coinbase", 1), ("spend", 0)]),
+            exp_unspents: HashSet::from([("coinbase", 1), ("spend", 0)]),
+            exp_balance: Balance {
+                // No anchor is held for the coinbase, so its maturity cannot be proven.
+                immature: Amount::from_sat(4_000),
+                trusted_pending: Amount::from_sat(20_000),
+                ..Default::default()
+            }
+        },
+        Scenario {
+            name: "assumed canonical coinbase tx without anchor is canonical",
+            tx_templates: &[
+                TxTemplate {
+                    tx_name: "coinbase",
+                    inputs: &[TxInTemplate::Coinbase],
+                    outputs: &[TxOutTemplate::new(21_000, Some(0))],
+                    assume_canonical: true,
+                    ..Default::default()
+                }
+            ],
+            exp_chain_txs: HashSet::from(["coinbase"]),
+            exp_chain_txouts: HashSet::from([("coinbase", 0)]),
+            exp_unspents: HashSet::from([("coinbase", 0)]),
+            exp_balance: Balance {
+                immature: Amount::from_sat(21_000),
+                ..Default::default()
             }
         }
     ];
@@ -1028,13 +1061,9 @@ fn test_tx_conflict_handling() {
         );
 
         let balance = canonical_view.balance(
-            env.indexer.outpoints().iter().cloned(),
-            |_, txout| {
-                env.indexer
-                    .index_of_spk(txout.txout.script_pubkey.as_script())
-                    .is_some()
-            },
-            0,
+            env.indexer.outpoints().iter().map(|(_, op)| *op),
+            bdk_chain::taints_unowned(&env.indexer),
+            |pos| pos.is_confirmed(),
         );
         assert_eq!(
             balance, scenario.exp_balance,
@@ -1042,4 +1071,73 @@ fn test_tx_conflict_handling() {
             scenario.name
         );
     }
+}
+
+/// A tx without its own anchor borrows the anchor of a confirmed descendant, so its confirmation
+/// height is only an upper bound until its own anchor is known.
+#[test]
+fn transitively_confirmed_tx_reports_descendant_anchor_height() {
+    let chain = local_chain![
+        (0, hash!("genesis")),
+        (1, hash!("parent_block")),
+        (5, hash!("child_block"))
+    ];
+    let tip = chain.tip().block_id();
+    let parent_anchor = block_id!(1, "parent_block");
+    let child_anchor = block_id!(5, "child_block");
+
+    let templates = [
+        TxTemplate {
+            tx_name: "parent",
+            inputs: &[TxInTemplate::Bogus],
+            outputs: &[TxOutTemplate::new(100_000, Some(0))],
+            // Seen in the mempool, but its confirmation has not been fetched yet.
+            last_seen: Some(1),
+            ..Default::default()
+        },
+        TxTemplate {
+            tx_name: "child",
+            inputs: &[TxInTemplate::PrevTx("parent", 0)],
+            outputs: &[TxOutTemplate::new(90_000, Some(0))],
+            anchors: &[child_anchor],
+            ..Default::default()
+        },
+    ];
+    let mut env = init_graph(&templates);
+    let parent_txid = env.txid_to_name["parent"];
+    let child_txid = env.txid_to_name["child"];
+
+    let parent_position = |tx_graph: &TxGraph<BlockId>| {
+        chain
+            .canonical_view(tx_graph, tip, Default::default())
+            .txs()
+            .find(|tx| tx.txid == parent_txid)
+            .expect("parent must be canonical")
+            .pos
+    };
+
+    // Really confirmed in block 1, but the position can only report the child's block 5.
+    let pos = parent_position(&env.tx_graph);
+    assert_eq!(
+        pos,
+        ChainPosition::Confirmed {
+            anchor: child_anchor,
+            transitively: Some(child_txid),
+        }
+    );
+    assert_eq!(pos.confirmation_height_upper_bound(), Some(5));
+    assert_eq!(pos.confirmations_lower_bound(tip.height), 1);
+
+    // Once the parent's own anchor is known, the position becomes exact.
+    let _ = env.tx_graph.insert_anchor(parent_txid, parent_anchor);
+    let pos = parent_position(&env.tx_graph);
+    assert_eq!(
+        pos,
+        ChainPosition::Confirmed {
+            anchor: parent_anchor,
+            transitively: None,
+        }
+    );
+    assert_eq!(pos.confirmation_height_upper_bound(), Some(1));
+    assert_eq!(pos.confirmations_lower_bound(tip.height), 5);
 }

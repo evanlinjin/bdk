@@ -1,5 +1,5 @@
 use bdk_chain::{
-    bitcoin::{hashes::Hash, Address, Amount, ScriptBuf, WScriptHash},
+    bitcoin::{hashes::Hash, Address, Amount, OutPoint, ScriptBuf, Txid, WScriptHash},
     local_chain::LocalChain,
     spk_client::{FullScanRequest, SyncRequest, SyncResponse},
     spk_txout::SpkTxOutIndex,
@@ -62,7 +62,11 @@ fn get_balance(
             recv_chain.tip().block_id(),
             Default::default(),
         )
-        .balance(outpoints, |_, _| true, 0);
+        .balance(
+            outpoints.into_iter().map(|(_, op)| op),
+            bdk_chain::taints_unowned(&recv_graph.index),
+            |pos| pos.is_confirmed(),
+        );
     Ok(balance)
 }
 
@@ -323,7 +327,7 @@ pub fn test_update_tx_graph_without_keychain() -> anyhow::Result<()> {
         .send_to_address(&receive_address0, Amount::from_sat(20000))?
         .txid()?;
     env.mine_blocks(1, None)?;
-    env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+    env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
 
     // use a full checkpoint linked list (since this is not what we are testing)
     let cp_tip = env.make_checkpoint_tip();
@@ -415,7 +419,7 @@ pub fn test_update_tx_graph_stop_gap() -> anyhow::Result<()> {
         .send_to_address(&addresses[3], Amount::from_sat(10000))?
         .txid()?;
     env.mine_blocks(1, None)?;
-    env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+    env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
 
     // use a full checkpoint linked list (since this is not what we are testing)
     let cp_tip = env.make_checkpoint_tip();
@@ -454,7 +458,7 @@ pub fn test_update_tx_graph_stop_gap() -> anyhow::Result<()> {
         .send_to_address(&addresses[addresses.len() - 1], Amount::from_sat(10000))?
         .txid()?;
     env.mine_blocks(1, None)?;
-    env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+    env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
 
     // A scan with gap limit 5 won't find the second transaction, but a scan with gap limit 6 will.
     // The last active indice won't be updated in the first case but will in the second one.
@@ -519,7 +523,7 @@ pub fn test_stop_gap_past_last_revealed() -> anyhow::Result<()> {
         .send_to_address(&addresses[9], Amount::from_sat(10000))?
         .txid()?;
     env.mine_blocks(1, None)?;
-    env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+    env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
 
     let cp_tip = env.make_checkpoint_tip();
 
@@ -575,7 +579,7 @@ fn test_sync() -> anyhow::Result<()> {
 
     // Mine some blocks.
     env.mine_blocks(101, Some(addr_to_mine))?;
-    env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+    env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
 
     // Broadcast transaction to mempool.
     let txid = env.send(&addr_to_track, SEND_AMOUNT)?;
@@ -592,7 +596,7 @@ fn test_sync() -> anyhow::Result<()> {
     assert_eq!(
         get_balance(&recv_chain, &recv_graph)?,
         Balance {
-            trusted_pending: SEND_AMOUNT,
+            untrusted_pending: SEND_AMOUNT,
             ..Balance::default()
         },
         "balance must be correct",
@@ -600,7 +604,7 @@ fn test_sync() -> anyhow::Result<()> {
 
     // Mine block to confirm transaction.
     env.mine_blocks(1, None)?;
-    env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+    env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
 
     let _ = sync_with_electrum(
         &client,
@@ -621,7 +625,7 @@ fn test_sync() -> anyhow::Result<()> {
 
     // Perform reorg on block with confirmed transaction.
     env.reorg_empty_blocks(1)?;
-    env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+    env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
 
     let _ = sync_with_electrum(
         &client,
@@ -634,14 +638,14 @@ fn test_sync() -> anyhow::Result<()> {
     assert_eq!(
         get_balance(&recv_chain, &recv_graph)?,
         Balance {
-            trusted_pending: SEND_AMOUNT,
+            untrusted_pending: SEND_AMOUNT,
             ..Balance::default()
         },
     );
 
     // Mine block to confirm transaction again.
     env.mine_blocks(1, None)?;
-    env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+    env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
 
     let _ = sync_with_electrum(&client, [spk_to_track], &mut recv_chain, &mut recv_graph)?;
 
@@ -680,6 +684,78 @@ fn test_sync() -> anyhow::Result<()> {
 
         // Check that the calculated fee matches the fee from the transaction data.
         assert_eq!(fee, tx_fee);
+    }
+
+    Ok(())
+}
+
+/// Ensure that a tx re-mined at the same height after a reorg is anchored to the replacement block.
+///
+/// The header cache must not keep serving the pre-reorg header for that height, otherwise the
+/// anchor cache is hit with the stale block hash and the tx is never re-anchored. This is checked
+/// both when the reorged height is still within the synced chain suffix, and when enough blocks
+/// have been mined before the next sync that it is not.
+#[test]
+fn test_sync_reorg_remined_at_same_height() -> anyhow::Result<()> {
+    const SEND_AMOUNT: Amount = Amount::from_sat(10_000);
+
+    for blocks_after_reorg in [0, 20] {
+        let env = TestEnv::new()?;
+        let electrum_client = electrum_client::Client::new(env.electrsd.electrum_url.as_str())?;
+        let client = BdkElectrumClient::new(electrum_client);
+
+        let spk_to_track = ScriptBuf::new_p2wsh(&WScriptHash::all_zeros());
+        let addr_to_track =
+            Address::from_script(&spk_to_track, bdk_chain::bitcoin::Network::Regtest)?;
+
+        let (mut recv_chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
+        let mut recv_graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new({
+            let mut recv_index = SpkTxOutIndex::default();
+            recv_index.insert_spk((), spk_to_track.clone());
+            recv_index
+        });
+
+        env.mine_blocks(101, None)?;
+        let txid = env.send(&addr_to_track, SEND_AMOUNT)?;
+        env.mine_blocks(1, None)?;
+        env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
+        let _ = sync_with_electrum(
+            &client,
+            [spk_to_track.clone()],
+            &mut recv_chain,
+            &mut recv_graph,
+        )?;
+
+        // Replace the confirming block. The tx returns to the mempool and is re-mined at the same
+        // height in the replacement block.
+        let height = env.bitcoind.client.get_block_count()?.into_model().0;
+        env.reorg(1)?;
+        env.mine_blocks(blocks_after_reorg, None)?;
+        env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
+        let new_hash = env.get_block_hash(height)?;
+        let _ = sync_with_electrum(
+            &client,
+            [spk_to_track.clone()],
+            &mut recv_chain,
+            &mut recv_graph,
+        )?;
+
+        assert!(
+            recv_graph
+                .graph()
+                .all_anchors()
+                .get(&txid)
+                .is_some_and(|anchors| anchors.iter().any(|a| a.block_id.hash == new_hash)),
+            "blocks_after_reorg={blocks_after_reorg}: tx must be anchored to the replacement block",
+        );
+        assert_eq!(
+            get_balance(&recv_chain, &recv_graph)?,
+            Balance {
+                confirmed: SEND_AMOUNT,
+                ..Balance::default()
+            },
+            "blocks_after_reorg={blocks_after_reorg}: balance must be correct",
+        );
     }
 
     Ok(())
@@ -725,7 +801,7 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
     }
 
     // Sync up to tip.
-    env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+    env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
     let update = sync_with_electrum(
         &client,
         [spk_to_track.clone()],
@@ -756,7 +832,7 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
     for depth in 1..=REORG_COUNT {
         env.reorg_empty_blocks(depth)?;
 
-        env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+        env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
         let update = sync_with_electrum(
             &client,
             [spk_to_track.clone()],
@@ -770,7 +846,7 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
         assert_eq!(
             get_balance(&recv_chain, &recv_graph)?,
             Balance {
-                trusted_pending: SEND_AMOUNT * depth as u64,
+                untrusted_pending: SEND_AMOUNT * depth as u64,
                 confirmed: SEND_AMOUNT * (REORG_COUNT - depth) as u64,
                 ..Balance::default()
             },
@@ -801,7 +877,7 @@ fn test_sync_with_coinbase() -> anyhow::Result<()> {
 
     // Mine some blocks.
     env.mine_blocks(101, Some(addr_to_track))?;
-    env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+    env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
 
     // Check to see if electrum syncs properly.
     assert!(sync_with_electrum(
@@ -877,7 +953,7 @@ fn test_check_fee_calculation() -> anyhow::Result<()> {
         .expect("should've successfully found the existing `TxOut`");
 
     // Sync up to tip.
-    env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+    env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
     let _ = sync_with_electrum(
         &client,
         [spk_to_track.clone()],
@@ -928,5 +1004,56 @@ fn test_check_fee_calculation() -> anyhow::Result<()> {
         // Check that the calculated fee matches the fee from the transaction data.
         assert_eq!(fee, Amount::from_sat(tx_fee)); // 1650sat
     }
+    Ok(())
+}
+
+/// Syncing outpoints must report network errors instead of silently skipping the outpoint.
+#[test]
+fn test_sync_outpoints_propagates_connection_error() -> anyhow::Result<()> {
+    // A "server" that accepts connections and closes them immediately.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("tcp://{}", listener.local_addr()?);
+    std::thread::spawn(move || listener.incoming().for_each(drop));
+
+    let config = electrum_client::ConfigBuilder::new().retry(0).build();
+    let client = BdkElectrumClient::new(electrum_client::Client::from_config(&url, config)?);
+
+    let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+    let request = SyncRequest::<()>::builder().outpoints([outpoint]).build();
+    let result = client.sync(request, BATCH_SIZE, false);
+
+    assert!(
+        result.is_err(),
+        "sync dropped the outpoint and returned {result:?}"
+    );
+
+    Ok(())
+}
+
+/// A `batch_size` of 0 must not make `sync` or `full_scan` skip their scripts.
+///
+/// The server drops every connection, so a scan that actually requests something returns an error.
+/// If no request is made, the scan returns an empty `Ok`.
+#[test]
+fn test_zero_batch_size() -> anyhow::Result<()> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("tcp://{}", listener.local_addr()?);
+    std::thread::spawn(move || listener.incoming().for_each(drop));
+
+    let config = electrum_client::ConfigBuilder::new().retry(0).build();
+    let client = BdkElectrumClient::new(electrum_client::Client::from_config(&url, config)?);
+
+    let response = client.sync(SyncRequest::builder().spks([get_test_spk()]), 0, false);
+    assert!(
+        response.is_err(),
+        "sync skipped its script and returned {response:?}"
+    );
+
+    let request = FullScanRequest::builder().spks_for_keychain(0u32, [(0, get_test_spk())]);
+    let response = client.full_scan(request, 3, 0, false);
+    assert!(
+        response.is_err(),
+        "full scan skipped its script and returned {response:?}"
+    );
     Ok(())
 }

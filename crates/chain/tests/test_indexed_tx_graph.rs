@@ -10,7 +10,7 @@ use bdk_chain::{
     indexer::keychain_txout::KeychainTxOutIndex,
     local_chain::LocalChain,
     spk_txout::SpkTxOutIndex,
-    tx_graph, Balance, ChainPosition, ConfirmationBlockTime, DescriptorExt, SpkIterator,
+    tx_graph, Balance, ChainPosition, ConfirmationBlockTime, DescriptorExt, Merge, SpkIterator,
 };
 use bdk_testenv::{
     anyhow::{self},
@@ -302,6 +302,69 @@ fn insert_relevant_txs() {
     assert_eq!(graph.initial_changeset(), initial_changeset);
 }
 
+/// `reindex` must climb to the highest index the lookahead can reach, not stop at whichever match
+/// it happened to see first.
+///
+/// A match widens the derived window the *remaining* outputs are judged against, so one pass can
+/// miss an output it already walked past. Two transactions would express that too, but the walk
+/// order over the graph is a `HashMap` order — the very thing that is unreliable — so such a test
+/// would pass a single-pass implementation about half the time. One transaction with both outputs
+/// pins it down: `index_tx` walks `tx.output`, a `Vec`, in vout order, so `far` at vout 0 is
+/// always judged against the initial window and always missed, and `near` at vout 1 only then
+/// lifts the frontier that brings `far` into range. Nothing here depends on a hash seed.
+#[test]
+fn reindex_reaches_fixed_point() {
+    let (descriptor, _) = Descriptor::parse_descriptor(&Secp256k1::signing_only(), DESCRIPTORS[0])
+        .expect("must be valid");
+    let did = descriptor.descriptor_id();
+
+    let lookahead = 10;
+    let near = lookahead - 1;
+    let far = lookahead + 5;
+    assert!(
+        far >= lookahead && far < 2 * lookahead,
+        "`far` must be out of the initial window but within the one `near` widens it to",
+    );
+
+    let tx = Transaction {
+        output: [far, near]
+            .iter()
+            .map(|&index| TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: descriptor
+                    .at_derivation_index(index)
+                    .unwrap()
+                    .script_pubkey(),
+            })
+            .collect(),
+        ..new_tx(0)
+    };
+
+    let (mut graph, changeset) =
+        IndexedTxGraph::<ConfirmationBlockTime, KeychainTxOutIndex<()>>::from_changeset(
+            indexed_tx_graph::ChangeSet {
+                tx_graph: tx_graph::ChangeSet {
+                    txs: [Arc::new(tx)].into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            |_| -> anyhow::Result<_> {
+                let mut indexer = KeychainTxOutIndex::new(lookahead, true);
+                assert!(indexer.insert_descriptor((), descriptor.clone()).unwrap());
+                Ok(indexer)
+            },
+        )
+        .expect("must construct");
+
+    assert_eq!(graph.index.last_revealed_index(()), Some(far));
+    assert_eq!(changeset.indexer.last_revealed.get(&did), Some(&far));
+    assert!(
+        graph.reindex().is_empty(),
+        "reindexing an already-reindexed graph must find nothing new",
+    );
+}
+
 /// Ensure consistency IndexedTxGraph list_* and balance methods. These methods lists
 /// relevant txouts and utxos from the information fetched from a LocalChain.
 ///
@@ -311,16 +374,15 @@ fn insert_relevant_txs() {
 ///
 /// Keychains:
 ///
-/// keychain_1: Trusted
-/// keychain_2: Untrusted
+/// keychain_1 and keychain_2 are owned.
 ///
 /// Transactions:
 ///
-/// tx1: A Coinbase, sending 70000 sats to "trusted" address. [Block 0]
-/// tx2: A external Receive, sending 30000 sats to "untrusted" address. [Block 1]
-/// tx3: Internal Spend. Spends tx2 and returns change of 10000 to "trusted" address. [Block 2]
-/// tx4: Mempool tx, sending 20000 sats to "untrusted" address.
-/// tx5: Mempool tx, sending 15000 sats to "trusted" address.
+/// tx1: A Coinbase, sending 70000 sats to a keychain_1 address. [Block 0]
+/// tx2: A external Receive, sending 30000 sats to a keychain_2 address. [Block 1]
+/// tx3: Internal Spend. Spends tx2 and returns change of 10000 to a keychain_1 address. [Block 2]
+/// tx4: Mempool tx, sending 20000 sats to a keychain_2 address.
+/// tx5: Mempool tx, sending 15000 sats to a keychain_1 address.
 /// tx6: Complete unrelated tx. [Block 3]
 ///
 /// Different transactions are added via `insert_relevant_txs`.
@@ -355,10 +417,10 @@ fn test_list_owned_txouts() {
         indexer
     });
 
-    // Get trusted and untrusted addresses
+    // Get addresses for both keychains
 
-    let mut trusted_spks: Vec<ScriptBuf> = Vec::new();
-    let mut untrusted_spks: Vec<ScriptBuf> = Vec::new();
+    let mut keychain_1_spks: Vec<ScriptBuf> = Vec::new();
+    let mut keychain_2_spks: Vec<ScriptBuf> = Vec::new();
 
     {
         // we need to scope here to take immutable reference of the graph
@@ -368,7 +430,7 @@ fn test_list_owned_txouts() {
                 .reveal_next_spk("keychain_1".to_string())
                 .unwrap();
             // TODO Assert indexes
-            trusted_spks.push(script.to_owned());
+            keychain_1_spks.push(script.to_owned());
         }
     }
     {
@@ -377,7 +439,7 @@ fn test_list_owned_txouts() {
                 .index
                 .reveal_next_spk("keychain_2".to_string())
                 .unwrap();
-            untrusted_spks.push(script.to_owned());
+            keychain_2_spks.push(script.to_owned());
         }
     }
 
@@ -391,21 +453,21 @@ fn test_list_owned_txouts() {
         }],
         output: vec![TxOut {
             value: Amount::from_sat(70000),
-            script_pubkey: trusted_spks[0].to_owned(),
+            script_pubkey: keychain_1_spks[0].to_owned(),
         }],
         ..new_tx(1)
     };
 
-    // tx2 is an incoming transaction received at untrusted keychain at block 1.
+    // tx2 is an incoming transaction received at keychain_2 at block 1.
     let tx2 = Transaction {
         output: vec![TxOut {
             value: Amount::from_sat(30000),
-            script_pubkey: untrusted_spks[0].to_owned(),
+            script_pubkey: keychain_2_spks[0].to_owned(),
         }],
         ..new_tx(2)
     };
 
-    // tx3 spends tx2 and gives a change back in trusted keychain. Confirmed at Block 2.
+    // tx3 spends tx2 and gives a change back in keychain_1. Confirmed at Block 2.
     let tx3 = Transaction {
         input: vec![TxIn {
             previous_output: OutPoint::new(tx2.compute_txid(), 0),
@@ -413,25 +475,31 @@ fn test_list_owned_txouts() {
         }],
         output: vec![TxOut {
             value: Amount::from_sat(10000),
-            script_pubkey: trusted_spks[1].to_owned(),
+            script_pubkey: keychain_1_spks[1].to_owned(),
         }],
         ..new_tx(3)
     };
 
-    // tx4 is an external transaction receiving at untrusted keychain, unconfirmed.
+    // tx4 is unconfirmed and pays one of our addresses, but it spends a third-party
+    // coin we don't own. That foreign input is what makes its ancestry untrusted.
     let tx4 = Transaction {
+        input: vec![TxIn {
+            // A coin outside our wallet, never inserted into the graph.
+            previous_output: OutPoint::new(new_tx(40).compute_txid(), 0),
+            ..Default::default()
+        }],
         output: vec![TxOut {
             value: Amount::from_sat(20000),
-            script_pubkey: untrusted_spks[1].to_owned(),
+            script_pubkey: keychain_2_spks[1].to_owned(),
         }],
         ..new_tx(4)
     };
 
-    // tx5 is an external transaction receiving at trusted keychain, unconfirmed.
+    // tx5 is an external transaction receiving at keychain_1, unconfirmed.
     let tx5 = Transaction {
         output: vec![TxOut {
             value: Amount::from_sat(15000),
-            script_pubkey: trusted_spks[2].to_owned(),
+            script_pubkey: keychain_1_spks[2].to_owned(),
         }],
         ..new_tx(5)
     };
@@ -481,9 +549,9 @@ fn test_list_owned_txouts() {
                 .collect::<Vec<_>>();
 
             let balance = canonical_view.balance(
-                graph.index.outpoints().iter().cloned(),
-                |_, txout| trusted_spks.contains(&txout.txout.script_pubkey),
-                0,
+                graph.index.outpoints().iter().map(|(_, op)| *op),
+                bdk_chain::taints_unowned(&graph.index),
+                |pos| pos.is_confirmed(),
             );
 
             let confirmed_txouts_txid = txouts
@@ -577,7 +645,7 @@ fn test_list_owned_txouts() {
                 immature: Amount::from_sat(70000),          // immature coinbase
                 trusted_pending: Amount::from_sat(25000),   // tx3, tx5
                 untrusted_pending: Amount::from_sat(20000), // tx4
-                confirmed: Amount::ZERO                     // Nothing is confirmed yet
+                ..Default::default()
             }
         );
     }
@@ -615,7 +683,7 @@ fn test_list_owned_txouts() {
                 immature: Amount::from_sat(70000),          // immature coinbase
                 trusted_pending: Amount::from_sat(25000),   // tx3, tx5
                 untrusted_pending: Amount::from_sat(20000), // tx4
-                confirmed: Amount::from_sat(0)              // tx2 got confirmed (but spent by 3)
+                confirmed: Amount::from_sat(0),             // tx2 got confirmed (but spent by 3)
             }
         );
     }
@@ -656,7 +724,7 @@ fn test_list_owned_txouts() {
                 immature: Amount::from_sat(70000),          // immature coinbase
                 trusted_pending: Amount::from_sat(15000),   // tx5
                 untrusted_pending: Amount::from_sat(20000), // tx4
-                confirmed: Amount::from_sat(10000)          // tx3 got confirmed
+                confirmed: Amount::from_sat(10000),         // tx3 got confirmed
             }
         );
     }
@@ -697,7 +765,7 @@ fn test_list_owned_txouts() {
                 immature: Amount::from_sat(70000),          // immature coinbase
                 trusted_pending: Amount::from_sat(15000),   // tx5
                 untrusted_pending: Amount::from_sat(20000), // tx4
-                confirmed: Amount::from_sat(10000)          // tx3 is confirmed
+                confirmed: Amount::from_sat(10000),         // tx3 is confirmed
             }
         );
     }
@@ -710,10 +778,10 @@ fn test_list_owned_txouts() {
         assert_eq!(
             balance,
             Balance {
-                immature: Amount::ZERO,                     // coinbase matured
                 trusted_pending: Amount::from_sat(15000),   // tx5
                 untrusted_pending: Amount::from_sat(20000), // tx4
-                confirmed: Amount::from_sat(80000)          // tx1 + tx3
+                confirmed: Amount::from_sat(80000),         // tx1 + tx3
+                ..Default::default()
             }
         );
     }

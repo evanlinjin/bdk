@@ -109,7 +109,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
     /// - `stop_gap`: the full scan for each keychain stops after a gap of script pubkeys with no
     ///   associated transactions.
     /// - `batch_size`: specifies the max number of script pubkeys to request for in a single batch
-    ///   request.
+    ///   request. A `batch_size` of 0 is treated as 1.
     /// - `fetch_prev_txouts`: specifies whether we want previous `TxOut`s for fee calculation. Note
     ///   that this requires additional calls to the Electrum server, but is necessary for
     ///   calculating the fee on a transaction if your wallet does not own the inputs. Methods like
@@ -132,7 +132,11 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
         let start_time = request.start_time();
 
         let tip_and_latest_blocks = match request.chain_tip() {
-            Some(chain_tip) => Some(fetch_tip_and_latest_blocks(&self.inner, chain_tip)?),
+            Some(chain_tip) => Some(fetch_tip_and_latest_blocks(
+                &self.inner,
+                chain_tip,
+                &mut self.block_header_cache.lock().unwrap(),
+            )?),
             None => None,
         };
 
@@ -191,7 +195,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
     /// - `request`: struct with data required to perform a spk-based blockchain client sync, see
     ///   [`SyncRequest`]
     /// - `batch_size`: specifies the max number of script pubkeys to request for in a single batch
-    ///   request
+    ///   request. A `batch_size` of 0 is treated as 1.
     /// - `fetch_prev_txouts`: specifies whether we want previous `TxOut`s for fee calculation. Note
     ///   that this requires additional calls to the Electrum server, but is necessary for
     ///   calculating the fee on a transaction if your wallet does not own the inputs. Methods like
@@ -217,7 +221,11 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
         let start_time = request.start_time();
 
         let tip_and_latest_blocks = match request.chain_tip() {
-            Some(chain_tip) => Some(fetch_tip_and_latest_blocks(&self.inner, chain_tip)?),
+            Some(chain_tip) => Some(fetch_tip_and_latest_blocks(
+                &self.inner,
+                chain_tip,
+                &mut self.block_header_cache.lock().unwrap(),
+            )?),
             None => None,
         };
 
@@ -293,6 +301,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
     ) -> Result<Option<u32>, Error> {
         let mut unused_spk_count = 0_usize;
         let mut last_active_index = Option::<u32>::None;
+        let batch_size = batch_size.max(1);
 
         loop {
             let spks = (0..batch_size)
@@ -305,6 +314,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
             let spk_histories = self
                 .inner
                 .batch_script_get_history(spks.iter().map(|(_, s)| s.spk.as_script()))?;
+            check_batch_len("batch_script_get_history", spks.len(), spk_histories.len())?;
 
             for ((spk_index, spk), spk_history) in spks.into_iter().zip(spk_histories) {
                 let beyond_revealed = last_revealed.is_none_or(|lr| spk_index > lr);
@@ -360,10 +370,13 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
         // Collect valid outpoints with their corresponding `spk` and `tx`.
         let mut ops_spks_txs = Vec::new();
         for op in outpoints {
-            if let Ok(tx) = self.fetch_tx(op.txid) {
-                if let Some(txout) = tx.output.get(op.vout as usize) {
-                    ops_spks_txs.push((op, txout.script_pubkey.clone(), tx));
-                }
+            let tx = match self.fetch_tx(op.txid) {
+                Ok(tx) => tx,
+                Err(electrum_client::Error::Protocol(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            if let Some(txout) = tx.output.get(op.vout as usize) {
+                ops_spks_txs.push((op, txout.script_pubkey.clone(), tx));
             }
         }
 
@@ -377,6 +390,11 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
         let histories = self
             .inner
             .batch_script_get_history(unique_spks.iter().map(|spk| spk.as_script()))?;
+        check_batch_len(
+            "batch_script_get_history",
+            unique_spks.len(),
+            histories.len(),
+        )?;
         let mut spk_map = HashMap::new();
         for (spk, history) in unique_spks.into_iter().zip(histories) {
             spk_map.insert(spk, history);
@@ -495,6 +513,11 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
         let spk_histories = self
             .inner
             .batch_script_get_history(scripts.iter().map(|spk| spk.as_script()))?;
+        check_batch_len(
+            "batch_script_get_history",
+            scripts.len(),
+            spk_histories.len(),
+        )?;
 
         for (tx, spk_history) in txs.into_iter().zip(spk_histories) {
             if let Some(res) = spk_history.into_iter().find(|res| res.tx_hash == tx.0) {
@@ -546,6 +569,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
 
             if !missing_heights.is_empty() {
                 let headers = self.inner.batch_block_header(missing_heights.clone())?;
+                check_batch_len("batch_block_header", missing_heights.len(), headers.len())?;
                 for (height, header) in missing_heights.into_iter().zip(headers) {
                     height_to_hash.insert(height, header.block_hash());
                     cache.insert(height, header);
@@ -569,6 +593,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
 
         // Fetch merkle proofs.
         let proofs = self.inner.batch_transaction_get_merkle(to_fetch.iter())?;
+        check_batch_len("batch_transaction_get_merkle", to_fetch.len(), proofs.len())?;
 
         // Validate each proof, retrying once for each stale header.
         for ((txid, height), proof) in to_fetch.into_iter().zip(proofs) {
@@ -647,14 +672,27 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
     }
 }
 
+/// Ensure that a batch response has exactly one entry per request, so that pairing them with
+/// `zip` or indexing can never silently drop entries or panic.
+fn check_batch_len(method: &str, expected: usize, actual: usize) -> Result<(), Error> {
+    if expected != actual {
+        return Err(Error::Message(format!(
+            "electrum server returned {actual} responses for {expected} {method} requests"
+        )));
+    }
+    Ok(())
+}
+
 /// Return a [`CheckPoint`] of the latest tip, that connects with `prev_tip`. The latest blocks are
 /// fetched to construct checkpoint updates with the proper [`BlockHash`] in case of re-org.
 fn fetch_tip_and_latest_blocks(
     client: &impl ElectrumApi,
     prev_tip: CheckPoint<BlockHash>,
+    block_header_cache: &mut HashMap<u32, Header>,
 ) -> Result<(CheckPoint<BlockHash>, BTreeMap<u32, BlockHash>), Error> {
     let HeaderNotification { height, .. } = client.block_headers_subscribe()?;
-    let new_tip_height = height as u32;
+    let new_tip_height = u32::try_from(height)
+        .map_err(|_| Error::Message(format!("server tip height {height} overflows u32")))?;
 
     // If electrum returns a tip height that is lower than our previous tip, then checkpoints do
     // not need updating. We just return the previous tip and use that as the point of agreement.
@@ -666,12 +704,14 @@ fn fetch_tip_and_latest_blocks(
     // to construct our checkpoint update.
     let mut new_blocks = {
         let start_height = new_tip_height.saturating_sub(CHAIN_SUFFIX_LENGTH - 1);
-        let hashes = client
+        let headers = client
             .block_headers(start_height as _, CHAIN_SUFFIX_LENGTH as _)?
-            .headers
-            .into_iter()
-            .map(|h| h.block_hash());
-        (start_height..).zip(hashes).collect::<BTreeMap<u32, _>>()
+            .headers;
+        block_header_cache.extend((start_height..).zip(headers.iter().copied()));
+
+        (start_height..)
+            .zip(headers.into_iter().map(|h| h.block_hash()))
+            .collect::<BTreeMap<u32, BlockHash>>()
     };
 
     // Find the "point of agreement" (if any).
@@ -686,7 +726,9 @@ fn fetch_tip_and_latest_blocks(
                         new_tip_height >= cp_block.height,
                         "already checked that electrum's tip cannot be smaller"
                     );
-                    let hash = client.block_header(cp_block.height as _)?.block_hash();
+                    let header = client.block_header(cp_block.height as _)?;
+                    block_header_cache.insert(cp_block.height, header);
+                    let hash = header.block_hash();
                     new_blocks.insert(cp_block.height, hash);
                     hash
                 }
@@ -836,7 +878,7 @@ mod test {
 
         // Mine block that confirms transaction.
         env.mine_blocks(1, None)?;
-        env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+        env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
         let height: u32 = env.rpc_client().get_block_count()?.into_model().0 as u32;
 
         // Add the pre-reorg block that the tx is confirmed in to the header cache.
@@ -851,7 +893,7 @@ mod test {
 
         // Reorg to create a new header and hash.
         env.reorg(1)?;
-        env.wait_until_electrum_sees_block(Duration::from_secs(6))?;
+        env.wait_until_electrum_tip_syncs_with_bitcoind(Duration::from_secs(6))?;
 
         // Calling `batch_fetch_anchors` should fetch new header, replacing the pre-reorg header.
         let anchors = electrum_client.batch_fetch_anchors(&[(txid, height as usize)])?;

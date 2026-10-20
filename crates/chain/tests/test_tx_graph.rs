@@ -1456,6 +1456,32 @@ fn tx_graph_update_conversion() {
 }
 
 #[test]
+fn tx_node_is_evicted() {
+    let anchors = [block_id!(1, "A")].into();
+    let test_cases = [
+        (None, None, false),
+        (Some(10), None, false),
+        (None, Some(10), true),
+        (Some(10), Some(9), false),
+        (Some(10), Some(10), true),
+        (Some(10), Some(11), true),
+    ];
+
+    for (last_seen, last_evicted, expected) in test_cases {
+        let node = tx_graph::TxNode {
+            txid: hash!("tx"),
+            tx: (),
+            anchors: &anchors,
+            first_seen: None,
+            last_seen,
+            last_evicted,
+        };
+
+        assert_eq!(node.is_evicted(), expected);
+    }
+}
+
+#[test]
 fn test_seen_at_updates() {
     // Update both first_seen and last_seen
     let seen_at = 1000000_u64;

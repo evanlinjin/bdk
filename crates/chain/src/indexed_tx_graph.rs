@@ -145,18 +145,16 @@ where
 
     /// Synchronizes the indexer to reflect every entry in the transaction graph.
     ///
-    /// Iterates over **all** full transactions and floating outputs in `self.graph`, passing each
-    /// into `self.index`. Any indexer-side changes produced (via `index_tx` or `index_txout`) are
-    /// merged into a fresh `ChangeSet`, which is then returned.
+    /// Hands the whole graph to [`Indexer::rescan`] and returns the indexer-side changes it
+    /// produces. How thoroughly the graph is walked is the indexer's decision: one whose set of
+    /// recognized outputs grows as it matches — `KeychainTxOutIndex` extends its lookahead past
+    /// each newly revealed index — has to look more than once to reach everything it can, and it is
+    /// the only party that knows when it is done.
     pub fn reindex(&mut self) -> ChangeSet<A, I::ChangeSet> {
-        let mut changeset = ChangeSet::<A, I::ChangeSet>::default();
-        for tx in self.graph.full_txs() {
-            changeset.indexer.merge(self.index.index_tx(&tx));
+        ChangeSet {
+            tx_graph: Default::default(),
+            indexer: self.index.rescan(&self.graph),
         }
-        for (op, txout) in self.graph.floating_txouts() {
-            changeset.indexer.merge(self.index.index_txout(op, txout));
-        }
-        changeset
     }
 
     fn index_tx_graph_changeset(
@@ -366,6 +364,10 @@ where
     /// Relevancy is determined by the internal [`Indexer::is_tx_relevant`] implementation of `I`.
     /// A transaction that conflicts with a relevant transaction is also considered relevant.
     /// Irrelevant transactions in `block` will be ignored.
+    ///
+    /// The caller must supply a valid block at `height` from a trusted source. This method does not
+    /// validate the block: neither the header's place in the chain nor that `block.txdata` matches
+    /// the header's merkle root.
     pub fn apply_block_relevant(
         &mut self,
         block: &Block,
@@ -400,6 +402,10 @@ where
     /// Each inserted transaction's anchor will be constructed using [`TxPosInBlock`].
     ///
     /// To only insert relevant transactions, use [`apply_block_relevant`] instead.
+    ///
+    /// The caller must supply a valid block at `height` from a trusted source. This method does not
+    /// validate the block: neither the header's place in the chain nor that `block.txdata` matches
+    /// the header's merkle root.
     ///
     /// [`apply_block_relevant`]: IndexedTxGraph::apply_block_relevant
     pub fn apply_block(&mut self, block: Block, height: u32) -> ChangeSet<A, I::ChangeSet> {

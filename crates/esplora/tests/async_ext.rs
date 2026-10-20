@@ -1,4 +1,4 @@
-use bdk_chain::bitcoin::{Address, Amount};
+use bdk_chain::bitcoin::{hashes::Hash, Address, Amount, OutPoint, ScriptBuf, Txid};
 use bdk_chain::local_chain::LocalChain;
 use bdk_chain::spk_client::{FullScanRequest, SyncRequest};
 use bdk_chain::spk_txout::SpkTxOutIndex;
@@ -408,5 +408,70 @@ pub async fn test_async_stop_gap_past_last_revealed() -> anyhow::Result<()> {
     assert!(response.tx_update.txs.is_empty());
     assert!(response.last_active_indices.is_empty());
 
+    Ok(())
+}
+
+// Ensure `sync` gives up on a server that keeps returning the same page of transactions.
+//
+// The per-spk pagination loop advances by asking for the transactions following the last txid of
+// the previous page. A server that answers every request with the same full page leaves the cursor
+// where it was, which used to make the loop request that page forever. See bitcoindevkit/bdk#2339.
+#[tokio::test]
+async fn sync_terminates_when_server_page_does_not_advance() {
+    let base_url = common::spawn_non_advancing_server();
+    let client = Builder::new(&base_url)
+        .build_async()
+        .expect("must build client");
+
+    let request = SyncRequest::builder().spks([common::get_test_spk()]);
+    let result = tokio::time::timeout(Duration::from_secs(10), client.sync(request, 1))
+        .await
+        .expect("`sync` must terminate");
+    assert!(
+        matches!(
+            result.unwrap_err().as_ref(),
+            esplora_client::Error::InvalidResponse
+        ),
+        "`sync` must reject a page that does not advance the cursor"
+    );
+}
+
+/// A `parallel_requests` of 0 must not make `full_scan` skip its scripts.
+///
+/// The client points at a closed port, so a scan that actually requests something returns an
+/// error. If no request is made, the scan returns an empty `Ok`.
+#[tokio::test]
+pub async fn test_full_scan_with_zero_parallel_requests() -> anyhow::Result<()> {
+    let client = Builder::new("http://127.0.0.1:1").build_async()?;
+    let request = FullScanRequest::builder().spks_for_keychain(0u32, [(0, ScriptBuf::new())]);
+
+    let response = client.full_scan(request, 3, 0).await;
+    assert!(
+        response.is_err(),
+        "scan skipped its script and returned {response:?}"
+    );
+    Ok(())
+}
+
+/// A `parallel_requests` of 0 must not make `sync` skip its spks, txids or outpoints (each goes
+/// through a different fetch loop).
+#[tokio::test]
+pub async fn test_sync_with_zero_parallel_requests() -> anyhow::Result<()> {
+    let client = Builder::new("http://127.0.0.1:1").build_async()?;
+    let requests = [
+        ("spks", SyncRequest::builder().spks([ScriptBuf::new()])),
+        ("txids", SyncRequest::builder().txids([Txid::all_zeros()])),
+        (
+            "outpoints",
+            SyncRequest::builder().outpoints([OutPoint::new(Txid::all_zeros(), 0)]),
+        ),
+    ];
+    for (kind, request) in requests {
+        let response = client.sync(request, 0).await;
+        assert!(
+            response.is_err(),
+            "sync skipped its {kind} and returned {response:?}"
+        );
+    }
     Ok(())
 }

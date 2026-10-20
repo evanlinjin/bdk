@@ -225,6 +225,20 @@ pub struct TxNode<'a, T, A> {
     pub last_evicted: Option<u64>,
 }
 
+impl<T, A> TxNode<'_, T, A> {
+    /// Whether the transaction has been evicted from the mempool.
+    ///
+    /// Only mempool observation timestamps are considered; anchors have no effect. A transaction
+    /// is evicted when its last-evicted timestamp is at least as recent as its last-seen timestamp.
+    pub fn is_evicted(&self) -> bool {
+        match (self.last_seen, self.last_evicted) {
+            (_, None) => false,
+            (Some(last_seen), Some(last_evicted)) => last_evicted >= last_seen,
+            (None, Some(_)) => true,
+        }
+    }
+}
+
 impl<T, A> Deref for TxNode<'_, T, A> {
     type Target = T;
 
@@ -752,15 +766,11 @@ impl<A: Anchor> TxGraph<A> {
         // `txs_by_highest_conf_heights`.
         // We want to remove `(old_top_h?, txid)` and insert `(new_top_h?, txid)`.
         let mut old_top_h = None;
-        let mut new_top_h = anchor.confirmation_height_upper_bound();
+        let mut new_top_h = anchor.anchor_block().height;
 
         let is_changed = match self.anchors.entry(txid) {
             hash_map::Entry::Occupied(mut e) => {
-                old_top_h = e
-                    .get()
-                    .iter()
-                    .last()
-                    .map(Anchor::confirmation_height_upper_bound);
+                old_top_h = e.get().iter().last().map(|a| a.anchor_block().height);
                 if let Some(old_top_h) = old_top_h {
                     if old_top_h > new_top_h {
                         new_top_h = old_top_h;
