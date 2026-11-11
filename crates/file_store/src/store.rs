@@ -24,7 +24,7 @@ impl<C> Store<C>
 where
     C: Merge + serde::Serialize + serde::de::DeserializeOwned,
 {
-    /// Create a new [`Store`] file in write-only mode; error if the file exists.
+    /// Create a new [`Store`] file in read-write mode; error if the file exists.
     ///
     /// `magic` is the prefixed bytes to write to the new file. This will be checked when loading
     /// the [`Store`] in the future with [`load`].
@@ -66,9 +66,9 @@ where
     /// To get a new working file store from this error use [`Store::create`] and [`Store::append`]
     /// to add the aggregated changeset obtained from [`StoreErrorWithDump`].
     ///
-    /// To analyze the causes of the problem in the original database do not recreate the [`Store`]
-    /// using the same file path. Not changing the file path will overwrite previous file without
-    /// being able to recover its original data.
+    /// [`Store::create`] fails if the path already exists, so create the recovered [`Store`] at a
+    /// different path. This keeps the original file for analysis; to replace it, rename the new
+    /// file over it afterwards, as shown in the example below.
     ///
     /// # Examples
     /// ```
@@ -294,6 +294,8 @@ mod test {
     const TEST_MAGIC_BYTES_LEN: usize = 12;
     const TEST_MAGIC_BYTES: [u8; TEST_MAGIC_BYTES_LEN] =
         [98, 100, 107, 102, 115, 49, 49, 49, 49, 49, 49, 49];
+
+    use bdk_testenv::persist_test_utils::*;
 
     type TestChangeSet = BTreeSet<String>;
 
@@ -598,5 +600,34 @@ mod test {
 
         // current position matches EOF
         assert_eq!(current_pointer, expected_pointer);
+    }
+
+    #[test]
+    fn changesets_are_persisted() {
+        #[track_caller]
+        fn assert_store_persists<C>(changesets: &[C])
+        where
+            C: Merge
+                + serde::Serialize
+                + serde::de::DeserializeOwned
+                + Debug
+                + PartialEq
+                + Default
+                + Clone
+                + 'static,
+        {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let path = temp_dir.path().join("store.db");
+            assert_persist_changesets(
+                || Ok(Store::load_or_create(&TEST_MAGIC_BYTES, &path)?.0),
+                |db| Ok(db.dump().map(Option::unwrap_or_default)?),
+                |db, changeset| Ok(db.append(changeset)?),
+                changesets,
+            );
+        }
+
+        assert_store_persists(&tx_graph_changesets());
+        assert_store_persists(&keychain_txout_changesets());
+        assert_store_persists(&local_chain_changesets());
     }
 }

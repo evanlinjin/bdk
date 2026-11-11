@@ -376,21 +376,64 @@ impl<I, D> SyncRequest<I, D> {
         Some(outpoint)
     }
 
-    /// Iterate over [`ScriptBuf`]s with corresponding [`Txid`] histories contained in this request.
-    pub fn iter_spks_with_expected_txids(
+    /// Drain and iterate over [`ScriptBuf`]s with corresponding [`Txid`] histories contained in
+    /// this request, consuming them.
+    pub fn drain_spks_with_expected_txids(
         &mut self,
     ) -> impl ExactSizeIterator<Item = SpkWithExpectedTxids> + '_ {
         SyncIter::<I, D, SpkWithExpectedTxids>::new(self)
     }
 
-    /// Iterate over [`Txid`]s contained in this request.
-    pub fn iter_txids(&mut self) -> impl ExactSizeIterator<Item = Txid> + '_ {
+    /// Iterate over [`ScriptBuf`]s with corresponding [`Txid`] histories contained in this request.
+    #[deprecated(
+        note = "use `drain_spks_with_expected_txids` for consuming iteration or `spks` for read-only iteration"
+    )]
+    pub fn iter_spks_with_expected_txids(
+        &mut self,
+    ) -> impl ExactSizeIterator<Item = SpkWithExpectedTxids> + '_ {
+        self.drain_spks_with_expected_txids()
+    }
+
+    /// Drain and iterate over [`Txid`]s contained in this request, consuming them.
+    pub fn drain_txids(&mut self) -> impl ExactSizeIterator<Item = Txid> + '_ {
         SyncIter::<I, D, Txid>::new(self)
     }
 
-    /// Iterate over [`OutPoint`]s contained in this request.
-    pub fn iter_outpoints(&mut self) -> impl ExactSizeIterator<Item = OutPoint> + '_ {
+    /// Drain and iterate over [`OutPoint`]s contained in this request, consuming them.
+    pub fn drain_outpoints(&mut self) -> impl ExactSizeIterator<Item = OutPoint> + '_ {
         SyncIter::<I, D, OutPoint>::new(self)
+    }
+
+    /// Iterate over [`Txid`]s contained in this request.
+    #[deprecated(
+        note = "use `drain_txids` for consuming iteration or `txids` for read-only iteration"
+    )]
+    pub fn iter_txids(&mut self) -> impl ExactSizeIterator<Item = Txid> + '_ {
+        self.drain_txids()
+    }
+
+    /// Iterate over [`OutPoint`]s contained in this request.
+    #[deprecated(
+        note = "use `drain_outpoints` for consuming iteration or `outpoints` for read-only iteration"
+    )]
+    pub fn iter_outpoints(&mut self) -> impl ExactSizeIterator<Item = OutPoint> + '_ {
+        self.drain_outpoints()
+    }
+
+    /// Iterate over script pubkeys (with indexes) contained in this request, without
+    /// consuming them.
+    pub fn spks(&self) -> impl ExactSizeIterator<Item = &(I, ScriptBuf)> + '_ {
+        self.spks.iter()
+    }
+
+    /// Iterate over [`Txid`]s contained in this request, without consuming them.
+    pub fn txids(&self) -> impl ExactSizeIterator<Item = &Txid> + '_ {
+        self.txids.iter()
+    }
+
+    /// Iterate over [`OutPoint`]s contained in this request, without consuming them.
+    pub fn outpoints(&self) -> impl ExactSizeIterator<Item = &OutPoint> + '_ {
+        self.outpoints.iter()
     }
 
     fn _call_inspect(&mut self, item: SyncItem<I>) {
@@ -403,7 +446,16 @@ impl<I, D> SyncRequest<I, D> {
 ///
 /// See also [`SyncRequest`].
 #[must_use]
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound(
+        serialize = "A: serde::Serialize, D: serde::Serialize",
+        deserialize = "A: Ord + serde::Deserialize<'de>, \
+                       D: crate::ToBlockHash + Clone + core::fmt::Debug + serde::Deserialize<'de>"
+    ))
+)]
 pub struct SyncResponse<A = ConfirmationBlockTime, D = BlockHash> {
     /// Relevant transaction data discovered during the scan.
     pub tx_update: crate::TxUpdate<A>,
@@ -420,7 +472,7 @@ impl<A, D> Default for SyncResponse<A, D> {
     }
 }
 
-impl<A> SyncResponse<A> {
+impl<A, D> SyncResponse<A, D> {
     /// Returns true if the `SyncResponse` is empty.
     pub fn is_empty(&self) -> bool {
         self.tx_update.is_empty() && self.chain_update.is_none()
@@ -586,7 +638,16 @@ impl<K: Ord + Clone, D> FullScanRequest<K, D> {
 ///
 /// See also [`FullScanRequest`].
 #[must_use]
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound(
+        serialize = "K: serde::Serialize, A: serde::Serialize, D: serde::Serialize",
+        deserialize = "K: Ord + serde::Deserialize<'de>, A: Ord + serde::Deserialize<'de>, \
+                       D: crate::ToBlockHash + Clone + core::fmt::Debug + serde::Deserialize<'de>"
+    ))
+)]
 pub struct FullScanResponse<K, A = ConfirmationBlockTime, D = BlockHash> {
     /// Relevant transaction data discovered during the scan.
     pub tx_update: crate::TxUpdate<A>,
@@ -607,7 +668,7 @@ impl<K, A, D> Default for FullScanResponse<K, A, D> {
     }
 }
 
-impl<K, A> FullScanResponse<K, A> {
+impl<K, A, D> FullScanResponse<K, A, D> {
     /// Returns true if the `FullScanResponse` is empty.
     pub fn is_empty(&self) -> bool {
         self.tx_update.is_empty()
@@ -687,5 +748,46 @@ impl<I, D> Iterator for SyncIter<'_, I, D, OutPoint> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let remaining = self.request.outpoints.len();
         (remaining, Some(remaining))
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod test {
+    use super::*;
+    use bitcoin::hashes::Hash;
+
+    #[test]
+    fn sync_response_serde_round_trip() {
+        let cp = CheckPoint::new(0, Hash::hash(b"genesis"))
+            .push(1, Hash::hash(b"block"))
+            .unwrap();
+        let response: SyncResponse = SyncResponse {
+            tx_update: crate::TxUpdate::default(),
+            chain_update: Some(cp),
+        };
+
+        let json = serde_json::to_string(&response).expect("serialization must succeed");
+        let restored: SyncResponse =
+            serde_json::from_str(&json).expect("deserialization must succeed");
+
+        assert_eq!(response, restored);
+    }
+
+    #[test]
+    fn full_scan_response_serde_round_trip() {
+        let cp = CheckPoint::new(0, Hash::hash(b"genesis"))
+            .push(1, Hash::hash(b"block"))
+            .unwrap();
+        let response: FullScanResponse<&str> = FullScanResponse {
+            tx_update: crate::TxUpdate::default(),
+            last_active_indices: [("external", 5), ("internal", 2)].into(),
+            chain_update: Some(cp),
+        };
+
+        let json = serde_json::to_string(&response).expect("serialization must succeed");
+        let restored: FullScanResponse<&str> =
+            serde_json::from_str(&json).expect("deserialization must succeed");
+
+        assert_eq!(response, restored);
     }
 }

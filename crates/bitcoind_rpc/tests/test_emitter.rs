@@ -1,3 +1,5 @@
+#![cfg(not(windows))]
+
 use std::{collections::BTreeSet, ops::Deref};
 
 use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXS};
@@ -325,7 +327,12 @@ fn get_balance(
             recv_chain.tip().block_id(),
             Default::default(),
         )
-        .balance(outpoints, |_, _| true, 0);
+        .balance(
+            outpoints.into_iter().map(|(_, op)| op),
+            bdk_chain::taints_unowned(&recv_graph.index),
+            |pos| pos.is_confirmed(),
+            |_txout| false,
+        );
     Ok(balance)
 }
 
@@ -409,7 +416,7 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
         assert_eq!(
             get_balance(&recv_chain, &recv_graph)?,
             Balance {
-                trusted_pending: SEND_AMOUNT * reorg_count as u64,
+                untrusted_pending: SEND_AMOUNT * reorg_count as u64,
                 confirmed: SEND_AMOUNT * (ADDITIONAL_COUNT - reorg_count) as u64,
                 ..Balance::default()
             },

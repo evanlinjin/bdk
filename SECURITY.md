@@ -1,8 +1,12 @@
 # Security Policy
 
-To report security issues send an email to `security AT bitcoindevkit DOT org` (not for support).
+To report security issues, either
 
-The following key may be used to communicate sensitive information to developers:
+- send an email to `security AT bitcoindevkit DOT org` (not for support), or
+- open a security advisory on GitHub at
+[`https://github.com/bitcoindevkit/bdk/security/advisories`](https://github.com/bitcoindevkit/bdk/security/advisories).
+
+The following key may be used to communicate sensitive information to BDK via email:
 
 | Name | Fingerprint |
 | ---- | ----------- |
@@ -10,7 +14,7 @@ The following key may be used to communicate sensitive information to developers
 
 You can import the key by running the following command:
 ```
-gpg --recv-keys 7416BB255E60E40D482E591B72018930A1FB3444 --keyserver hkps://keys.openpgp.org
+gpg --keyserver hkps://keys.openpgp.org --recv-keys 7416BB255E60E40D482E591B72018930A1FB3444
 ```
 
 You can also download it from [our website](https://bitcoindevkit.org/foundation/pgp/#security-disclosures).

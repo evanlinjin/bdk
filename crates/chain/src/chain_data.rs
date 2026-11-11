@@ -75,13 +75,35 @@ impl<A: Clone> ChainPosition<&A> {
 
 impl<A: Anchor> ChainPosition<A> {
     /// Determines the upper bound of the confirmation height.
+    ///
+    /// This is the height of the anchor block. It is exact for a direct anchor. If the position is
+    /// confirmed [`transitively`](ChainPosition::Confirmed::transitively), the anchor belongs to a
+    /// descendant, so the chain data may be confirmed in an earlier block.
     pub fn confirmation_height_upper_bound(&self) -> Option<u32> {
         match self {
-            ChainPosition::Confirmed { anchor, .. } => {
-                Some(anchor.confirmation_height_upper_bound())
-            }
+            ChainPosition::Confirmed { anchor, .. } => Some(anchor.anchor_block().height),
             ChainPosition::Unconfirmed { .. } => None,
         }
+    }
+
+    /// Lower bound of the number of confirmations of this position, given `tip`.
+    ///
+    /// This is derived from [`confirmation_height_upper_bound`], so it is exact unless the position
+    /// is confirmed [`transitively`](ChainPosition::Confirmed::transitively).
+    ///
+    /// Returns `0` if unconfirmed, or if the confirmation height is above `tip`.
+    ///
+    /// [`confirmation_height_upper_bound`]: Self::confirmation_height_upper_bound
+    pub fn confirmations_lower_bound(&self, tip: u32) -> u32 {
+        let Some(height) = self.confirmation_height_upper_bound() else {
+            return 0;
+        };
+
+        if height > tip {
+            return 0;
+        }
+
+        tip - height + 1
     }
 }
 
@@ -334,5 +356,30 @@ mod test {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_confirmations_lower_bound() {
+        let confirmed_at = |height: u32| ChainPosition::Confirmed {
+            anchor: ConfirmationBlockTime {
+                confirmation_time: 0,
+                block_id: BlockId {
+                    height,
+                    ..Default::default()
+                },
+            },
+            transitively: None,
+        };
+
+        assert_eq!(confirmed_at(100).confirmations_lower_bound(100), 1);
+        assert_eq!(confirmed_at(99).confirmations_lower_bound(100), 2);
+        assert_eq!(confirmed_at(90).confirmations_lower_bound(100), 11);
+        assert_eq!(confirmed_at(101).confirmations_lower_bound(100), 0);
+
+        let unconfirmed = ChainPosition::<ConfirmationBlockTime>::Unconfirmed {
+            first_seen: Some(1),
+            last_seen: Some(2),
+        };
+        assert_eq!(unconfirmed.confirmations_lower_bound(100), 0);
     }
 }

@@ -49,9 +49,13 @@ The [`bdk_wallet`] repository and crate contains a higher level `Wallet` type th
 [`bdk_chain`]: https://docs.rs/bdk-chain/
 [`bdk_wallet`]: https://github.com/bitcoindevkit/bdk_wallet
 
+## Security Policy
+
+To report a security issue, please refer to the [security policy](SECURITY.md).
+
 ## Minimum Supported Rust Version (MSRV)
 
-The following BDK crates maintains a MSRV of 1.85.0. To build these crates with the MSRV of 1.85.0 you will need to pin dependencies by running the [`pin-msrv.sh`](./ci/pin-msrv.sh) script.
+The following BDK crates maintains a MSRV of 1.85.0. To build these crates with the MSRV of 1.85.0 you will need to pin dependencies by running the [`pin-msrv.sh`](./ci/pin-msrv.sh) script. The MSRV only covers building the libraries; tests and examples need the toolchain in [`rust-version`](./rust-version).
 
 - `bdk_core`
 - `bdk_chain`
@@ -59,6 +63,7 @@ The following BDK crates maintains a MSRV of 1.85.0. To build these crates with 
 - `bdk_esplora`
 - `bdk_file_store`
 - `bdk_electrum`
+- `bdk_testenv`
 
 ## Just
 

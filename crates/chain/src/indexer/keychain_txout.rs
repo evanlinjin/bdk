@@ -8,6 +8,7 @@ use crate::{
     spk_client::{FullScanRequestBuilder, SyncRequestBuilder},
     spk_iter::BIP32_MAX_INDEX,
     spk_txout::SpkTxOutIndex,
+    tx_graph::TxGraph,
     DescriptorExt, DescriptorId, Indexed, Indexer, KeychainIndexed, SpkIterator,
 };
 use alloc::{borrow::ToOwned, vec::Vec};
@@ -36,9 +37,9 @@ pub const DEFAULT_LOOKAHEAD: u32 = 25;
 /// and only one descriptor and each descriptor has one and only one keychain. The
 /// [`insert_descriptor`] method will return an error if you try and violate this invariant. This
 /// rule is a proxy for a stronger rule: no two descriptors should produce the same script pubkey.
-/// Having two descriptors produce the same script pubkey should cause whichever keychain derives
-/// the script pubkey first to be the effective owner of it but you should not rely on this
-/// behaviour. ⚠ It is up you, the developer, not to violate this invariant.
+/// Violating this is a contract violation: debug builds panic, and in release builds the keychain
+/// that did not derive the script pubkey first cannot reveal it. ⚠ It is up you, the developer,
+/// not to violate this invariant.
 ///
 /// # Revealed script pubkeys
 ///
@@ -197,6 +198,28 @@ impl<K: Clone + Ord + Debug> Indexer for KeychainTxOutIndex<K> {
 
     fn is_tx_relevant(&self, tx: &bitcoin::Transaction) -> bool {
         self.inner.is_relevant(tx)
+    }
+
+    /// Looks repeatedly, because a match here widens what the next look can find: revealing an
+    /// index replenishes the lookahead past it, bringing spks into the derived set that outputs
+    /// already walked past may pay to. Looking once would make the outcome depend on the order the
+    /// graph happens to yield its transactions.
+    fn rescan<A>(&mut self, graph: &TxGraph<A>) -> Self::ChangeSet {
+        let mut changeset = ChangeSet::default();
+        loop {
+            // The frontier, not `changeset.is_empty()`: the changeset also carries staged spk cache
+            // entries, which move without the frontier moving and would buy a pointless extra look.
+            let frontier = self.last_revealed.clone();
+            for tx in graph.full_txs() {
+                changeset.merge(self.index_tx(&tx));
+            }
+            for (op, txout) in graph.floating_txouts() {
+                changeset.merge(self.index_txout(op, txout));
+            }
+            if self.last_revealed == frontier {
+                return changeset;
+            }
+        }
     }
 }
 
@@ -474,10 +497,8 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     ///
     /// [`KeychainTxOutIndex`] will prevent you from inserting two descriptors which derive the same
     /// script pubkey at index 0, but it's up to you to ensure that descriptors don't collide at
-    /// other indices. If they do nothing catastrophic happens at the `KeychainTxOutIndex` level
-    /// (one keychain just becomes the defacto owner of that spk arbitrarily) but this may have
-    /// subtle implications up the application stack like one UTXO being missing from one keychain
-    /// because it has been assigned to another which produces the same script pubkey.
+    /// other indices. A collision at any other index is a contract violation (see
+    /// [`KeychainTxOutIndex`]).
     pub fn insert_descriptor(
         &mut self,
         keychain: K,
@@ -540,11 +561,9 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     pub fn lookahead_to_target(&mut self, keychain: K, target_index: u32) -> ChangeSet {
         let mut changeset = ChangeSet::default();
         if let Some((next_index, _)) = self.next_index(keychain.clone()) {
-            let temp_lookahead = (target_index + 1)
-                .checked_sub(next_index)
-                .filter(|&index| index > 0);
+            let temp_lookahead = target_index.saturating_add(1).saturating_sub(next_index);
 
-            if let Some(temp_lookahead) = temp_lookahead {
+            if temp_lookahead > 0 {
                 self.replenish_inner_index_keychain(keychain, temp_lookahead);
             }
         }
@@ -578,7 +597,9 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
         // Exclusive: index to stop at.
         let stop_index = if descriptor.has_wildcard() {
             let next_reveal_index = self.last_revealed.get(&did).map_or(0, |v| *v + 1);
-            (next_reveal_index + lookahead).min(BIP32_MAX_INDEX)
+            next_reveal_index
+                .saturating_add(lookahead)
+                .min(BIP32_MAX_INDEX + 1)
         } else {
             1
         };
@@ -858,7 +879,9 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     ///
     ///  1. The descriptor has no wildcard and already has one script revealed.
     ///  2. The descriptor has already revealed scripts up to the numeric bound.
-    ///  3. There is no descriptor associated with the given keychain.
+    ///
+    /// Also returns `None` if the next script pubkey is owned by another keychain, which is a
+    /// contract violation (see [`KeychainTxOutIndex`]).
     pub fn reveal_next_spk(&mut self, keychain: K) -> Option<(Indexed<ScriptBuf>, ChangeSet)> {
         let mut changeset = ChangeSet::default();
         let indexed_spk = self._reveal_next_spk(&mut changeset, keychain)?;
@@ -877,10 +900,9 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
             changeset.last_revealed.insert(*did, next_index);
             self.replenish_inner_index(*did, &keychain, self.lookahead);
         }
-        let script = self
-            .inner
-            .spk_at_index(&(keychain.clone(), next_index))
-            .expect("we just inserted it");
+        // `None` only if another keychain owns this spk (a contract violation, which already
+        // trips the `debug_assert!` in `replenish_inner_index`).
+        let script = self.inner.spk_at_index(&(keychain.clone(), next_index))?;
         Some((next_index, script))
     }
 
@@ -969,6 +991,7 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
             }
         }
         for (did, index) in changeset.last_revealed {
+            let index = index.min(BIP32_MAX_INDEX);
             let v = self.last_revealed.entry(did).or_default();
             *v = index.max(*v);
             self.replenish_inner_index_did(did, self.lookahead);
@@ -1202,5 +1225,96 @@ mod test {
         // The cache is optional at load time
         let index = KeychainTxOutIndex::<i32>::from_changeset(lookahead, false, init_cs);
         assert!(index.spk_cache.is_empty());
+    }
+
+    /// Build an index with `last_revealed` (and the matching spk) at `last_revealed_index`.
+    fn indexer_with_last_revealed_at(last_revealed_index: u32) -> KeychainTxOutIndex<i32> {
+        let s = DESCRIPTORS[0];
+        let desc = Descriptor::parse_descriptor(&Secp256k1::new(), s)
+            .unwrap()
+            .0;
+        let mut index = KeychainTxOutIndex::new(0, false);
+        let did = desc.descriptor_id();
+        let _ = index.insert_descriptor(0i32, desc.clone());
+
+        let spk = desc
+            .at_derivation_index(last_revealed_index)
+            .unwrap()
+            .script_pubkey();
+        index.inner.insert_spk((0i32, last_revealed_index), spk);
+        index.last_revealed.insert(did, last_revealed_index);
+        index
+    }
+
+    #[test]
+    fn apply_changeset_clamps_out_of_range_index_and_derives_correct_spk() {
+        let mut index = indexer_with_last_revealed_at(BIP32_MAX_INDEX - 1);
+        let desc = index.get_descriptor(0i32).unwrap().clone();
+        let changeset = ChangeSet {
+            last_revealed: [(desc.descriptor_id(), BIP32_MAX_INDEX + 1)].into(),
+            ..Default::default()
+        };
+        index.apply_changeset(changeset);
+        assert_eq!(index.last_revealed_index(0i32), Some(BIP32_MAX_INDEX));
+        assert_eq!(
+            index.spk_at_index(0i32, BIP32_MAX_INDEX),
+            Some(
+                desc.at_derivation_index(BIP32_MAX_INDEX)
+                    .unwrap()
+                    .script_pubkey()
+            )
+        );
+    }
+
+    #[test]
+    fn reveal_next_spk_and_next_unused_spk_return_last_script_when_saturated() {
+        let mut index = indexer_with_last_revealed_at(BIP32_MAX_INDEX);
+        let (i, changeset) = index.reveal_next_spk(0i32).unwrap();
+        assert_eq!(i.0, BIP32_MAX_INDEX);
+        assert!(changeset.is_empty());
+        assert!(index.mark_used(0i32, BIP32_MAX_INDEX));
+        let (i, changeset) = index.next_unused_spk(0i32).unwrap();
+        assert_eq!(i.0, BIP32_MAX_INDEX);
+        assert!(changeset.is_empty());
+    }
+
+    #[test]
+    fn reveal_to_target_with_target_at_bip32_max_index() {
+        let mut index = indexer_with_last_revealed_at(BIP32_MAX_INDEX - 1);
+        let (spks, _changeset) = index.reveal_to_target(0i32, BIP32_MAX_INDEX).unwrap();
+        assert_eq!(spks.len(), 1);
+        assert_eq!(spks[0].0, BIP32_MAX_INDEX);
+    }
+
+    #[test]
+    fn reveal_to_target_with_target_above_bip32_max_index() {
+        let mut index = indexer_with_last_revealed_at(BIP32_MAX_INDEX - 1);
+        let (spks, _changeset) = index.reveal_to_target(0i32, BIP32_MAX_INDEX + 5).unwrap();
+        assert_eq!(spks.len(), 1);
+        assert_eq!(spks[0].0, BIP32_MAX_INDEX);
+    }
+
+    #[test]
+    fn lookahead_to_target_past_bip32_max_clamps() {
+        let mut index = indexer_with_last_revealed_at(BIP32_MAX_INDEX - 1);
+        // `u32::MAX` is past `BIP32_MAX_INDEX`, so it must clamp down to it and store the final
+        // spk.
+        let changeset = index.lookahead_to_target(0i32, u32::MAX);
+        assert!(
+            changeset.last_revealed.is_empty(),
+            "lookahead must not reveal"
+        );
+        // `spk_at_index` is aware of lookahead spks.
+        assert!(index.spk_at_index(0i32, BIP32_MAX_INDEX).is_some());
+    }
+
+    #[test]
+    fn lookahead_to_target_at_bip32_max_does_not_overflow() {
+        let mut index = indexer_with_last_revealed_at(BIP32_MAX_INDEX);
+        let changeset = index.lookahead_to_target(0i32, u32::MAX - 1);
+        assert!(
+            changeset.last_revealed.is_empty(),
+            "lookahead must not reveal"
+        );
     }
 }
